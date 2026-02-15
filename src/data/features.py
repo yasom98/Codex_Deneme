@@ -135,7 +135,7 @@ def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.loc[:, list(REQUIRED_OHLCV_COLUMNS)].copy()
 
-    if not pd.api.types.is_datetime64tz_dtype(out["timestamp"]):
+    if not isinstance(out["timestamp"].dtype, pd.DatetimeTZDtype):
         out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
 
     if out["timestamp"].isna().any():
