@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -30,10 +31,121 @@ except ImportError:
 LOGGER = get_logger(__name__)
 
 
-def _parse_and_drop_invalid_timestamps(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Parse timestamp as UTC and drop invalid timestamp rows."""
+_TIMESTAMP_STRATEGY_ORDER: tuple[str, ...] = (
+    "epoch_milliseconds",
+    "epoch_seconds",
+    "epoch_microseconds",
+    "excel_serial",
+    "generic_datetime",
+)
+_MIN_PLAUSIBLE_YEAR = 2010
+_MAX_PLAUSIBLE_YEAR = 2100
+_LARGE_FILE_MIN_ROWS = 500
+
+
+@dataclass(frozen=True)
+class TimestampParseResult:
+    """Selected timestamp parsing strategy and quality metrics."""
+
+    strategy: str
+    parsed: pd.Series
+    parse_valid_ratio: float
+    plausible_year_ratio: float
+    unique_days: int
+    timestamp_min: pd.Timestamp | None
+    timestamp_max: pd.Timestamp | None
+
+    @property
+    def score(self) -> tuple[float, float, int]:
+        """Score tuple used for strategy comparison."""
+        return (self.parse_valid_ratio, self.plausible_year_ratio, self.unique_days)
+
+
+def _parse_with_strategy(series: pd.Series, strategy: str) -> pd.Series:
+    """Parse timestamp series with a named strategy."""
+    if strategy == "epoch_milliseconds":
+        numeric = pd.to_numeric(series, errors="coerce")
+        return pd.to_datetime(numeric, unit="ms", utc=True, errors="coerce")
+    if strategy == "epoch_seconds":
+        numeric = pd.to_numeric(series, errors="coerce")
+        return pd.to_datetime(numeric, unit="s", utc=True, errors="coerce")
+    if strategy == "epoch_microseconds":
+        numeric = pd.to_numeric(series, errors="coerce")
+        return pd.to_datetime(numeric, unit="us", utc=True, errors="coerce")
+    if strategy == "excel_serial":
+        numeric = pd.to_numeric(series, errors="coerce")
+        return pd.to_datetime(numeric, unit="D", origin="1899-12-30", utc=True, errors="coerce")
+    if strategy == "generic_datetime":
+        return pd.to_datetime(series, utc=True, errors="coerce")
+    raise ValueError(f"Unknown timestamp strategy: {strategy}")
+
+
+def _evaluate_parse_quality(
+    parsed: pd.Series,
+    *,
+    min_year: int = _MIN_PLAUSIBLE_YEAR,
+    max_year: int = _MAX_PLAUSIBLE_YEAR,
+) -> tuple[float, float, int, pd.Timestamp | None, pd.Timestamp | None]:
+    """Return quality metrics for parsed timestamps."""
+    total = int(len(parsed))
+    if total == 0:
+        return 0.0, 0.0, 0, None, None
+
+    valid = parsed.dropna()
+    valid_count = int(len(valid))
+    if valid_count == 0:
+        return 0.0, 0.0, 0, None, None
+
+    parse_valid_ratio = valid_count / total
+    years = valid.dt.year
+    plausible_year_ratio = float(years.between(min_year, max_year, inclusive="both").mean())
+    unique_days = int(valid.dt.floor("D").nunique())
+    return parse_valid_ratio, plausible_year_ratio, unique_days, valid.min(), valid.max()
+
+
+def _select_timestamp_strategy(series: pd.Series) -> TimestampParseResult:
+    """Select best timestamp parsing strategy by quality score."""
+    best_result: TimestampParseResult | None = None
+
+    for strategy in _TIMESTAMP_STRATEGY_ORDER:
+        parsed = _parse_with_strategy(series, strategy=strategy)
+        parse_valid_ratio, plausible_year_ratio, unique_days, timestamp_min, timestamp_max = _evaluate_parse_quality(parsed)
+        candidate = TimestampParseResult(
+            strategy=strategy,
+            parsed=parsed,
+            parse_valid_ratio=parse_valid_ratio,
+            plausible_year_ratio=plausible_year_ratio,
+            unique_days=unique_days,
+            timestamp_min=timestamp_min,
+            timestamp_max=timestamp_max,
+        )
+        if best_result is None or candidate.score > best_result.score:
+            best_result = candidate
+
+    if best_result is None:
+        raise RuntimeError("Timestamp strategy selection produced no candidates.")
+    return best_result
+
+
+def _is_implausible_year_range(
+    parse_result: TimestampParseResult,
+    *,
+    min_year: int = _MIN_PLAUSIBLE_YEAR,
+    max_year: int = _MAX_PLAUSIBLE_YEAR,
+) -> bool:
+    """Return True when parsed timestamp range falls outside plausible years."""
+    if parse_result.timestamp_min is None or parse_result.timestamp_max is None:
+        return True
+
+    min_ts = parse_result.timestamp_min
+    max_ts = parse_result.timestamp_max
+    return bool(min_ts.year < min_year or max_ts.year > max_year)
+
+
+def _parse_and_drop_invalid_timestamps(df: pd.DataFrame, parse_result: TimestampParseResult) -> tuple[pd.DataFrame, int]:
+    """Apply selected parser output and drop invalid timestamp rows."""
     out = df.copy()
-    parsed = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    parsed = parse_result.parsed
     invalid_mask = parsed.isna()
     dropped = int(invalid_mask.sum())
     out = out.loc[~invalid_mask].copy()
@@ -143,10 +255,49 @@ def standardize_file(
             atomic_write_json(report.to_dict(), report_path)
         return report
 
-    ts_cleaned, dropped_invalid_ts = _parse_and_drop_invalid_timestamps(canonical_df)
+    parse_result = _select_timestamp_strategy(canonical_df["timestamp"])
+    report.selected_timestamp_strategy = parse_result.strategy
+    report.parse_valid_ratio = parse_result.parse_valid_ratio
+    report.timestamp_min = parse_result.timestamp_min.isoformat() if parse_result.timestamp_min is not None else None
+    report.timestamp_max = parse_result.timestamp_max.isoformat() if parse_result.timestamp_max is not None else None
+    report.unique_days = parse_result.unique_days
+
+    LOGGER.info(
+        "Timestamp strategy selected | file=%s strategy=%s valid_ratio=%.4f plausible_ratio=%.4f unique_days=%d min=%s max=%s",
+        src_csv,
+        parse_result.strategy,
+        parse_result.parse_valid_ratio,
+        parse_result.plausible_year_ratio,
+        parse_result.unique_days,
+        report.timestamp_min,
+        report.timestamp_max,
+    )
+
+    ts_cleaned, dropped_invalid_ts = _parse_and_drop_invalid_timestamps(canonical_df, parse_result=parse_result)
     report.dropped_invalid_ts = dropped_invalid_ts
     if dropped_invalid_ts > 0:
         LOGGER.info("Dropped invalid timestamps | file=%s dropped=%d", src_csv, dropped_invalid_ts)
+
+    is_large_file = report.rows_in >= _LARGE_FILE_MIN_ROWS
+    has_implausible_year_range = _is_implausible_year_range(parse_result)
+    if (is_large_file and parse_result.unique_days < 2) or has_implausible_year_range:
+        add_error(
+            report,
+            stage="timestamp_parse",
+            code="TIMESTAMP_PARSE_INVALID",
+            message="Timestamp parsing failed integrity gates.",
+            selected_timestamp_strategy=parse_result.strategy,
+            parse_valid_ratio=parse_result.parse_valid_ratio,
+            timestamp_min=report.timestamp_min,
+            timestamp_max=report.timestamp_max,
+            unique_days=parse_result.unique_days,
+            is_large_file=is_large_file,
+            plausible_year_range=f"{_MIN_PLAUSIBLE_YEAR}-{_MAX_PLAUSIBLE_YEAR}",
+        )
+        finalize_report(report)
+        if not dry_run:
+            atomic_write_json(report.to_dict(), report_path)
+        return report
 
     deduped, dropped_duplicates = _drop_duplicate_timestamps(ts_cleaned)
     report.dropped_duplicates = dropped_duplicates

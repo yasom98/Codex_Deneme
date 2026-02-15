@@ -36,6 +36,11 @@ class FileHealthReport:
     output_file: str | None = None
     timestamp_alias: str | None = None
     alias_confidence: float | None = None
+    selected_timestamp_strategy: str | None = None
+    parse_valid_ratio: float | None = None
+    timestamp_min: str | None = None
+    timestamp_max: str | None = None
+    unique_days: int = 0
     errors: list[StructuredError] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
