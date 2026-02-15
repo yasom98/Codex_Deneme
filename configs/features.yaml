@@ -30,6 +30,10 @@ events:
   rsi_overbought: 70.0
   rsi_oversold: 30.0
 
+pivot:
+  warmup_policy: "allow_first_session_nan"
+  first_session_fill: "ffill_from_second_session"
+
 health:
   warn_ratio: 0.005
   critical_warn_ratio: 0.001

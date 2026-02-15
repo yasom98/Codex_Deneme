@@ -103,6 +103,8 @@ def main() -> int:
                 warn_ratio=cfg.health.warn_ratio,
                 critical_warn_ratio=cfg.health.critical_warn_ratio,
                 critical_columns=cfg.health.critical_columns,
+                pivot_warmup_policy=cfg.pivot.warmup_policy,
+                pivot_first_session_fill=cfg.pivot.first_session_fill,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             add_error(report, stage="build", code="FEATURE_BUILD_FAILED", message=str(exc))

@@ -19,15 +19,7 @@ LOGGER = get_logger(__name__)
 REQUIRED_OHLCV_COLUMNS: tuple[str, ...] = ("timestamp", "open", "high", "low", "close", "volume")
 ALPHATREND_LOCK_PERIOD: int = 11
 ALPHATREND_LOCK_ATR_MULTIPLIER: float = 3.0
-CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
-    "supertrend",
-    "alphatrend",
-    "rsi",
-    "rsi_slope",
-    "rsi_zscore",
-    "ema_200",
-    "ema_600",
-    "ema_1200",
+PIVOT_FEATURE_COLUMNS: tuple[str, ...] = (
     "pivot_p",
     "pivot_s1",
     "pivot_s2",
@@ -42,6 +34,17 @@ CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
     "pivot_std_lower_2",
     "pivot_std_lower_3",
 )
+CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
+    "supertrend",
+    "alphatrend",
+    "rsi",
+    "rsi_slope",
+    "rsi_zscore",
+    "ema_200",
+    "ema_600",
+    "ema_1200",
+    *PIVOT_FEATURE_COLUMNS,
+)
 EVENT_FLAG_COLUMNS: tuple[str, ...] = (
     "evt_supertrend_flip_up",
     "evt_supertrend_flip_down",
@@ -54,6 +57,8 @@ EVENT_FLAG_COLUMNS: tuple[str, ...] = (
 )
 
 _ALLOWED_RULE_OPERATORS: tuple[str, ...] = (">", ">=", "<", "<=", "==", "!=")
+_ALLOWED_PIVOT_WARMUP_POLICIES: tuple[str, ...] = ("allow_first_session_nan",)
+_ALLOWED_PIVOT_FIRST_SESSION_FILL: tuple[str, ...] = ("none", "ffill_from_second_session")
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,14 @@ class HealthPolicyConfig:
 
 
 @dataclass(frozen=True)
+class PivotPolicyConfig:
+    """Warmup policy for previous-session pivot mapping."""
+
+    warmup_policy: str
+    first_session_fill: str
+
+
+@dataclass(frozen=True)
 class FeatureBuildConfig:
     """Feature build configuration loaded from YAML."""
 
@@ -123,6 +136,7 @@ class FeatureBuildConfig:
     alphatrend: AlphaTrendConfig
     rsi: RsiConfig
     events: EventConfig
+    pivot: PivotPolicyConfig
     health: HealthPolicyConfig
 
 
@@ -364,11 +378,26 @@ def compute_ema_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def compute_daily_pivots_with_std_bands(df: pd.DataFrame) -> pd.DataFrame:
+def compute_daily_pivots_with_std_bands(
+    df: pd.DataFrame,
+    warmup_policy: str = "allow_first_session_nan",
+    first_session_fill: str = "none",
+) -> pd.DataFrame:
     """Compute previous-session daily pivots and std bands mapped to intraday bars.
 
     All pivot/std-band levels for a session are derived from the previous UTC day.
+    With ``allow_first_session_nan``, missing pivots in the first session are expected.
+    Optional ``ffill_from_second_session`` copies second-session pivot values into
+    first-session rows only.
     """
+
+    normalized_warmup_policy = warmup_policy.strip().lower()
+    if normalized_warmup_policy not in _ALLOWED_PIVOT_WARMUP_POLICIES:
+        raise ValueError(f"Unsupported pivot warmup policy: {warmup_policy}")
+
+    normalized_fill = first_session_fill.strip().lower()
+    if normalized_fill not in _ALLOWED_PIVOT_FIRST_SESSION_FILL:
+        raise ValueError(f"Unsupported pivot first_session_fill policy: {first_session_fill}")
 
     sessions = df["timestamp"].dt.floor("D")
     grouped = (
@@ -415,6 +444,28 @@ def compute_daily_pivots_with_std_bands(df: pd.DataFrame) -> pd.DataFrame:
     intraday = pd.DataFrame(index=df.index)
     for col in shifted_levels.columns:
         intraday[col] = sessions.map(shifted_levels[col])
+
+    if normalized_fill == "ffill_from_second_session":
+        ordered_sessions = sessions.drop_duplicates()
+        if len(ordered_sessions) >= 2:
+            first_session = ordered_sessions.iloc[0]
+            second_session = ordered_sessions.iloc[1]
+
+            first_mask = sessions.eq(first_session)
+            second_mask = sessions.eq(second_session)
+            second_session_pivots = intraday.loc[second_mask, list(PIVOT_FEATURE_COLUMNS)]
+            if not second_session_pivots.empty:
+                fill_values = second_session_pivots.iloc[0]
+                intraday.loc[first_mask, list(PIVOT_FEATURE_COLUMNS)] = fill_values.to_numpy(dtype=np.float64, copy=False)
+                LOGGER.info(
+                    "Applied pivot first-session fill from second session | rows=%d",
+                    int(first_mask.sum()),
+                )
+        else:
+            LOGGER.warning(
+                "pivot.first_session_fill requested but skipped due to insufficient sessions | sessions=%d",
+                int(sessions.nunique()),
+            )
 
     return intraday.astype("float32")
 
@@ -522,6 +573,7 @@ def compute_indicator_core(
     supertrend_cfg: SuperTrendConfig,
     alphatrend_cfg: AlphaTrendConfig,
     rsi_cfg: RsiConfig,
+    pivot_cfg: PivotPolicyConfig,
 ) -> pd.DataFrame:
     """Compute continuous indicators and internal trend-direction helpers."""
 
@@ -531,7 +583,11 @@ def compute_indicator_core(
     alphatrend, alphatrend_direction = compute_alphatrend(ohlcv, alphatrend_cfg)
     rsi_derivatives = compute_rsi_derivatives(ohlcv, rsi_cfg)
     ema_features = compute_ema_features(ohlcv)
-    pivot_features = compute_daily_pivots_with_std_bands(ohlcv)
+    pivot_features = compute_daily_pivots_with_std_bands(
+        ohlcv,
+        warmup_policy=pivot_cfg.warmup_policy,
+        first_session_fill=pivot_cfg.first_session_fill,
+    )
 
     features = pd.concat(
         [
@@ -675,6 +731,9 @@ def load_feature_config(path: Path) -> FeatureBuildConfig:
     alphatrend_cfg = _get_required_dict(raw, "alphatrend")
     rsi_cfg = _get_required_dict(raw, "rsi")
     events_cfg = _get_required_dict(raw, "events")
+    pivot_cfg = raw.get("pivot", {})
+    if not isinstance(pivot_cfg, dict):
+        raise ValueError("pivot must be a dictionary if provided")
     health_cfg = raw.get("health", {})
     if not isinstance(health_cfg, dict):
         raise ValueError("health must be a dictionary if provided")
@@ -704,6 +763,10 @@ def load_feature_config(path: Path) -> FeatureBuildConfig:
             rsi_centerline=float(events_cfg.get("rsi_centerline", 50.0)),
             rsi_overbought=float(events_cfg.get("rsi_overbought", 70.0)),
             rsi_oversold=float(events_cfg.get("rsi_oversold", 30.0)),
+        ),
+        pivot=PivotPolicyConfig(
+            warmup_policy=str(pivot_cfg.get("warmup_policy", "allow_first_session_nan")),
+            first_session_fill=str(pivot_cfg.get("first_session_fill", "none")),
         ),
         health=HealthPolicyConfig(
             warn_ratio=float(health_cfg.get("warn_ratio", 0.005)),
@@ -738,6 +801,16 @@ def validate_feature_config(cfg: FeatureBuildConfig) -> None:
         raise ValueError("health.critical_warn_ratio must be <= health.warn_ratio")
     if not cfg.health.critical_columns:
         raise ValueError("health.critical_columns cannot be empty")
+    if cfg.pivot.warmup_policy.strip().lower() not in _ALLOWED_PIVOT_WARMUP_POLICIES:
+        raise ValueError(
+            "pivot.warmup_policy must be one of: "
+            + ", ".join(_ALLOWED_PIVOT_WARMUP_POLICIES)
+        )
+    if cfg.pivot.first_session_fill.strip().lower() not in _ALLOWED_PIVOT_FIRST_SESSION_FILL:
+        raise ValueError(
+            "pivot.first_session_fill must be one of: "
+            + ", ".join(_ALLOWED_PIVOT_FIRST_SESSION_FILL)
+        )
     if cfg.alphatrend.period != ALPHATREND_LOCK_PERIOD:
         raise ValueError(f"alphatrend.period must be fixed at {ALPHATREND_LOCK_PERIOD}")
     if cfg.alphatrend.atr_multiplier != ALPHATREND_LOCK_ATR_MULTIPLIER:
@@ -793,6 +866,7 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
         supertrend_cfg=cfg.supertrend,
         alphatrend_cfg=cfg.alphatrend,
         rsi_cfg=cfg.rsi,
+        pivot_cfg=cfg.pivot,
     )
     raw_events = generate_raw_event_flags(indicators, cfg.events)
     shifted_events = enforce_shift_one(raw_events)

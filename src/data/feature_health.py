@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-from data.features import CONTINUOUS_FEATURE_COLUMNS, EVENT_FLAG_COLUMNS, validate_shift_one
+from data.features import CONTINUOUS_FEATURE_COLUMNS, EVENT_FLAG_COLUMNS, PIVOT_FEATURE_COLUMNS, validate_shift_one
 
 
 @dataclass
@@ -36,6 +36,10 @@ class FeatureHealthReport:
     nan_ratio_ok: bool = False
     status: str = "failed"
     output_file: str | None = None
+    pivot_first_session_allowed_nan: bool = False
+    pivot_first_session_rows: int = 0
+    pivot_nonnull_ratio_after_first_session: float = 1.0
+    pivot_fill_strategy_applied: str = "none"
     nan_ratios: dict[str, float] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     errors: list[StructuredError] = field(default_factory=list)
@@ -83,6 +87,8 @@ def evaluate_feature_health(
     warn_ratio: float,
     critical_warn_ratio: float,
     critical_columns: Sequence[str],
+    pivot_warmup_policy: str,
+    pivot_first_session_fill: str,
 ) -> FeatureHealthReport:
     """Run strict QC gates for feature outputs and update report in place."""
 
@@ -114,16 +120,87 @@ def evaluate_feature_health(
 
     report.nan_ratio_ok = True
     critical_set = {col.strip() for col in critical_columns if str(col).strip()}
+    normalized_pivot_policy = pivot_warmup_policy.strip().lower()
+    report.pivot_first_session_allowed_nan = normalized_pivot_policy == "allow_first_session_nan"
+    report.pivot_fill_strategy_applied = pivot_first_session_fill.strip().lower()
+
+    first_session_mask = pd.Series(False, index=feature_df.index, dtype=bool)
+    if len(feature_df) > 0:
+        sessions = feature_df["timestamp"].dt.floor("D")
+        first_session = sessions.iloc[0]
+        first_session_mask = sessions.eq(first_session)
+        report.pivot_first_session_rows = int(first_session_mask.sum())
+
+    pivot_columns = list(PIVOT_FEATURE_COLUMNS)
+    pivot_present = all(col in feature_df.columns for col in pivot_columns)
+    if pivot_present and len(feature_df) > 0:
+        pivot_frame = feature_df.loc[:, pivot_columns]
+        if bool(pivot_frame.isna().all(axis=0).all()):
+            report.nan_ratio_ok = False
+            add_error(
+                report,
+                stage="gates",
+                code="PIVOT_MAPPING_EMPTY",
+                message="All pivot mapping columns are fully NaN across the file.",
+            )
+
+        first_session_pivots = pivot_frame.loc[first_session_mask]
+        first_session_has_nan = bool(first_session_pivots.isna().any(axis=0).any())
+        if report.pivot_first_session_allowed_nan and first_session_has_nan:
+            add_warning(
+                report,
+                "Pivot first-session NaN warmup exception used."
+                f" rows={report.pivot_first_session_rows}",
+            )
+        if (not report.pivot_first_session_allowed_nan) and first_session_has_nan:
+            report.nan_ratio_ok = False
+            add_error(
+                report,
+                stage="gates",
+                code="PIVOT_FIRST_SESSION_NULL_NOT_ALLOWED",
+                message="Pivot columns contain NaN values in first session but warmup policy disallows it.",
+            )
+
+        after_first_session = pivot_frame.loc[~first_session_mask]
+        total_after_first = int(after_first_session.shape[0] * after_first_session.shape[1])
+        if total_after_first > 0:
+            nonnull_after_first = int(after_first_session.notna().sum().sum())
+            ratio_after_first = nonnull_after_first / float(total_after_first)
+            report.pivot_nonnull_ratio_after_first_session = ratio_after_first
+            if ratio_after_first < 1.0:
+                report.nan_ratio_ok = False
+                add_error(
+                    report,
+                    stage="gates",
+                    code="PIVOT_AFTER_FIRST_SESSION_NULL",
+                    message="Pivot columns must be fully non-null from second session onward.",
+                    nonnull_ratio=ratio_after_first,
+                )
+        else:
+            report.pivot_nonnull_ratio_after_first_session = 1.0
+    else:
+        report.pivot_nonnull_ratio_after_first_session = 1.0
 
     for col in _continuous_columns():
+        if col not in feature_df.columns:
+            continue
+
         ratio = float(feature_df[col].isna().mean())
         report.nan_ratios[col] = ratio
+        gate_ratio = ratio
+        if (
+            col in PIVOT_FEATURE_COLUMNS
+            and report.pivot_first_session_allowed_nan
+            and report.pivot_first_session_rows > 0
+            and len(feature_df) > report.pivot_first_session_rows
+        ):
+            gate_ratio = float(feature_df.loc[~first_session_mask, col].isna().mean())
 
-        if ratio > warn_ratio:
-            add_warning(report, f"NaN ratio high | column={col} ratio={ratio:.6f} warn_ratio={warn_ratio:.6f}")
+        if gate_ratio > warn_ratio:
+            add_warning(report, f"NaN ratio high | column={col} ratio={gate_ratio:.6f} warn_ratio={warn_ratio:.6f}")
 
         col_threshold = critical_warn_ratio if col in critical_set else warn_ratio
-        if ratio > col_threshold:
+        if gate_ratio > col_threshold:
             report.nan_ratio_ok = False
             add_error(
                 report,
@@ -131,7 +208,8 @@ def evaluate_feature_health(
                 code="NAN_RATIO_TOO_HIGH",
                 message="NaN ratio exceeded threshold",
                 column=col,
-                ratio=ratio,
+                ratio=gate_ratio,
+                ratio_all_rows=ratio,
                 threshold=col_threshold,
             )
 
