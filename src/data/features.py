@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from core.logging import get_logger
+from core.paths import ensure_within_root
 
 LOGGER = get_logger(__name__)
 
@@ -78,6 +82,29 @@ class EventConfig:
     rsi_centerline: float
     rsi_overbought: float
     rsi_oversold: float
+
+
+@dataclass(frozen=True)
+class FeatureBuildConfig:
+    """Feature build configuration loaded from YAML."""
+
+    input_root: Path
+    runs_root: Path
+    parquet_glob: str
+    seed: int
+    supertrend: SuperTrendConfig
+    alphatrend: AlphaTrendConfig
+    rsi: RsiConfig
+    events: EventConfig
+
+
+@dataclass(frozen=True)
+class FeatureBuildArtifacts:
+    """Feature build artifacts for one dataframe."""
+
+    frame: pd.DataFrame
+    raw_events: pd.DataFrame
+    shifted_events: pd.DataFrame
 
 
 def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -496,3 +523,159 @@ def validate_shift_one(raw_events: pd.DataFrame, shifted_events: pd.DataFrame) -
         if len(raw_uint8) > 1 and not np.array_equal(shifted_uint8[1:], raw_uint8[:-1]):
             return False
     return True
+
+
+def _resolve_path(value: str, base_dir: Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else (base_dir / path).resolve()
+
+
+def _get_required_dict(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    value = raw.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"Missing or invalid dictionary config key: {key}")
+    return value
+
+
+def _parse_rule(raw: dict[str, Any], key: str) -> ThresholdRule:
+    node = _get_required_dict(raw, key)
+    signal = str(node.get("signal", "")).strip()
+    operator = str(node.get("op", "")).strip()
+    if not signal:
+        raise ValueError(f"alphatrend.{key}.signal is required")
+    if not operator:
+        raise ValueError(f"alphatrend.{key}.op is required")
+    if operator not in _ALLOWED_RULE_OPERATORS:
+        raise ValueError(f"Unsupported alphatrend.{key}.op: {operator}")
+    if "threshold" not in node:
+        raise ValueError(f"alphatrend.{key}.threshold is required")
+    return ThresholdRule(signal=signal, operator=operator, threshold=float(node["threshold"]))
+
+
+def load_feature_config(path: Path) -> FeatureBuildConfig:
+    """Load and validate feature engineering configuration."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("Top-level config must be a dictionary")
+
+    base_dir = path.resolve().parent
+    supertrend_cfg = _get_required_dict(raw, "supertrend")
+    alphatrend_cfg = _get_required_dict(raw, "alphatrend")
+    rsi_cfg = _get_required_dict(raw, "rsi")
+    events_cfg = _get_required_dict(raw, "events")
+
+    cfg = FeatureBuildConfig(
+        input_root=_resolve_path(str(raw.get("input_root", "")), base_dir),
+        runs_root=_resolve_path(str(raw.get("runs_root", "runs")), base_dir),
+        parquet_glob=str(raw.get("parquet_glob", "*.parquet")),
+        seed=int(raw.get("seed", 42)),
+        supertrend=SuperTrendConfig(
+            period=int(supertrend_cfg.get("period", 10)),
+            multiplier=float(supertrend_cfg.get("multiplier", 3.0)),
+        ),
+        alphatrend=AlphaTrendConfig(
+            period=int(alphatrend_cfg.get("period", 14)),
+            atr_multiplier=float(alphatrend_cfg.get("atr_multiplier", 1.0)),
+            signal_period=int(alphatrend_cfg.get("signal_period", 14)),
+            long_rule=_parse_rule(alphatrend_cfg, "long_rule"),
+            short_rule=_parse_rule(alphatrend_cfg, "short_rule"),
+        ),
+        rsi=RsiConfig(
+            period=int(rsi_cfg.get("period", 14)),
+            slope_lag=int(rsi_cfg.get("slope_lag", 3)),
+            zscore_window=int(rsi_cfg.get("zscore_window", 50)),
+        ),
+        events=EventConfig(
+            rsi_centerline=float(events_cfg.get("rsi_centerline", 50.0)),
+            rsi_overbought=float(events_cfg.get("rsi_overbought", 70.0)),
+            rsi_oversold=float(events_cfg.get("rsi_oversold", 30.0)),
+        ),
+    )
+    validate_feature_config(cfg)
+    return cfg
+
+
+def validate_feature_config(cfg: FeatureBuildConfig) -> None:
+    """Validate semantic constraints for feature build config."""
+
+    if not cfg.input_root.exists():
+        raise FileNotFoundError(f"input_root does not exist: {cfg.input_root}")
+    if not cfg.input_root.is_dir():
+        raise NotADirectoryError(f"input_root is not a directory: {cfg.input_root}")
+    if not cfg.parquet_glob.strip():
+        raise ValueError("parquet_glob cannot be empty")
+    if cfg.seed < 0:
+        raise ValueError("seed must be >= 0")
+    if cfg.events.rsi_oversold >= cfg.events.rsi_overbought:
+        raise ValueError("events.rsi_oversold must be < events.rsi_overbought")
+    if cfg.alphatrend.long_rule.signal.strip() == "":
+        raise ValueError("alphatrend.long_rule.signal is required")
+    if cfg.alphatrend.short_rule.signal.strip() == "":
+        raise ValueError("alphatrend.short_rule.signal is required")
+
+
+def discover_parquet_files(input_root: Path, parquet_glob: str = "*.parquet") -> list[Path]:
+    """Discover parquet files recursively under input_root."""
+
+    files = [path for path in input_root.glob(parquet_glob) if path.is_file() and path.suffix.lower() == ".parquet"]
+    return sorted(files)
+
+
+def build_feature_output_path(src_parquet: Path, input_root: Path, output_root: Path) -> Path:
+    """Build output parquet path for a source standardized parquet file."""
+
+    rel_path = src_parquet.resolve().relative_to(input_root.resolve())
+    stem = "__".join(rel_path.with_suffix("").parts)
+    out_path = output_root / f"{stem}.parquet"
+    ensure_within_root(out_path, output_root)
+    return out_path
+
+
+def apply_dtype_policy(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast continuous columns to float32 and event flags to uint8."""
+
+    out = df.copy()
+    continuous = ("open", "high", "low", "close", "volume", *CONTINUOUS_FEATURE_COLUMNS)
+
+    for col in continuous:
+        if col not in out.columns:
+            raise ValueError(f"Missing continuous column for dtype policy: {col}")
+        out[col] = out[col].astype("float32")
+
+    for col in EVENT_FLAG_COLUMNS:
+        if col not in out.columns:
+            raise ValueError(f"Missing event flag column for dtype policy: {col}")
+        out[col] = out[col].astype("uint8")
+
+    return out
+
+
+def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> FeatureBuildArtifacts:
+    """Build feature table plus raw/shifted events for one input dataframe."""
+
+    ohlcv = validate_ohlcv_frame(df)
+    indicators = compute_indicator_core(
+        df=ohlcv,
+        supertrend_cfg=cfg.supertrend,
+        alphatrend_cfg=cfg.alphatrend,
+        rsi_cfg=cfg.rsi,
+    )
+    raw_events = generate_raw_event_flags(indicators, cfg.events)
+    shifted_events = enforce_shift_one(raw_events)
+    if not validate_shift_one(raw_events, shifted_events):
+        raise ValueError("Strict shift(1) validation failed for event columns")
+
+    frame = pd.concat(
+        [
+            ohlcv,
+            indicators.loc[:, list(CONTINUOUS_FEATURE_COLUMNS)],
+            shifted_events.loc[:, list(EVENT_FLAG_COLUMNS)],
+        ],
+        axis=1,
+    )
+    frame = apply_dtype_policy(frame)
+    return FeatureBuildArtifacts(frame=frame, raw_events=raw_events, shifted_events=shifted_events)

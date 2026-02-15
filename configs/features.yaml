@@ -1,0 +1,31 @@
+input_root: ../runs/20260215T153524Z/data_standardized/parquet
+runs_root: ../runs
+parquet_glob: "*.parquet"
+seed: 42
+
+supertrend:
+  period: 10
+  multiplier: 3.0
+
+alphatrend:
+  period: 14
+  atr_multiplier: 1.0
+  signal_period: 14
+  long_rule:
+    signal: mfi
+    op: ">="
+    threshold: 50.0
+  short_rule:
+    signal: mfi
+    op: "<"
+    threshold: 50.0
+
+rsi:
+  period: 14
+  slope_lag: 3
+  zscore_window: 50
+
+events:
+  rsi_centerline: 50.0
+  rsi_overbought: 70.0
+  rsi_oversold: 30.0
