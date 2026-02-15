@@ -121,8 +121,9 @@ def evaluate_feature_health(
     report.nan_ratio_ok = True
     critical_set = {col.strip() for col in critical_columns if str(col).strip()}
     normalized_pivot_policy = pivot_warmup_policy.strip().lower()
+    normalized_pivot_fill = pivot_first_session_fill.strip().lower()
     report.pivot_first_session_allowed_nan = normalized_pivot_policy == "allow_first_session_nan"
-    report.pivot_fill_strategy_applied = pivot_first_session_fill.strip().lower()
+    report.pivot_fill_strategy_applied = "none"
 
     first_session_mask = pd.Series(False, index=feature_df.index, dtype=bool)
     if len(feature_df) > 0:
@@ -151,6 +152,12 @@ def evaluate_feature_health(
                 add_warning(report, "Pivot columns are NaN only in first session warmup window.")
 
         first_session_pivots = pivot_frame.loc[first_session_mask]
+        if (
+            normalized_pivot_fill == "ffill_from_second_session"
+            and after_first_rows > 0
+            and bool(first_session_pivots.notna().all(axis=0).all())
+        ):
+            report.pivot_fill_strategy_applied = "ffill_from_second_session"
         first_session_has_nan = bool(first_session_pivots.isna().any(axis=0).any())
         if report.pivot_first_session_allowed_nan and first_session_has_nan:
             add_warning(
