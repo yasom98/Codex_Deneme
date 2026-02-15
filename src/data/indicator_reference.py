@@ -171,7 +171,8 @@ def _barssince(cond: pd.Series) -> pd.Series:
 
     out = np.full(len(cond), np.nan, dtype=np.float64)
     last = -1
-    for i, v in enumerate(cond.fillna(False).to_numpy()):
+    cond_bool = cond.astype("boolean").fillna(False).astype(bool)
+    for i, v in enumerate(cond_bool.to_numpy(dtype=np.bool_, copy=False)):
         if v:
             last = i
             out[i] = 0.0
@@ -335,4 +336,3 @@ def compute_supertrend(
         },
         index=df.index,
     )
-

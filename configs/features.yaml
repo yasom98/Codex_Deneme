@@ -4,40 +4,34 @@ parquet_glob: "*.parquet"
 seed: 42
 
 supertrend:
-  period: 10
+  periods: 10
   multiplier: 3.0
+  source: "hl2"
+  change_atr_method: true
 
 alphatrend:
-  period: 11
-  atr_multiplier: 3.0
-  signal_period: 14
-  long_rule:
-    signal: mfi
-    op: ">="
-    threshold: 50.0
-  short_rule:
-    signal: mfi
-    op: "<"
-    threshold: 50.0
-
-rsi:
-  period: 14
-  slope_lag: 3
-  zscore_window: 50
-
-events:
-  rsi_centerline: 50.0
-  rsi_overbought: 70.0
-  rsi_oversold: 30.0
+  coeff: 3.0
+  ap: 11
+  use_no_volume: false
 
 pivot:
+  pivot_tf: "1D"
   warmup_policy: "allow_first_session_nan"
   first_session_fill: "ffill_from_second_session"
+
+parity:
+  enabled: true
+  sample_rows: 4096
+  float_atol: 1.0e-6
+  float_rtol: 1.0e-6
 
 health:
   warn_ratio: 0.005
   critical_warn_ratio: 0.001
   critical_columns:
-    - supertrend
-    - alphatrend
-    - rsi
+    - EMA_200
+    - EMA_600
+    - EMA_1200
+    - AlphaTrend
+    - ST_up
+    - ST_dn

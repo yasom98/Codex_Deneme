@@ -1,10 +1,11 @@
-"""Feature engineering indicator core for standardized OHLCV parquet tables."""
+"""Feature engineering core locked to reference indicator formulas."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
-from typing import Callable
 from typing import Any
 
 import numpy as np
@@ -13,98 +14,91 @@ import yaml
 
 from core.logging import get_logger
 from core.paths import ensure_within_root
+from data import indicator_reference as ref
 
 LOGGER = get_logger(__name__)
 
-REQUIRED_OHLCV_COLUMNS: tuple[str, ...] = ("timestamp", "open", "high", "low", "close", "volume")
-ALPHATREND_LOCK_PERIOD: int = 11
-ALPHATREND_LOCK_ATR_MULTIPLIER: float = 3.0
-PIVOT_FEATURE_COLUMNS: tuple[str, ...] = (
-    "pivot_p",
-    "pivot_s1",
-    "pivot_s2",
-    "pivot_s3",
-    "pivot_r1",
-    "pivot_r2",
-    "pivot_r3",
-    "pivot_std_upper_1",
-    "pivot_std_upper_2",
-    "pivot_std_upper_3",
-    "pivot_std_lower_1",
-    "pivot_std_lower_2",
-    "pivot_std_lower_3",
-)
-CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
-    "supertrend",
-    "alphatrend",
-    "rsi",
-    "rsi_slope",
-    "rsi_zscore",
-    "ema_200",
-    "ema_600",
-    "ema_1200",
-    *PIVOT_FEATURE_COLUMNS,
-)
-EVENT_FLAG_COLUMNS: tuple[str, ...] = (
-    "evt_supertrend_flip_up",
-    "evt_supertrend_flip_down",
-    "evt_alphatrend_flip_up",
-    "evt_alphatrend_flip_down",
-    "evt_rsi_cross_center_up",
-    "evt_rsi_cross_center_down",
-    "evt_rsi_overbought",
-    "evt_rsi_oversold",
-)
+INDICATOR_SPEC_VERSION: str = "indicators.v2026-02-15.1"
 
-_ALLOWED_RULE_OPERATORS: tuple[str, ...] = (">", ">=", "<", "<=", "==", "!=")
+REQUIRED_OHLCV_COLUMNS: tuple[str, ...] = ("timestamp", "open", "high", "low", "close", "volume")
+PIVOT_FEATURE_COLUMNS: tuple[str, ...] = ("PP", "R1", "S1", "R2", "S2", "R3", "S3", "R4", "S4", "R5", "S5")
+CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
+    *PIVOT_FEATURE_COLUMNS,
+    "EMA_200",
+    "EMA_600",
+    "EMA_1200",
+    "AlphaTrend",
+    "AlphaTrend_2",
+    "ST_trend",
+    "ST_up",
+    "ST_dn",
+)
+RAW_EVENT_COLUMNS: tuple[str, ...] = ("AT_buy_raw", "AT_sell_raw", "AT_buy", "AT_sell", "ST_buy", "ST_sell")
+EVENT_FLAG_COLUMNS: tuple[str, ...] = (
+    "evt_at_buy_raw",
+    "evt_at_sell_raw",
+    "evt_at_buy",
+    "evt_at_sell",
+    "evt_st_buy",
+    "evt_st_sell",
+)
+RAW_TO_EVENT_COLUMN: dict[str, str] = {
+    "AT_buy_raw": "evt_at_buy_raw",
+    "AT_sell_raw": "evt_at_sell_raw",
+    "AT_buy": "evt_at_buy",
+    "AT_sell": "evt_at_sell",
+    "ST_buy": "evt_st_buy",
+    "ST_sell": "evt_st_sell",
+}
+
+_LOCKED_ALPHATREND_COEFF: float = 3.0
+_LOCKED_ALPHATREND_AP: int = 11
+_LOCKED_SUPERTREND_PERIODS: int = 10
+_LOCKED_SUPERTREND_MULTIPLIER: float = 3.0
+_LOCKED_SUPERTREND_SOURCE: str = "hl2"
+_LOCKED_SUPERTREND_CHANGE_ATR_METHOD: bool = True
+_LOCKED_PIVOT_TF: str = "1D"
+
 _ALLOWED_PIVOT_WARMUP_POLICIES: tuple[str, ...] = ("allow_first_session_nan",)
 _ALLOWED_PIVOT_FIRST_SESSION_FILL: tuple[str, ...] = ("none", "ffill_from_second_session")
 
 
 @dataclass(frozen=True)
-class ThresholdRule:
-    """Declarative threshold rule for AlphaTrend regime conditions."""
-
-    signal: str
-    operator: str
-    threshold: float
-
-
-@dataclass(frozen=True)
 class SuperTrendConfig:
-    """SuperTrend hyperparameters."""
+    """Locked Supertrend config."""
 
-    period: int
+    periods: int
     multiplier: float
+    source: str
+    change_atr_method: bool
 
 
 @dataclass(frozen=True)
 class AlphaTrendConfig:
-    """AlphaTrend hyperparameters and rule definitions."""
+    """Locked AlphaTrend config."""
 
-    period: int
-    atr_multiplier: float
-    signal_period: int
-    long_rule: ThresholdRule
-    short_rule: ThresholdRule
+    coeff: float
+    ap: int
+    use_no_volume: bool
 
 
 @dataclass(frozen=True)
-class RsiConfig:
-    """RSI derivatives hyperparameters."""
+class PivotPolicyConfig:
+    """Pivot policy configuration."""
 
-    period: int
-    slope_lag: int
-    zscore_window: int
+    pivot_tf: str
+    warmup_policy: str
+    first_session_fill: str
 
 
 @dataclass(frozen=True)
-class EventConfig:
-    """Event threshold settings for RSI-based and trend-flip events."""
+class ParityPolicyConfig:
+    """Parity check configuration."""
 
-    rsi_centerline: float
-    rsi_overbought: float
-    rsi_oversold: float
+    enabled: bool
+    sample_rows: int
+    float_atol: float
+    float_rtol: float
 
 
 @dataclass(frozen=True)
@@ -117,14 +111,6 @@ class HealthPolicyConfig:
 
 
 @dataclass(frozen=True)
-class PivotPolicyConfig:
-    """Warmup policy for previous-session pivot mapping."""
-
-    warmup_policy: str
-    first_session_fill: str
-
-
-@dataclass(frozen=True)
 class FeatureBuildConfig:
     """Feature build configuration loaded from YAML."""
 
@@ -134,10 +120,11 @@ class FeatureBuildConfig:
     seed: int
     supertrend: SuperTrendConfig
     alphatrend: AlphaTrendConfig
-    rsi: RsiConfig
-    events: EventConfig
     pivot: PivotPolicyConfig
+    parity: ParityPolicyConfig
     health: HealthPolicyConfig
+    config_hash: str
+    indicator_spec_version: str
 
 
 @dataclass(frozen=True)
@@ -147,16 +134,20 @@ class FeatureBuildArtifacts:
     frame: pd.DataFrame
     raw_events: pd.DataFrame
     shifted_events: pd.DataFrame
+    indicator_parity_status: str
+    indicator_parity_details: dict[str, bool]
+
+
+@dataclass(frozen=True)
+class IndicatorCoreOutput:
+    """Internal indicator output blocks before event shift."""
+
+    continuous: pd.DataFrame
+    raw_events: pd.DataFrame
 
 
 def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate and normalize an OHLCV dataframe.
-
-    Rules:
-    - required columns must exist
-    - timestamp is sorted increasingly (sort with warning if needed)
-    - duplicate timestamps are dropped with `keep=last`
-    """
+    """Validate and normalize an OHLCV dataframe."""
 
     if df.empty:
         raise ValueError("Input dataframe is empty.")
@@ -174,13 +165,13 @@ def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("timestamp contains invalid or NaT values.")
 
     if not out["timestamp"].is_monotonic_increasing:
-        LOGGER.warning("timestamp not monotonic increasing; sorting in ascending order.")
+        LOGGER.warning("timestamp not monotonic increasing; sorting ascending.")
         out = out.sort_values("timestamp", kind="mergesort")
 
     duplicated_mask = out.duplicated(subset=["timestamp"], keep="last")
     dropped_duplicates = int(duplicated_mask.sum())
     if dropped_duplicates > 0:
-        LOGGER.warning("duplicate timestamps detected; dropping duplicates with keep='last' | dropped=%d", dropped_duplicates)
+        LOGGER.warning("duplicate timestamps dropped with keep='last' | dropped=%d", dropped_duplicates)
         out = out.loc[~duplicated_mask].copy()
 
     for col in ("open", "high", "low", "close", "volume"):
@@ -189,461 +180,166 @@ def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def rma(series: pd.Series, period: int) -> pd.Series:
-    """Compute Wilder's RMA (running moving average)."""
+def _to_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return copy with timestamp index for reference indicator functions."""
 
-    if period <= 0:
-        raise ValueError("period must be > 0")
-    return series.ewm(alpha=1.0 / float(period), adjust=False, min_periods=1).mean()
-
-
-def compute_true_range(df: pd.DataFrame) -> pd.Series:
-    """Compute True Range for OHLCV rows."""
-
-    high = df["high"].astype("float64")
-    low = df["low"].astype("float64")
-    prev_close = df["close"].astype("float64").shift(1)
-
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.fillna(0.0)
+    indexed = df.copy()
+    indexed = indexed.set_index("timestamp", drop=True)
+    if not isinstance(indexed.index, pd.DatetimeIndex):
+        raise ValueError("timestamp index conversion failed.")
+    if indexed.index.tz is None:
+        raise ValueError("timestamp index must be timezone-aware UTC.")
+    if not indexed.index.is_monotonic_increasing:
+        raise ValueError("timestamp index must be monotonic increasing.")
+    return indexed
 
 
-def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    """Compute Average True Range using Wilder's RMA."""
+def _normalize_pivot_policies(warmup_policy: str, first_session_fill: str) -> tuple[str, str]:
+    """Normalize and validate pivot policy values."""
 
-    true_range = compute_true_range(df)
-    return rma(true_range, period=period)
-
-
-def compute_supertrend(df: pd.DataFrame, cfg: SuperTrendConfig) -> tuple[pd.Series, pd.Series]:
-    """Compute SuperTrend line and direction (+1/-1)."""
-
-    if cfg.period <= 0:
-        raise ValueError("SuperTrend period must be > 0")
-    if cfg.multiplier <= 0:
-        raise ValueError("SuperTrend multiplier must be > 0")
-
-    rows = len(df)
-    high = df["high"].to_numpy(dtype=np.float64, copy=False)
-    low = df["low"].to_numpy(dtype=np.float64, copy=False)
-    close = df["close"].to_numpy(dtype=np.float64, copy=False)
-
-    atr = compute_atr(df, period=cfg.period).to_numpy(dtype=np.float64, copy=False)
-    hl2 = (high + low) / 2.0
-
-    basic_upper = hl2 + (cfg.multiplier * atr)
-    basic_lower = hl2 - (cfg.multiplier * atr)
-
-    final_upper = np.empty(rows, dtype=np.float64)
-    final_lower = np.empty(rows, dtype=np.float64)
-    supertrend = np.empty(rows, dtype=np.float64)
-    direction = np.empty(rows, dtype=np.int8)
-
-    for idx in range(rows):
-        if idx == 0:
-            final_upper[idx] = basic_upper[idx]
-            final_lower[idx] = basic_lower[idx]
-            supertrend[idx] = final_lower[idx] if close[idx] >= final_lower[idx] else final_upper[idx]
-            direction[idx] = 1 if close[idx] >= supertrend[idx] else -1
-            continue
-
-        prev_close = close[idx - 1]
-        prev_final_upper = final_upper[idx - 1]
-        prev_final_lower = final_lower[idx - 1]
-
-        if basic_upper[idx] < prev_final_upper or prev_close > prev_final_upper:
-            final_upper[idx] = basic_upper[idx]
-        else:
-            final_upper[idx] = prev_final_upper
-
-        if basic_lower[idx] > prev_final_lower or prev_close < prev_final_lower:
-            final_lower[idx] = basic_lower[idx]
-        else:
-            final_lower[idx] = prev_final_lower
-
-        prev_supertrend = supertrend[idx - 1]
-        if prev_supertrend == prev_final_upper:
-            supertrend[idx] = final_upper[idx] if close[idx] <= final_upper[idx] else final_lower[idx]
-        else:
-            supertrend[idx] = final_lower[idx] if close[idx] >= final_lower[idx] else final_upper[idx]
-
-        direction[idx] = 1 if close[idx] >= supertrend[idx] else -1
-
-    return (
-        pd.Series(supertrend, index=df.index, name="supertrend", dtype="float32"),
-        pd.Series(direction, index=df.index, name="supertrend_direction_raw", dtype="int8"),
-    )
-
-
-def compute_rsi(df: pd.DataFrame, period: int) -> pd.Series:
-    """Compute RSI in range [0, 100]."""
-
-    if period <= 0:
-        raise ValueError("RSI period must be > 0")
-
-    close = df["close"].astype("float64")
-    delta = close.diff().fillna(0.0)
-
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-
-    avg_gain = rma(gain, period=period)
-    avg_loss = rma(loss, period=period)
-
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-
-    both_zero = (avg_gain == 0.0) & (avg_loss == 0.0)
-    only_loss_zero = (avg_loss == 0.0) & ~both_zero
-
-    rsi = rsi.where(~only_loss_zero, 100.0)
-    rsi = rsi.where(~both_zero, 50.0)
-
-    return rsi.fillna(50.0).astype("float32")
-
-
-def compute_mfi(df: pd.DataFrame, period: int) -> pd.Series:
-    """Compute Money Flow Index in range [0, 100]."""
-
-    if period <= 0:
-        raise ValueError("MFI period must be > 0")
-
-    typical_price = (df["high"].astype("float64") + df["low"].astype("float64") + df["close"].astype("float64")) / 3.0
-    raw_money_flow = typical_price * df["volume"].astype("float64")
-
-    tp_delta = typical_price.diff().fillna(0.0)
-    positive_flow = raw_money_flow.where(tp_delta > 0.0, 0.0)
-    negative_flow = raw_money_flow.where(tp_delta < 0.0, 0.0)
-
-    positive_sum = positive_flow.rolling(window=period, min_periods=1).sum()
-    negative_sum = negative_flow.rolling(window=period, min_periods=1).sum()
-
-    ratio = positive_sum / negative_sum.replace(0.0, np.nan)
-    mfi = 100.0 - (100.0 / (1.0 + ratio))
-
-    both_zero = (positive_sum == 0.0) & (negative_sum == 0.0)
-    only_negative_zero = (negative_sum == 0.0) & ~both_zero
-
-    mfi = mfi.where(~only_negative_zero, 100.0)
-    mfi = mfi.where(~both_zero, 50.0)
-
-    return mfi.fillna(50.0).astype("float32")
-
-
-def compute_rsi_derivatives(df: pd.DataFrame, cfg: RsiConfig) -> pd.DataFrame:
-    """Compute RSI, RSI slope, and RSI z-score derivatives."""
-
-    if cfg.period <= 0:
-        raise ValueError("rsi.period must be > 0")
-    if cfg.slope_lag <= 0:
-        raise ValueError("rsi.slope_lag must be > 0")
-    if cfg.zscore_window <= 1:
-        raise ValueError("rsi.zscore_window must be > 1")
-
-    rsi = compute_rsi(df, period=cfg.period).astype("float64")
-    rsi_slope = (rsi - rsi.shift(cfg.slope_lag)).fillna(0.0)
-
-    rolling_mean = rsi.rolling(window=cfg.zscore_window, min_periods=1).mean()
-    rolling_std = rsi.rolling(window=cfg.zscore_window, min_periods=1).std(ddof=0)
-    rsi_zscore = ((rsi - rolling_mean) / rolling_std.replace(0.0, np.nan)).fillna(0.0)
-
-    return pd.DataFrame(
-        {
-            "rsi": rsi.astype("float32"),
-            "rsi_slope": rsi_slope.astype("float32"),
-            "rsi_zscore": rsi_zscore.astype("float32"),
-        },
-        index=df.index,
-    )
-
-
-def compute_ema_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute long-horizon EMA features from close prices."""
-
-    close = df["close"].astype("float64")
-    return pd.DataFrame(
-        {
-            "ema_200": close.ewm(span=200, adjust=False, min_periods=1).mean().astype("float32"),
-            "ema_600": close.ewm(span=600, adjust=False, min_periods=1).mean().astype("float32"),
-            "ema_1200": close.ewm(span=1200, adjust=False, min_periods=1).mean().astype("float32"),
-        },
-        index=df.index,
-    )
-
-
-def compute_daily_pivots_with_std_bands(
-    df: pd.DataFrame,
-    warmup_policy: str = "allow_first_session_nan",
-    first_session_fill: str = "none",
-) -> pd.DataFrame:
-    """Compute previous-session daily pivots and std bands mapped to intraday bars.
-
-    All pivot/std-band levels for a session are derived from the previous UTC day.
-    With ``allow_first_session_nan``, missing pivots in the first session are expected.
-    Optional ``ffill_from_second_session`` copies second-session pivot values into
-    first-session rows only.
-    """
-
-    normalized_warmup_policy = warmup_policy.strip().lower()
-    if normalized_warmup_policy not in _ALLOWED_PIVOT_WARMUP_POLICIES:
+    normalized_warmup = warmup_policy.strip().lower()
+    if normalized_warmup not in _ALLOWED_PIVOT_WARMUP_POLICIES:
         raise ValueError(f"Unsupported pivot warmup policy: {warmup_policy}")
 
     normalized_fill = first_session_fill.strip().lower()
     if normalized_fill not in _ALLOWED_PIVOT_FIRST_SESSION_FILL:
         raise ValueError(f"Unsupported pivot first_session_fill policy: {first_session_fill}")
 
-    sessions = df["timestamp"].dt.floor("D")
-    grouped = (
-        df.assign(_session=sessions)
-        .groupby("_session", sort=True)
-        .agg(
-            day_high=("high", "max"),
-            day_low=("low", "min"),
-            day_close=("close", "last"),
-        )
-    )
-
-    close_std = (
-        df.assign(_session=sessions)
-        .groupby("_session", sort=True)["close"]
-        .std(ddof=0)
-        .rename("day_close_std")
-        .fillna(0.0)
-    )
-    daily = grouped.join(close_std)
-
-    pivot = (daily["day_high"] + daily["day_low"] + daily["day_close"]) / 3.0
-    day_range = daily["day_high"] - daily["day_low"]
-
-    levels = pd.DataFrame(index=daily.index)
-    levels["pivot_p"] = pivot
-    levels["pivot_r1"] = (2.0 * pivot) - daily["day_low"]
-    levels["pivot_s1"] = (2.0 * pivot) - daily["day_high"]
-    levels["pivot_r2"] = pivot + day_range
-    levels["pivot_s2"] = pivot - day_range
-    levels["pivot_r3"] = daily["day_high"] + (2.0 * (pivot - daily["day_low"]))
-    levels["pivot_s3"] = daily["day_low"] - (2.0 * (daily["day_high"] - pivot))
-
-    std = daily["day_close_std"]
-    levels["pivot_std_upper_1"] = pivot + std
-    levels["pivot_std_upper_2"] = pivot + (2.0 * std)
-    levels["pivot_std_upper_3"] = pivot + (3.0 * std)
-    levels["pivot_std_lower_1"] = pivot - std
-    levels["pivot_std_lower_2"] = pivot - (2.0 * std)
-    levels["pivot_std_lower_3"] = pivot - (3.0 * std)
-
-    shifted_levels = levels.shift(1)
-
-    intraday = pd.DataFrame(index=df.index)
-    for col in shifted_levels.columns:
-        intraday[col] = sessions.map(shifted_levels[col])
-
-    if normalized_fill == "ffill_from_second_session":
-        ordered_sessions = sessions.drop_duplicates()
-        if len(ordered_sessions) >= 2:
-            first_session = ordered_sessions.iloc[0]
-            second_session = ordered_sessions.iloc[1]
-
-            first_mask = sessions.eq(first_session)
-            second_mask = sessions.eq(second_session)
-            second_session_pivots = intraday.loc[second_mask, list(PIVOT_FEATURE_COLUMNS)]
-            if not second_session_pivots.empty:
-                fill_values = second_session_pivots.iloc[0]
-                intraday.loc[first_mask, list(PIVOT_FEATURE_COLUMNS)] = fill_values.to_numpy(dtype=np.float64, copy=False)
-                LOGGER.info(
-                    "Applied pivot first-session fill from second session | rows=%d",
-                    int(first_mask.sum()),
-                )
-        else:
-            LOGGER.warning(
-                "pivot.first_session_fill requested but skipped due to insufficient sessions | sessions=%d",
-                int(sessions.nunique()),
-            )
-
-    return intraday.astype("float32")
+    return normalized_warmup, normalized_fill
 
 
-def _operator_callable(operator: str) -> Callable[[pd.Series, float], pd.Series]:
-    if operator == ">":
-        return lambda series, threshold: series > threshold
-    if operator == ">=":
-        return lambda series, threshold: series >= threshold
-    if operator == "<":
-        return lambda series, threshold: series < threshold
-    if operator == "<=":
-        return lambda series, threshold: series <= threshold
-    if operator == "==":
-        return lambda series, threshold: series == threshold
-    if operator == "!=":
-        return lambda series, threshold: series != threshold
-    raise ValueError(f"Unsupported rule operator: {operator}")
-
-
-def evaluate_rule(signal: pd.Series, rule: ThresholdRule) -> pd.Series:
-    """Evaluate a threshold rule against signal values."""
-
-    if rule.operator not in _ALLOWED_RULE_OPERATORS:
-        raise ValueError(f"Unsupported rule operator: {rule.operator}")
-    return _operator_callable(rule.operator)(signal, float(rule.threshold))
-
-
-def _resolve_signal(df: pd.DataFrame, signal_name: str, period: int) -> pd.Series:
-    """Resolve a named signal series for rule evaluation."""
-
-    lowered = signal_name.strip().lower()
-    if lowered == "rsi":
-        return compute_rsi(df, period=period)
-    if lowered == "mfi":
-        return compute_mfi(df, period=period)
-    if lowered == "close":
-        return df["close"].astype("float32")
-
-    raise ValueError(f"Unsupported signal for AlphaTrend rule: {signal_name}")
-
-
-def compute_alphatrend(df: pd.DataFrame, cfg: AlphaTrendConfig) -> tuple[pd.Series, pd.Series]:
-    """Compute AlphaTrend line and direction (+1/-1) from configurable threshold rules."""
-
-    if cfg.period <= 0:
-        raise ValueError("alphatrend.period must be > 0")
-    if cfg.signal_period <= 0:
-        raise ValueError("alphatrend.signal_period must be > 0")
-    if cfg.atr_multiplier <= 0:
-        raise ValueError("alphatrend.atr_multiplier must be > 0")
-
-    if not cfg.long_rule.signal.strip() or not cfg.short_rule.signal.strip():
-        raise ValueError("alphatrend long_rule.signal and short_rule.signal are required")
-
-    atr = compute_atr(df, period=cfg.period).astype("float64")
-    low = df["low"].astype("float64")
-    high = df["high"].astype("float64")
-
-    up_level = low - (cfg.atr_multiplier * atr)
-    down_level = high + (cfg.atr_multiplier * atr)
-
-    long_signal = _resolve_signal(df, cfg.long_rule.signal, period=cfg.signal_period)
-    short_signal = _resolve_signal(df, cfg.short_rule.signal, period=cfg.signal_period)
-
-    long_condition = evaluate_rule(long_signal, cfg.long_rule)
-    short_condition = evaluate_rule(short_signal, cfg.short_rule)
-
-    rows = len(df)
-    alphatrend = np.empty(rows, dtype=np.float64)
-    direction = np.empty(rows, dtype=np.int8)
-
-    up_arr = up_level.to_numpy(dtype=np.float64, copy=False)
-    down_arr = down_level.to_numpy(dtype=np.float64, copy=False)
-    long_arr = long_condition.to_numpy(dtype=np.bool_, copy=False)
-    short_arr = short_condition.to_numpy(dtype=np.bool_, copy=False)
-
-    for idx in range(rows):
-        if idx == 0:
-            alphatrend[idx] = up_arr[idx]
-            direction[idx] = 1
-            continue
-
-        long_active = bool(long_arr[idx] and not short_arr[idx])
-        short_active = bool(short_arr[idx] and not long_arr[idx])
-
-        if long_active:
-            alphatrend[idx] = max(alphatrend[idx - 1], up_arr[idx])
-            direction[idx] = 1
-        elif short_active:
-            alphatrend[idx] = min(alphatrend[idx - 1], down_arr[idx])
-            direction[idx] = -1
-        else:
-            alphatrend[idx] = alphatrend[idx - 1]
-            direction[idx] = direction[idx - 1]
-
-    return (
-        pd.Series(alphatrend, index=df.index, name="alphatrend", dtype="float32"),
-        pd.Series(direction, index=df.index, name="alphatrend_direction_raw", dtype="int8"),
-    )
-
-
-def compute_indicator_core(
-    df: pd.DataFrame,
-    supertrend_cfg: SuperTrendConfig,
-    alphatrend_cfg: AlphaTrendConfig,
-    rsi_cfg: RsiConfig,
-    pivot_cfg: PivotPolicyConfig,
+def _apply_first_session_fill(
+    pivots: pd.DataFrame,
+    sessions: pd.Series,
+    first_session_fill: str,
 ) -> pd.DataFrame:
-    """Compute continuous indicators and internal trend-direction helpers."""
+    """Apply optional first-session fill to pivot columns."""
+
+    normalized_fill = first_session_fill.strip().lower()
+    if normalized_fill != "ffill_from_second_session":
+        return pivots
+
+    ordered_sessions = sessions.drop_duplicates()
+    if len(ordered_sessions) < 2:
+        LOGGER.warning(
+            "pivot.first_session_fill requested but skipped due to insufficient sessions | sessions=%d",
+            int(sessions.nunique()),
+        )
+        return pivots
+
+    first_session = ordered_sessions.iloc[0]
+    second_session = ordered_sessions.iloc[1]
+    first_mask = sessions.eq(first_session)
+    second_mask = sessions.eq(second_session)
+
+    second_session_pivots = pivots.loc[second_mask, list(PIVOT_FEATURE_COLUMNS)]
+    if second_session_pivots.empty:
+        return pivots
+
+    fill_values = second_session_pivots.iloc[0].to_numpy(dtype=np.float64, copy=False)
+    pivots.loc[first_mask, list(PIVOT_FEATURE_COLUMNS)] = fill_values
+    LOGGER.info("Applied pivot first-session fill from second session | rows=%d", int(first_mask.sum()))
+    return pivots
+
+
+def compute_daily_pivots_with_std_bands(
+    df: pd.DataFrame,
+    warmup_policy: str = "allow_first_session_nan",
+    first_session_fill: str = "none",
+    pivot_tf: str = "1D",
+) -> pd.DataFrame:
+    """Compute leak-free traditional pivots with warmup policy handling."""
+
+    _normalize_pivot_policies(warmup_policy, first_session_fill)
+    if pivot_tf.strip() != _LOCKED_PIVOT_TF:
+        raise ValueError(f"pivot.pivot_tf must be fixed at {_LOCKED_PIVOT_TF}")
 
     ohlcv = validate_ohlcv_frame(df)
+    indexed = _to_datetime_index(ohlcv)
+    pivots = ref.compute_pivots_traditional(indexed, pivot_tf=pivot_tf)
 
-    supertrend, supertrend_direction = compute_supertrend(ohlcv, supertrend_cfg)
-    alphatrend, alphatrend_direction = compute_alphatrend(ohlcv, alphatrend_cfg)
-    rsi_derivatives = compute_rsi_derivatives(ohlcv, rsi_cfg)
-    ema_features = compute_ema_features(ohlcv)
-    pivot_features = compute_daily_pivots_with_std_bands(
+    out = pivots.reset_index(drop=True)
+    out.index = ohlcv.index
+    sessions = ohlcv["timestamp"].dt.floor("D")
+    out = _apply_first_session_fill(out, sessions=sessions, first_session_fill=first_session_fill)
+    return out.astype("float32")
+
+
+def _build_indicator_core(ohlcv: pd.DataFrame, cfg: FeatureBuildConfig) -> IndicatorCoreOutput:
+    """Compute reference-locked indicator blocks."""
+
+    indexed = _to_datetime_index(ohlcv)
+    pivots = compute_daily_pivots_with_std_bands(
         ohlcv,
-        warmup_policy=pivot_cfg.warmup_policy,
-        first_session_fill=pivot_cfg.first_session_fill,
+        warmup_policy=cfg.pivot.warmup_policy,
+        first_session_fill=cfg.pivot.first_session_fill,
+        pivot_tf=cfg.pivot.pivot_tf,
     )
 
-    features = pd.concat(
+    ema_block = ref.compute_ema_set(indexed, price_col="close").reset_index(drop=True)
+    ema_block.index = ohlcv.index
+
+    alpha_block = ref.compute_alphatrend(
+        indexed,
+        cfg=ref.AlphaTrendConfig(
+            coeff=cfg.alphatrend.coeff,
+            ap=cfg.alphatrend.ap,
+            use_no_volume=cfg.alphatrend.use_no_volume,
+        ),
+        show_progress=False,
+    ).reset_index(drop=True)
+    alpha_block.index = ohlcv.index
+
+    supertrend_block = ref.compute_supertrend(
+        indexed,
+        cfg=ref.SupertrendConfig(
+            periods=cfg.supertrend.periods,
+            multiplier=cfg.supertrend.multiplier,
+            source=cfg.supertrend.source,
+            change_atr_method=cfg.supertrend.change_atr_method,
+        ),
+        show_progress=False,
+    ).reset_index(drop=True)
+    supertrend_block.index = ohlcv.index
+
+    continuous = pd.concat(
         [
-            supertrend,
-            alphatrend,
-            rsi_derivatives,
-            ema_features,
-            pivot_features,
-            supertrend_direction,
-            alphatrend_direction,
+            pivots,
+            ema_block.loc[:, ["EMA_200", "EMA_600", "EMA_1200"]],
+            alpha_block.loc[:, ["AlphaTrend", "AlphaTrend_2"]],
+            supertrend_block.loc[:, ["ST_trend", "ST_up", "ST_dn"]],
         ],
         axis=1,
     )
 
-    return features
-
-
-def generate_raw_event_flags(indicators: pd.DataFrame, cfg: EventConfig) -> pd.DataFrame:
-    """Generate raw event flags before leak-free shift(1) enforcement."""
-
-    required = {"supertrend_direction_raw", "alphatrend_direction_raw", "rsi"}
-    missing = sorted(required.difference(indicators.columns))
-    if missing:
-        raise ValueError(f"Missing required indicator columns for event generation: {missing}")
-
-    if cfg.rsi_oversold >= cfg.rsi_overbought:
-        raise ValueError("events.rsi_oversold must be strictly less than events.rsi_overbought")
-
-    super_dir = indicators["supertrend_direction_raw"].astype("int8")
-    alpha_dir = indicators["alphatrend_direction_raw"].astype("int8")
-    rsi = indicators["rsi"].astype("float32")
-
-    prev_super_dir = super_dir.shift(1).fillna(super_dir.iloc[0]).astype("int8")
-    prev_alpha_dir = alpha_dir.shift(1).fillna(alpha_dir.iloc[0]).astype("int8")
-    prev_rsi = rsi.shift(1).fillna(rsi.iloc[0]).astype("float32")
-
-    raw_events = pd.DataFrame(
-        {
-            "evt_supertrend_flip_up": (super_dir.eq(1) & prev_super_dir.eq(-1)),
-            "evt_supertrend_flip_down": (super_dir.eq(-1) & prev_super_dir.eq(1)),
-            "evt_alphatrend_flip_up": (alpha_dir.eq(1) & prev_alpha_dir.eq(-1)),
-            "evt_alphatrend_flip_down": (alpha_dir.eq(-1) & prev_alpha_dir.eq(1)),
-            "evt_rsi_cross_center_up": (rsi >= cfg.rsi_centerline) & (prev_rsi < cfg.rsi_centerline),
-            "evt_rsi_cross_center_down": (rsi <= cfg.rsi_centerline) & (prev_rsi > cfg.rsi_centerline),
-            "evt_rsi_overbought": (rsi >= cfg.rsi_overbought) & (prev_rsi < cfg.rsi_overbought),
-            "evt_rsi_oversold": (rsi <= cfg.rsi_oversold) & (prev_rsi > cfg.rsi_oversold),
-        },
-        index=indicators.index,
+    raw_events = pd.concat(
+        [
+            alpha_block.loc[:, ["AT_buy_raw", "AT_sell_raw", "AT_buy", "AT_sell"]],
+            supertrend_block.loc[:, ["ST_buy", "ST_sell"]],
+        ],
+        axis=1,
     )
-    return raw_events
+
+    return IndicatorCoreOutput(continuous=continuous, raw_events=raw_events)
+
+
+def generate_raw_event_flags(raw_indicator_events: pd.DataFrame) -> pd.DataFrame:
+    """Map raw indicator event signals into pipeline raw event columns."""
+
+    missing = sorted(set(RAW_EVENT_COLUMNS).difference(raw_indicator_events.columns))
+    if missing:
+        raise ValueError(f"Missing raw indicator event columns: {missing}")
+
+    out = pd.DataFrame(index=raw_indicator_events.index)
+    for raw_col, event_col in RAW_TO_EVENT_COLUMN.items():
+        out[event_col] = raw_indicator_events[raw_col].fillna(0).astype("uint8")
+    return out
 
 
 def _shift_flag_one(raw_flag: pd.Series) -> pd.Series:
-    """Shift a boolean event by exactly one bar and convert to uint8."""
+    """Shift one bar and convert to uint8."""
 
-    raw_uint8 = raw_flag.fillna(False).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+    raw_uint8 = raw_flag.fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
     shifted = np.zeros(len(raw_uint8), dtype=np.uint8)
     if len(raw_uint8) > 1:
         shifted[1:] = raw_uint8[:-1]
@@ -651,7 +347,7 @@ def _shift_flag_one(raw_flag: pd.Series) -> pd.Series:
 
 
 def enforce_shift_one(raw_events: pd.DataFrame) -> pd.DataFrame:
-    """Enforce strict leak-free shift(1) for every event column."""
+    """Enforce strict shift(1) for every event column."""
 
     out = pd.DataFrame(index=raw_events.index)
     for col in EVENT_FLAG_COLUMNS:
@@ -662,13 +358,13 @@ def enforce_shift_one(raw_events: pd.DataFrame) -> pd.DataFrame:
 
 
 def validate_shift_one(raw_events: pd.DataFrame, shifted_events: pd.DataFrame) -> bool:
-    """Validate strict shift(1) relation between raw and final event flags."""
+    """Validate strict shift(1) relation for event columns."""
 
     for col in EVENT_FLAG_COLUMNS:
         if col not in raw_events.columns or col not in shifted_events.columns:
             return False
 
-        raw_uint8 = raw_events[col].fillna(False).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+        raw_uint8 = raw_events[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
         shifted_uint8 = shifted_events[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
 
         if len(raw_uint8) != len(shifted_uint8):
@@ -682,38 +378,87 @@ def validate_shift_one(raw_events: pd.DataFrame, shifted_events: pd.DataFrame) -
     return True
 
 
+def _float_parity_equal(actual: pd.Series, expected: pd.Series, atol: float, rtol: float) -> bool:
+    """Return allclose with NaN-aware comparison."""
+
+    actual_arr = actual.to_numpy(dtype=np.float64, copy=False)
+    expected_arr = expected.to_numpy(dtype=np.float64, copy=False)
+    if actual_arr.shape != expected_arr.shape:
+        return False
+    return bool(np.allclose(actual_arr, expected_arr, atol=atol, rtol=rtol, equal_nan=True))
+
+
+def evaluate_indicator_parity(
+    ohlcv: pd.DataFrame,
+    core_output: IndicatorCoreOutput,
+    cfg: FeatureBuildConfig,
+) -> tuple[str, dict[str, bool]]:
+    """Run deterministic parity checks against reference source on a small sample."""
+
+    if not cfg.parity.enabled:
+        return "disabled", {}
+
+    sample_rows = min(int(cfg.parity.sample_rows), int(len(ohlcv)))
+    if sample_rows <= 0:
+        raise ValueError("parity.sample_rows must be > 0 when parity is enabled")
+
+    sample = ohlcv.iloc[:sample_rows].copy()
+    expected = _build_indicator_core(sample, cfg)
+    actual_cont = core_output.continuous.iloc[:sample_rows]
+    actual_raw = core_output.raw_events.iloc[:sample_rows]
+
+    details: dict[str, bool] = {}
+
+    for col in CONTINUOUS_FEATURE_COLUMNS:
+        details[col] = _float_parity_equal(
+            actual_cont[col],
+            expected.continuous[col],
+            atol=cfg.parity.float_atol,
+            rtol=cfg.parity.float_rtol,
+        )
+
+    for col in RAW_EVENT_COLUMNS:
+        actual_arr = actual_raw[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+        expected_arr = expected.raw_events[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+        details[col] = bool(np.array_equal(actual_arr, expected_arr))
+
+    failed = sorted(key for key, passed in details.items() if not passed)
+    if failed:
+        LOGGER.error("Indicator parity check failed | failed_columns=%s", failed)
+        return "failed", details
+
+    return "passed", details
+
+
 def _resolve_path(value: str, base_dir: Path) -> Path:
+    """Resolve relative path against config directory."""
+
     path = Path(value)
     return path if path.is_absolute() else (base_dir / path).resolve()
 
 
 def _get_required_dict(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return required dict node."""
+
     value = raw.get(key)
     if not isinstance(value, dict):
         raise ValueError(f"Missing or invalid dictionary config key: {key}")
     return value
 
 
-def _get_required_numeric(raw: dict[str, Any], key: str) -> float:
-    value = raw.get(key, None)
-    if value is None:
-        raise ValueError(f"alphatrend.{key} is required")
-    return float(value)
+def _get_required_value(raw: dict[str, Any], key: str, section: str) -> Any:
+    """Get required key from a section."""
+
+    if key not in raw:
+        raise ValueError(f"{section}.{key} is required")
+    return raw[key]
 
 
-def _parse_rule(raw: dict[str, Any], key: str) -> ThresholdRule:
-    node = _get_required_dict(raw, key)
-    signal = str(node.get("signal", "")).strip()
-    operator = str(node.get("op", "")).strip()
-    if not signal:
-        raise ValueError(f"alphatrend.{key}.signal is required")
-    if not operator:
-        raise ValueError(f"alphatrend.{key}.op is required")
-    if operator not in _ALLOWED_RULE_OPERATORS:
-        raise ValueError(f"Unsupported alphatrend.{key}.op: {operator}")
-    if "threshold" not in node:
-        raise ValueError(f"alphatrend.{key}.threshold is required")
-    return ThresholdRule(signal=signal, operator=operator, threshold=float(node["threshold"]))
+def _compute_config_hash(raw: dict[str, Any]) -> str:
+    """Compute deterministic SHA256 hash for config payload."""
+
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def load_feature_config(path: Path) -> FeatureBuildConfig:
@@ -729,59 +474,51 @@ def load_feature_config(path: Path) -> FeatureBuildConfig:
     base_dir = path.resolve().parent
     supertrend_cfg = _get_required_dict(raw, "supertrend")
     alphatrend_cfg = _get_required_dict(raw, "alphatrend")
-    rsi_cfg = _get_required_dict(raw, "rsi")
-    events_cfg = _get_required_dict(raw, "events")
-    pivot_cfg = raw.get("pivot", {})
-    if not isinstance(pivot_cfg, dict):
-        raise ValueError("pivot must be a dictionary if provided")
-    health_cfg = raw.get("health", {})
-    if not isinstance(health_cfg, dict):
-        raise ValueError("health must be a dictionary if provided")
+    pivot_cfg = _get_required_dict(raw, "pivot")
+    parity_cfg = _get_required_dict(raw, "parity")
+    health_cfg = _get_required_dict(raw, "health")
 
     cfg = FeatureBuildConfig(
-        input_root=_resolve_path(str(raw.get("input_root", "")), base_dir),
-        runs_root=_resolve_path(str(raw.get("runs_root", "runs")), base_dir),
-        parquet_glob=str(raw.get("parquet_glob", "*.parquet")),
-        seed=int(raw.get("seed", 42)),
+        input_root=_resolve_path(str(_get_required_value(raw, "input_root", "root")), base_dir),
+        runs_root=_resolve_path(str(_get_required_value(raw, "runs_root", "root")), base_dir),
+        parquet_glob=str(_get_required_value(raw, "parquet_glob", "root")),
+        seed=int(_get_required_value(raw, "seed", "root")),
         supertrend=SuperTrendConfig(
-            period=int(supertrend_cfg.get("period", 10)),
-            multiplier=float(supertrend_cfg.get("multiplier", 3.0)),
+            periods=int(_get_required_value(supertrend_cfg, "periods", "supertrend")),
+            multiplier=float(_get_required_value(supertrend_cfg, "multiplier", "supertrend")),
+            source=str(_get_required_value(supertrend_cfg, "source", "supertrend")),
+            change_atr_method=bool(_get_required_value(supertrend_cfg, "change_atr_method", "supertrend")),
         ),
         alphatrend=AlphaTrendConfig(
-            period=int(_get_required_numeric(alphatrend_cfg, "period")),
-            atr_multiplier=float(_get_required_numeric(alphatrend_cfg, "atr_multiplier")),
-            signal_period=int(alphatrend_cfg.get("signal_period", 14)),
-            long_rule=_parse_rule(alphatrend_cfg, "long_rule"),
-            short_rule=_parse_rule(alphatrend_cfg, "short_rule"),
-        ),
-        rsi=RsiConfig(
-            period=int(rsi_cfg.get("period", 14)),
-            slope_lag=int(rsi_cfg.get("slope_lag", 3)),
-            zscore_window=int(rsi_cfg.get("zscore_window", 50)),
-        ),
-        events=EventConfig(
-            rsi_centerline=float(events_cfg.get("rsi_centerline", 50.0)),
-            rsi_overbought=float(events_cfg.get("rsi_overbought", 70.0)),
-            rsi_oversold=float(events_cfg.get("rsi_oversold", 30.0)),
+            coeff=float(_get_required_value(alphatrend_cfg, "coeff", "alphatrend")),
+            ap=int(_get_required_value(alphatrend_cfg, "ap", "alphatrend")),
+            use_no_volume=bool(_get_required_value(alphatrend_cfg, "use_no_volume", "alphatrend")),
         ),
         pivot=PivotPolicyConfig(
-            warmup_policy=str(pivot_cfg.get("warmup_policy", "allow_first_session_nan")),
-            first_session_fill=str(pivot_cfg.get("first_session_fill", "none")),
+            pivot_tf=str(_get_required_value(pivot_cfg, "pivot_tf", "pivot")),
+            warmup_policy=str(_get_required_value(pivot_cfg, "warmup_policy", "pivot")),
+            first_session_fill=str(_get_required_value(pivot_cfg, "first_session_fill", "pivot")),
+        ),
+        parity=ParityPolicyConfig(
+            enabled=bool(_get_required_value(parity_cfg, "enabled", "parity")),
+            sample_rows=int(_get_required_value(parity_cfg, "sample_rows", "parity")),
+            float_atol=float(_get_required_value(parity_cfg, "float_atol", "parity")),
+            float_rtol=float(_get_required_value(parity_cfg, "float_rtol", "parity")),
         ),
         health=HealthPolicyConfig(
-            warn_ratio=float(health_cfg.get("warn_ratio", 0.005)),
-            critical_warn_ratio=float(health_cfg.get("critical_warn_ratio", 0.001)),
-            critical_columns=tuple(
-                str(col) for col in health_cfg.get("critical_columns", ("supertrend", "alphatrend", "rsi"))
-            ),
+            warn_ratio=float(_get_required_value(health_cfg, "warn_ratio", "health")),
+            critical_warn_ratio=float(_get_required_value(health_cfg, "critical_warn_ratio", "health")),
+            critical_columns=tuple(str(col) for col in _get_required_value(health_cfg, "critical_columns", "health")),
         ),
+        config_hash=_compute_config_hash(raw),
+        indicator_spec_version=INDICATOR_SPEC_VERSION,
     )
     validate_feature_config(cfg)
     return cfg
 
 
 def validate_feature_config(cfg: FeatureBuildConfig) -> None:
-    """Validate semantic constraints for feature build config."""
+    """Validate semantic constraints and lock forbidden overrides."""
 
     if not cfg.input_root.exists():
         raise FileNotFoundError(f"input_root does not exist: {cfg.input_root}")
@@ -791,8 +528,35 @@ def validate_feature_config(cfg: FeatureBuildConfig) -> None:
         raise ValueError("parquet_glob cannot be empty")
     if cfg.seed < 0:
         raise ValueError("seed must be >= 0")
-    if cfg.events.rsi_oversold >= cfg.events.rsi_overbought:
-        raise ValueError("events.rsi_oversold must be < events.rsi_overbought")
+
+    if cfg.supertrend.periods != _LOCKED_SUPERTREND_PERIODS:
+        raise ValueError(f"supertrend.periods must be fixed at {_LOCKED_SUPERTREND_PERIODS}")
+    if cfg.supertrend.multiplier != _LOCKED_SUPERTREND_MULTIPLIER:
+        raise ValueError(f"supertrend.multiplier must be fixed at {_LOCKED_SUPERTREND_MULTIPLIER}")
+    if cfg.supertrend.source.strip().lower() != _LOCKED_SUPERTREND_SOURCE:
+        raise ValueError(f"supertrend.source must be fixed at {_LOCKED_SUPERTREND_SOURCE}")
+    if cfg.supertrend.change_atr_method is not _LOCKED_SUPERTREND_CHANGE_ATR_METHOD:
+        raise ValueError("supertrend.change_atr_method must be fixed at true")
+
+    if cfg.alphatrend.coeff != _LOCKED_ALPHATREND_COEFF:
+        raise ValueError(f"alphatrend.coeff must be fixed at {_LOCKED_ALPHATREND_COEFF}")
+    if cfg.alphatrend.ap != _LOCKED_ALPHATREND_AP:
+        raise ValueError(f"alphatrend.ap must be fixed at {_LOCKED_ALPHATREND_AP}")
+
+    if cfg.pivot.pivot_tf.strip() != _LOCKED_PIVOT_TF:
+        raise ValueError(f"pivot.pivot_tf must be fixed at {_LOCKED_PIVOT_TF}")
+    if cfg.pivot.warmup_policy.strip().lower() not in _ALLOWED_PIVOT_WARMUP_POLICIES:
+        raise ValueError("pivot.warmup_policy has unsupported value")
+    if cfg.pivot.first_session_fill.strip().lower() not in _ALLOWED_PIVOT_FIRST_SESSION_FILL:
+        raise ValueError("pivot.first_session_fill has unsupported value")
+
+    if cfg.parity.sample_rows <= 0:
+        raise ValueError("parity.sample_rows must be > 0")
+    if cfg.parity.float_atol < 0.0:
+        raise ValueError("parity.float_atol must be >= 0")
+    if cfg.parity.float_rtol < 0.0:
+        raise ValueError("parity.float_rtol must be >= 0")
+
     if not (0.0 <= cfg.health.warn_ratio <= 1.0):
         raise ValueError("health.warn_ratio must be in [0.0, 1.0]")
     if not (0.0 <= cfg.health.critical_warn_ratio <= 1.0):
@@ -801,24 +565,6 @@ def validate_feature_config(cfg: FeatureBuildConfig) -> None:
         raise ValueError("health.critical_warn_ratio must be <= health.warn_ratio")
     if not cfg.health.critical_columns:
         raise ValueError("health.critical_columns cannot be empty")
-    if cfg.pivot.warmup_policy.strip().lower() not in _ALLOWED_PIVOT_WARMUP_POLICIES:
-        raise ValueError(
-            "pivot.warmup_policy must be one of: "
-            + ", ".join(_ALLOWED_PIVOT_WARMUP_POLICIES)
-        )
-    if cfg.pivot.first_session_fill.strip().lower() not in _ALLOWED_PIVOT_FIRST_SESSION_FILL:
-        raise ValueError(
-            "pivot.first_session_fill must be one of: "
-            + ", ".join(_ALLOWED_PIVOT_FIRST_SESSION_FILL)
-        )
-    if cfg.alphatrend.period != ALPHATREND_LOCK_PERIOD:
-        raise ValueError(f"alphatrend.period must be fixed at {ALPHATREND_LOCK_PERIOD}")
-    if cfg.alphatrend.atr_multiplier != ALPHATREND_LOCK_ATR_MULTIPLIER:
-        raise ValueError(f"alphatrend.atr_multiplier must be fixed at {ALPHATREND_LOCK_ATR_MULTIPLIER}")
-    if cfg.alphatrend.long_rule.signal.strip() == "":
-        raise ValueError("alphatrend.long_rule.signal is required")
-    if cfg.alphatrend.short_rule.signal.strip() == "":
-        raise ValueError("alphatrend.short_rule.signal is required")
 
 
 def discover_parquet_files(input_root: Path, parquet_glob: str = "*.parquet") -> list[Path]:
@@ -861,25 +607,29 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
     """Build feature table plus raw/shifted events for one input dataframe."""
 
     ohlcv = validate_ohlcv_frame(df)
-    indicators = compute_indicator_core(
-        df=ohlcv,
-        supertrend_cfg=cfg.supertrend,
-        alphatrend_cfg=cfg.alphatrend,
-        rsi_cfg=cfg.rsi,
-        pivot_cfg=cfg.pivot,
-    )
-    raw_events = generate_raw_event_flags(indicators, cfg.events)
+    core_output = _build_indicator_core(ohlcv, cfg)
+
+    raw_events = generate_raw_event_flags(core_output.raw_events)
     shifted_events = enforce_shift_one(raw_events)
     if not validate_shift_one(raw_events, shifted_events):
         raise ValueError("Strict shift(1) validation failed for event columns")
 
+    parity_status, parity_details = evaluate_indicator_parity(ohlcv, core_output, cfg)
+
     frame = pd.concat(
         [
             ohlcv,
-            indicators.loc[:, list(CONTINUOUS_FEATURE_COLUMNS)],
+            core_output.continuous.loc[:, list(CONTINUOUS_FEATURE_COLUMNS)],
             shifted_events.loc[:, list(EVENT_FLAG_COLUMNS)],
         ],
         axis=1,
     )
     frame = apply_dtype_policy(frame)
-    return FeatureBuildArtifacts(frame=frame, raw_events=raw_events, shifted_events=shifted_events)
+
+    return FeatureBuildArtifacts(
+        frame=frame,
+        raw_events=raw_events,
+        shifted_events=shifted_events,
+        indicator_parity_status=parity_status,
+        indicator_parity_details=parity_details,
+    )

@@ -34,8 +34,11 @@ class FeatureHealthReport:
     dtype_ok: bool = False
     leakfree_ok: bool = False
     nan_ratio_ok: bool = False
+    parity_ok: bool = False
     status: str = "failed"
     output_file: str | None = None
+    indicator_parity_status: str = "not_checked"
+    indicator_parity_details: dict[str, bool] = field(default_factory=dict)
     pivot_first_session_allowed_nan: bool = False
     pivot_first_session_rows: int = 0
     pivot_nonnull_ratio_after_first_session: float = 1.0
@@ -89,6 +92,8 @@ def evaluate_feature_health(
     critical_columns: Sequence[str],
     pivot_warmup_policy: str,
     pivot_first_session_fill: str,
+    indicator_parity_status: str,
+    indicator_parity_details: dict[str, bool],
 ) -> FeatureHealthReport:
     """Run strict QC gates for feature outputs and update report in place."""
 
@@ -117,6 +122,19 @@ def evaluate_feature_health(
     report.leakfree_ok = validate_shift_one(raw_events, shifted_events)
     if not report.leakfree_ok:
         add_error(report, stage="gates", code="LEAKFREE_SHIFT_FAILED", message="Event flags are not strict shift(1)")
+
+    report.indicator_parity_status = indicator_parity_status
+    report.indicator_parity_details = dict(indicator_parity_details)
+    report.parity_ok = indicator_parity_status in {"passed", "disabled"}
+    if not report.parity_ok:
+        failed = sorted(key for key, passed in report.indicator_parity_details.items() if not passed)
+        add_error(
+            report,
+            stage="gates",
+            code="INDICATOR_PARITY_FAILED",
+            message="Indicator parity check failed.",
+            failed_columns=failed,
+        )
 
     report.nan_ratio_ok = True
     critical_set = {col.strip() for col in critical_columns if str(col).strip()}
@@ -158,6 +176,7 @@ def evaluate_feature_health(
             and bool(first_session_pivots.notna().all(axis=0).all())
         ):
             report.pivot_fill_strategy_applied = "ffill_from_second_session"
+
         first_session_has_nan = bool(first_session_pivots.isna().any(axis=0).any())
         if report.pivot_first_session_allowed_nan and first_session_has_nan:
             add_warning(
@@ -165,13 +184,14 @@ def evaluate_feature_health(
                 "Pivot first-session NaN warmup exception used."
                 f" rows={report.pivot_first_session_rows}",
             )
+
         if (not report.pivot_first_session_allowed_nan) and first_session_has_nan:
             report.nan_ratio_ok = False
             add_error(
                 report,
                 stage="gates",
                 code="PIVOT_FIRST_SESSION_NULL_NOT_ALLOWED",
-                message="Pivot columns contain NaN values in first session but warmup policy disallows it.",
+                message="Pivot columns contain NaN in first session but warmup policy disallows it.",
             )
 
         total_after_first = int(after_first_session.shape[0] * after_first_session.shape[1])
@@ -200,6 +220,7 @@ def evaluate_feature_health(
         ratio = float(feature_df[col].isna().mean())
         report.nan_ratios[col] = ratio
         gate_ratio = ratio
+
         if (
             col in PIVOT_FEATURE_COLUMNS
             and report.pivot_first_session_allowed_nan
@@ -245,6 +266,7 @@ def health_check(report: FeatureHealthReport) -> bool:
         and report.dtype_ok
         and report.leakfree_ok
         and report.nan_ratio_ok
+        and report.parity_ok
         and report.rows_out > 0
         and len(report.errors) == 0
     )
@@ -256,6 +278,7 @@ def summarize_feature_reports(reports: list[FeatureHealthReport]) -> dict[str, A
     total_files = len(reports)
     succeeded_files = sum(1 for report in reports if report.status == "success")
     failed_files = total_files - succeeded_files
+    parity_status_overall = all(report.parity_ok for report in reports)
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -265,4 +288,5 @@ def summarize_feature_reports(reports: list[FeatureHealthReport]) -> dict[str, A
         "total_rows_in": sum(report.rows_in for report in reports),
         "total_rows_out": sum(report.rows_out for report in reports),
         "failed_inputs": [report.input_file for report in reports if report.status == "failed"],
+        "parity_status_overall": parity_status_overall,
     }

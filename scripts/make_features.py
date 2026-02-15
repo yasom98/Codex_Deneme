@@ -105,6 +105,8 @@ def main() -> int:
                 critical_columns=cfg.health.critical_columns,
                 pivot_warmup_policy=cfg.pivot.warmup_policy,
                 pivot_first_session_fill=cfg.pivot.first_session_fill,
+                indicator_parity_status=artifacts.indicator_parity_status,
+                indicator_parity_details=artifacts.indicator_parity_details,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             add_error(report, stage="build", code="FEATURE_BUILD_FAILED", message=str(exc))
@@ -133,6 +135,8 @@ def main() -> int:
     summary = summarize_feature_reports(reports)
     summary["run_id"] = run_id
     summary["run_root"] = str(run_root)
+    summary["indicator_spec_version"] = cfg.indicator_spec_version
+    summary["config_hash"] = cfg.config_hash
 
     LOGGER.info(
         "Feature build summary | run_id=%s total=%d success=%d failed=%d",
