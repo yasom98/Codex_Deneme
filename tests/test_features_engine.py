@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from data.features import PIVOT_FEATURE_COLUMNS
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "make_features.py"
@@ -39,7 +41,7 @@ def _nan_df(rows: int = 60) -> pd.DataFrame:
     return df
 
 
-def _write_config(config_path: Path, input_root: Path, runs_root: Path) -> None:
+def _write_config(config_path: Path, input_root: Path, runs_root: Path, first_session_fill: str = "none") -> None:
     config_path.write_text(
         "\n".join(
             [
@@ -74,6 +76,10 @@ def _write_config(config_path: Path, input_root: Path, runs_root: Path) -> None:
                 "  rsi_centerline: 50.0",
                 "  rsi_overbought: 70.0",
                 "  rsi_oversold: 30.0",
+                "",
+                "pivot:",
+                "  warmup_policy: allow_first_session_nan",
+                f"  first_session_fill: {first_session_fill}",
                 "",
                 "health:",
                 "  warn_ratio: 0.005",
@@ -137,9 +143,74 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
 
     assert per_file_payload["status"] == "success"
+    assert per_file_payload["pivot_first_session_allowed_nan"] is True
+    assert per_file_payload["pivot_first_session_rows"] == 1
+    assert per_file_payload["pivot_nonnull_ratio_after_first_session"] == 1.0
+    assert per_file_payload["pivot_fill_strategy_applied"] == "none"
+    assert any("Pivot first-session NaN warmup exception used." in msg for msg in per_file_payload["warnings"])
     assert summary_payload["succeeded_files"] == 1
     assert summary_payload["failed_files"] == 0
     assert not list(run_root.rglob("*.tmp"))
+
+
+def test_make_features_cli_fails_on_empty_pivot_mapping(monkeypatch: object, tmp_path: Path) -> None:
+    input_root = tmp_path / "in"
+    runs_root = tmp_path / "runs"
+    input_root.mkdir(parents=True, exist_ok=True)
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    (input_root / "pivot_bug.parquet").write_text("placeholder", encoding="utf-8")
+    config_path = tmp_path / "features.yaml"
+    _write_config(config_path, input_root=input_root, runs_root=runs_root)
+
+    def fake_read_parquet(path: Path) -> pd.DataFrame:
+        del path
+        return _healthy_df()
+
+    def fake_to_parquet(self: pd.DataFrame, path: Path, index: bool = False) -> None:
+        del self, index
+        Path(path).write_text("ok", encoding="utf-8")
+
+    def fake_all_nan_pivots(
+        df: pd.DataFrame,
+        warmup_policy: str = "allow_first_session_nan",
+        first_session_fill: str = "none",
+    ) -> pd.DataFrame:
+        del warmup_policy, first_session_fill
+        return pd.DataFrame(
+            {col: np.full(len(df), np.nan, dtype=np.float32) for col in PIVOT_FEATURE_COLUMNS},
+            index=df.index,
+        )
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
+    monkeypatch.setattr("data.features.compute_daily_pivots_with_std_bands", fake_all_nan_pivots)
+
+    main = _load_main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["make_features.py", "--config", str(config_path), "--run-id", "pivot_fail_run"],
+    )
+
+    exit_code = int(main())
+    assert exit_code == 1
+
+    run_root = runs_root / "pivot_fail_run" / "data_features"
+    out_parquet = run_root / "parquet" / "pivot_bug.parquet"
+    per_file_report = run_root / "reports" / "per_file" / "pivot_bug.json"
+    summary_report = run_root / "reports" / "summary.json"
+
+    assert not out_parquet.exists()
+    assert per_file_report.exists()
+    assert summary_report.exists()
+
+    per_file_payload = json.loads(per_file_report.read_text(encoding="utf-8"))
+    summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
+
+    assert per_file_payload["status"] == "failed"
+    assert any(error["code"] == "PIVOT_MAPPING_EMPTY" for error in per_file_payload["errors"])
+    assert summary_payload["failed_files"] == 1
 
 
 def test_make_features_cli_blocks_output_when_health_fails(monkeypatch: object, tmp_path: Path) -> None:

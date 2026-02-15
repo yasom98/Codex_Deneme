@@ -12,6 +12,7 @@ from data.features import (
     EventConfig,
     FeatureBuildConfig,
     HealthPolicyConfig,
+    PivotPolicyConfig,
     RsiConfig,
     SuperTrendConfig,
     ThresholdRule,
@@ -59,6 +60,7 @@ def _config() -> FeatureBuildConfig:
         ),
         rsi=RsiConfig(period=14, slope_lag=3, zscore_window=50),
         events=EventConfig(rsi_centerline=50.0, rsi_overbought=70.0, rsi_oversold=30.0),
+        pivot=PivotPolicyConfig(warmup_policy="allow_first_session_nan", first_session_fill="none"),
         health=HealthPolicyConfig(
             warn_ratio=0.005,
             critical_warn_ratio=0.001,
