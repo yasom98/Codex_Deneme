@@ -1,10 +1,11 @@
-"""Tests for atomic write behavior and health gate."""
+"""Tests for atomic write behavior and strict health gate."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from core.config import PipelineConfig
 from core.io_atomic import atomic_write_parquet
@@ -39,10 +40,8 @@ def test_atomic_write_parquet_cleans_tmp_on_failure(monkeypatch: object, tmp_pat
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet_fail)
 
-    try:
+    with pytest.raises(RuntimeError, match="Failed to atomically write parquet"):
         atomic_write_parquet(df, dest)
-    except RuntimeError:
-        pass
 
     assert not dest.exists()
     assert not tmp_dest.exists()
@@ -50,8 +49,7 @@ def test_atomic_write_parquet_cleans_tmp_on_failure(monkeypatch: object, tmp_pat
 
 def test_health_gate_blocks_output_write(tmp_path: Path) -> None:
     input_root = tmp_path / "in"
-    output_root = tmp_path / "out"
-    reports_root = tmp_path / "reports"
+    runs_root = tmp_path / "runs"
     input_root.mkdir(parents=True, exist_ok=True)
 
     bad_csv = input_root / "bad.csv"
@@ -62,21 +60,28 @@ def test_health_gate_blocks_output_write(tmp_path: Path) -> None:
 
     cfg = PipelineConfig(
         input_root=input_root,
-        output_root=output_root,
-        reports_root=reports_root,
+        runs_root=runs_root,
         csv_glob="**/*.csv",
         timestamp_aliases=("timestamp", "ts", "date", "datetime", "time", "candle_time", "open_time", "close_time"),
         required_columns=("open", "high", "low", "close", "volume"),
         float_columns=("open", "high", "low", "close", "volume"),
-        fail_on_critical=True,
         duplicate_policy="last",
         seed=42,
     )
+    parquet_root = runs_root / "test_run" / "data_standardized" / "parquet"
+    per_file_reports_root = runs_root / "test_run" / "data_standardized" / "reports" / "per_file"
 
-    report = standardize_file(bad_csv, cfg=cfg, dry_run=False)
-    expected_out = output_root / "bad.parquet"
-    expected_report = reports_root / "bad.health.json"
+    report = standardize_file(
+        bad_csv,
+        cfg=cfg,
+        parquet_root=parquet_root,
+        per_file_reports_root=per_file_reports_root,
+        dry_run=False,
+    )
 
-    assert not report.success
+    expected_out = parquet_root / "bad.parquet"
+    expected_report = per_file_reports_root / "bad.json"
+
+    assert report.status == "failed"
     assert not expected_out.exists()
     assert expected_report.exists()
