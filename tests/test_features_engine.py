@@ -15,8 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "make_features.py"
 
 
-def _healthy_df(rows: int = 200) -> pd.DataFrame:
-    ts = pd.date_range("2024-01-01", periods=rows, freq="1min", tz="UTC")
+def _healthy_df(rows: int = 420) -> pd.DataFrame:
+    ts = pd.date_range("2024-01-01", periods=rows, freq="1D", tz="UTC")
     base = np.linspace(100.0, 140.0, rows)
     wiggle = np.sin(np.linspace(0.0, 12.0, rows))
     close = base + wiggle
@@ -53,8 +53,8 @@ def _write_config(config_path: Path, input_root: Path, runs_root: Path) -> None:
                 "  multiplier: 3.0",
                 "",
                 "alphatrend:",
-                "  period: 14",
-                "  atr_multiplier: 1.0",
+                "  period: 11",
+                "  atr_multiplier: 3.0",
                 "  signal_period: 14",
                 "  long_rule:",
                 "    signal: mfi",

@@ -51,8 +51,8 @@ def _config() -> FeatureBuildConfig:
         seed=42,
         supertrend=SuperTrendConfig(period=10, multiplier=3.0),
         alphatrend=AlphaTrendConfig(
-            period=14,
-            atr_multiplier=1.0,
+            period=11,
+            atr_multiplier=3.0,
             signal_period=14,
             long_rule=ThresholdRule(signal="mfi", operator=">=", threshold=50.0),
             short_rule=ThresholdRule(signal="mfi", operator="<", threshold=50.0),
