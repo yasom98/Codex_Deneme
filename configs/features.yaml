@@ -8,8 +8,8 @@ supertrend:
   multiplier: 3.0
 
 alphatrend:
-  period: 14
-  atr_multiplier: 1.0
+  period: 11
+  atr_multiplier: 3.0
   signal_period: 14
   long_rule:
     signal: mfi
