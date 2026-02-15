@@ -1,5 +1,5 @@
 input_root: /mnt/c/Users/YASİN/OneDrive/Desktop/Codex_Deneme
-runs_root: runs
+runs_root: ../runs
 csv_glob: "**/*.csv"
 timestamp_aliases:
   - timestamp
