@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from data.features import compute_daily_pivots_with_std_bands
+from data.features import PIVOT_FEATURE_COLUMNS, compute_daily_pivots_with_std_bands
 
 
 def test_daily_pivots_map_from_previous_session_only() -> None:
@@ -35,26 +35,24 @@ def test_daily_pivots_map_from_previous_session_only() -> None:
     day_1_mask = df["timestamp"].dt.floor("D") == pd.Timestamp("2024-01-01T00:00:00Z")
     day_2_mask = df["timestamp"].dt.floor("D") == pd.Timestamp("2024-01-02T00:00:00Z")
 
-    assert pivots.loc[day_1_mask, "pivot_p"].isna().all()
+    assert pivots.loc[day_1_mask, "PP"].isna().all()
 
-    expected_p = (14.0 + 9.0 + 13.0) / 3.0
+    h_prev, l_prev, c_prev = 14.0, 9.0, 13.0
+    pp = (h_prev + l_prev + c_prev) / 3.0
+    rng = h_prev - l_prev
     expected_values = {
-        "pivot_p": expected_p,
-        "pivot_r1": (2.0 * expected_p) - 9.0,
-        "pivot_s1": (2.0 * expected_p) - 14.0,
-        "pivot_r2": expected_p + (14.0 - 9.0),
-        "pivot_s2": expected_p - (14.0 - 9.0),
-        "pivot_r3": 14.0 + (2.0 * (expected_p - 9.0)),
-        "pivot_s3": 9.0 - (2.0 * (14.0 - expected_p)),
+        "PP": pp,
+        "R1": (2.0 * pp) - l_prev,
+        "S1": (2.0 * pp) - h_prev,
+        "R2": pp + rng,
+        "S2": pp - rng,
+        "R3": (2.0 * pp) + h_prev - (2.0 * l_prev),
+        "S3": (2.0 * pp) - ((2.0 * h_prev) - l_prev),
+        "R4": (3.0 * pp) + h_prev - (3.0 * l_prev),
+        "S4": (3.0 * pp) - ((3.0 * h_prev) - l_prev),
+        "R5": (4.0 * pp) + h_prev - (4.0 * l_prev),
+        "S5": (4.0 * pp) - ((4.0 * h_prev) - l_prev),
     }
-
-    day_1_std = float(np.std(np.array([10.0, 12.0, 13.0], dtype=np.float64), ddof=0))
-    expected_values["pivot_std_upper_1"] = expected_p + day_1_std
-    expected_values["pivot_std_upper_2"] = expected_p + (2.0 * day_1_std)
-    expected_values["pivot_std_upper_3"] = expected_p + (3.0 * day_1_std)
-    expected_values["pivot_std_lower_1"] = expected_p - day_1_std
-    expected_values["pivot_std_lower_2"] = expected_p - (2.0 * day_1_std)
-    expected_values["pivot_std_lower_3"] = expected_p - (3.0 * day_1_std)
 
     for col, expected in expected_values.items():
         np.testing.assert_allclose(
@@ -97,10 +95,10 @@ def test_daily_pivots_fill_first_session_from_second_session() -> None:
     first_mask = sessions.eq(first_session)
     second_mask = sessions.eq(second_session)
 
-    assert pivots_no_fill.loc[first_mask, "pivot_p"].isna().all()
-    assert pivots_fill.loc[first_mask, "pivot_p"].notna().all()
+    assert pivots_no_fill.loc[first_mask, "PP"].isna().all()
+    assert pivots_fill.loc[first_mask, "PP"].notna().all()
 
-    for col in pivots_fill.columns:
+    for col in PIVOT_FEATURE_COLUMNS:
         second_value = float(pivots_fill.loc[second_mask, col].iloc[0])
         np.testing.assert_allclose(
             pivots_fill.loc[first_mask, col].to_numpy(dtype=np.float64),

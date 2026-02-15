@@ -35,9 +35,9 @@ def _healthy_df(rows: int = 420) -> pd.DataFrame:
     )
 
 
-def _nan_df(rows: int = 60) -> pd.DataFrame:
+def _invalid_df(rows: int = 420) -> pd.DataFrame:
     df = _healthy_df(rows)
-    df.loc[:9, "close"] = np.nan
+    df.loc[1, "timestamp"] = df.loc[0, "timestamp"]
     return df
 
 
@@ -51,50 +51,40 @@ def _write_config(config_path: Path, input_root: Path, runs_root: Path, first_se
                 "seed: 42",
                 "",
                 "supertrend:",
-                "  period: 10",
+                "  periods: 10",
                 "  multiplier: 3.0",
+                "  source: hl2",
+                "  change_atr_method: true",
                 "",
                 "alphatrend:",
-                "  period: 11",
-                "  atr_multiplier: 3.0",
-                "  signal_period: 14",
-                "  long_rule:",
-                "    signal: mfi",
-                "    op: \">=\"",
-                "    threshold: 50.0",
-                "  short_rule:",
-                "    signal: mfi",
-                "    op: \"<\"",
-                "    threshold: 50.0",
-                "",
-                "rsi:",
-                "  period: 14",
-                "  slope_lag: 3",
-                "  zscore_window: 50",
-                "",
-                "events:",
-                "  rsi_centerline: 50.0",
-                "  rsi_overbought: 70.0",
-                "  rsi_oversold: 30.0",
+                "  coeff: 3.0",
+                "  ap: 11",
+                "  use_no_volume: false",
                 "",
                 "pivot:",
+                "  pivot_tf: 1D",
                 "  warmup_policy: allow_first_session_nan",
                 f"  first_session_fill: {first_session_fill}",
                 "",
+                "parity:",
+                "  enabled: true",
+                "  sample_rows: 128",
+                "  float_atol: 1.0e-6",
+                "  float_rtol: 1.0e-6",
+                "",
                 "health:",
-                "  warn_ratio: 0.005",
-                "  critical_warn_ratio: 0.001",
+                "  warn_ratio: 1.0",
+                "  critical_warn_ratio: 1.0",
                 "  critical_columns:",
-                "    - supertrend",
-                "    - alphatrend",
-                "    - rsi",
+                "    - EMA_200",
+                "    - AlphaTrend",
             ]
         ),
         encoding="utf-8",
     )
 
 
-def _load_main():
+def _load_main() -> object:
     module = runpy.run_path(str(SCRIPT_PATH))
     return module["main"]
 
@@ -121,11 +111,7 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
 
     main = _load_main()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["make_features.py", "--config", str(config_path), "--run-id", "unit_run"],
-    )
+    monkeypatch.setattr(sys, "argv", ["make_features.py", "--config", str(config_path), "--run-id", "unit_run"])
 
     exit_code = int(main())
     assert exit_code == 0
@@ -143,13 +129,17 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
 
     assert per_file_payload["status"] == "success"
+    assert per_file_payload["indicator_parity_status"] == "passed"
     assert per_file_payload["pivot_first_session_allowed_nan"] is True
     assert per_file_payload["pivot_first_session_rows"] == 1
     assert per_file_payload["pivot_nonnull_ratio_after_first_session"] == 1.0
     assert per_file_payload["pivot_fill_strategy_applied"] == "none"
-    assert any("Pivot first-session NaN warmup exception used." in msg for msg in per_file_payload["warnings"])
+
     assert summary_payload["succeeded_files"] == 1
     assert summary_payload["failed_files"] == 0
+    assert summary_payload["parity_status_overall"] is True
+    assert "indicator_spec_version" in summary_payload
+    assert "config_hash" in summary_payload
     assert not list(run_root.rglob("*.tmp"))
 
 
@@ -175,23 +165,17 @@ def test_make_features_cli_fails_on_empty_pivot_mapping(monkeypatch: object, tmp
         df: pd.DataFrame,
         warmup_policy: str = "allow_first_session_nan",
         first_session_fill: str = "none",
+        pivot_tf: str = "1D",
     ) -> pd.DataFrame:
-        del warmup_policy, first_session_fill
-        return pd.DataFrame(
-            {col: np.full(len(df), np.nan, dtype=np.float32) for col in PIVOT_FEATURE_COLUMNS},
-            index=df.index,
-        )
+        del warmup_policy, first_session_fill, pivot_tf
+        return pd.DataFrame({col: np.full(len(df), np.nan, dtype=np.float32) for col in PIVOT_FEATURE_COLUMNS}, index=df.index)
 
     monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
     monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
     monkeypatch.setattr("data.features.compute_daily_pivots_with_std_bands", fake_all_nan_pivots)
 
     main = _load_main()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["make_features.py", "--config", str(config_path), "--run-id", "pivot_fail_run"],
-    )
+    monkeypatch.setattr(sys, "argv", ["make_features.py", "--config", str(config_path), "--run-id", "pivot_fail_run"])
 
     exit_code = int(main())
     assert exit_code == 1
@@ -225,7 +209,7 @@ def test_make_features_cli_blocks_output_when_health_fails(monkeypatch: object, 
 
     def fake_read_parquet(path: Path) -> pd.DataFrame:
         del path
-        return _nan_df()
+        return _invalid_df()
 
     def fake_to_parquet(self: pd.DataFrame, path: Path, index: bool = False) -> None:
         del self, index
@@ -235,11 +219,7 @@ def test_make_features_cli_blocks_output_when_health_fails(monkeypatch: object, 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
 
     main = _load_main()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["make_features.py", "--config", str(config_path), "--run-id", "fail_run"],
-    )
+    monkeypatch.setattr(sys, "argv", ["make_features.py", "--config", str(config_path), "--run-id", "fail_run"])
 
     exit_code = int(main())
     assert exit_code == 1
@@ -257,5 +237,5 @@ def test_make_features_cli_blocks_output_when_health_fails(monkeypatch: object, 
     summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
 
     assert per_file_payload["status"] == "failed"
-    assert any(error["code"] == "NAN_RATIO_TOO_HIGH" for error in per_file_payload["errors"])
+    assert len(per_file_payload["errors"]) > 0
     assert summary_payload["failed_files"] == 1

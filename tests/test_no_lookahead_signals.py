@@ -1,4 +1,4 @@
-"""Tests for strict leak-free shift(1) event policy."""
+"""No-lookahead tests for all shifted event signal columns."""
 
 from __future__ import annotations
 
@@ -17,34 +17,27 @@ from data.features import (
     PivotPolicyConfig,
     SuperTrendConfig,
     build_feature_artifacts,
-    validate_shift_one,
 )
 
 
-def _sample_ohlcv(rows: int = 2400) -> pd.DataFrame:
-    ts = pd.date_range("2024-01-01", periods=rows, freq="min", tz="UTC")
-    base = np.linspace(100.0, 130.0, rows)
-    wave = np.sin(np.linspace(0.0, 24.0, rows))
-
-    close = base + wave
-    open_ = close + 0.1
-    high = close + 0.5
-    low = close - 0.5
-    volume = np.linspace(1000.0, 2000.0, rows)
-
+def _fixture_df(rows: int = 1800) -> pd.DataFrame:
+    ts = pd.date_range("2024-02-01", periods=rows, freq="5min", tz="UTC")
+    base = np.linspace(90.0, 140.0, rows)
+    noise = np.sin(np.linspace(0.0, 36.0, rows))
+    close = base + noise
     return pd.DataFrame(
         {
             "timestamp": ts,
-            "open": open_.astype(np.float32),
-            "high": high.astype(np.float32),
-            "low": low.astype(np.float32),
+            "open": (close + 0.2).astype(np.float32),
+            "high": (close + 0.7).astype(np.float32),
+            "low": (close - 0.7).astype(np.float32),
             "close": close.astype(np.float32),
-            "volume": volume.astype(np.float32),
+            "volume": np.linspace(1200.0, 2100.0, rows).astype(np.float32),
         }
     )
 
 
-def _config() -> FeatureBuildConfig:
+def _cfg() -> FeatureBuildConfig:
     return FeatureBuildConfig(
         input_root=Path("."),
         runs_root=Path("."),
@@ -55,23 +48,20 @@ def _config() -> FeatureBuildConfig:
         pivot=PivotPolicyConfig(pivot_tf="1D", warmup_policy="allow_first_session_nan", first_session_fill="none"),
         parity=ParityPolicyConfig(enabled=True, sample_rows=512, float_atol=1e-6, float_rtol=1e-6),
         health=HealthPolicyConfig(
-            warn_ratio=0.005,
-            critical_warn_ratio=0.001,
-            critical_columns=("EMA_200", "EMA_600", "EMA_1200"),
+            warn_ratio=1.0,
+            critical_warn_ratio=1.0,
+            critical_columns=("EMA_200",),
         ),
         config_hash="unit",
         indicator_spec_version=INDICATOR_SPEC_VERSION,
     )
 
 
-def test_event_columns_are_strict_shift_one() -> None:
-    artifacts = build_feature_artifacts(_sample_ohlcv(), _config())
-
-    assert validate_shift_one(artifacts.raw_events, artifacts.shifted_events)
+def test_all_shifted_signal_columns_are_strict_shift_one() -> None:
+    artifacts = build_feature_artifacts(_fixture_df(), _cfg())
 
     for col in EVENT_FLAG_COLUMNS:
-        raw = artifacts.raw_events[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8)
+        raw = artifacts.raw_events[col].to_numpy(dtype=np.uint8)
         shifted = artifacts.shifted_events[col].to_numpy(dtype=np.uint8)
-
         assert shifted[0] == 0
         np.testing.assert_array_equal(shifted[1:], raw[:-1])

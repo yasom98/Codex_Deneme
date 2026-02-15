@@ -11,18 +11,17 @@ from data.features import (
     CONTINUOUS_FEATURE_COLUMNS,
     EVENT_FLAG_COLUMNS,
     AlphaTrendConfig,
-    EventConfig,
     FeatureBuildConfig,
     HealthPolicyConfig,
+    INDICATOR_SPEC_VERSION,
+    ParityPolicyConfig,
     PivotPolicyConfig,
-    RsiConfig,
     SuperTrendConfig,
-    ThresholdRule,
     build_feature_artifacts,
 )
 
 
-def _sample_ohlcv(rows: int = 180) -> pd.DataFrame:
+def _sample_ohlcv(rows: int = 1800) -> pd.DataFrame:
     ts = pd.date_range("2024-01-01", periods=rows, freq="5min", tz="UTC")
     trend = np.linspace(200.0, 260.0, rows)
     noise = np.cos(np.linspace(0.0, 16.0, rows))
@@ -46,22 +45,17 @@ def _config() -> FeatureBuildConfig:
         runs_root=Path("."),
         parquet_glob="*.parquet",
         seed=42,
-        supertrend=SuperTrendConfig(period=10, multiplier=3.0),
-        alphatrend=AlphaTrendConfig(
-            period=11,
-            atr_multiplier=3.0,
-            signal_period=14,
-            long_rule=ThresholdRule(signal="mfi", operator=">=", threshold=50.0),
-            short_rule=ThresholdRule(signal="mfi", operator="<", threshold=50.0),
-        ),
-        rsi=RsiConfig(period=14, slope_lag=3, zscore_window=50),
-        events=EventConfig(rsi_centerline=50.0, rsi_overbought=70.0, rsi_oversold=30.0),
-        pivot=PivotPolicyConfig(warmup_policy="allow_first_session_nan", first_session_fill="none"),
+        supertrend=SuperTrendConfig(periods=10, multiplier=3.0, source="hl2", change_atr_method=True),
+        alphatrend=AlphaTrendConfig(coeff=3.0, ap=11, use_no_volume=False),
+        pivot=PivotPolicyConfig(pivot_tf="1D", warmup_policy="allow_first_session_nan", first_session_fill="none"),
+        parity=ParityPolicyConfig(enabled=True, sample_rows=512, float_atol=1e-6, float_rtol=1e-6),
         health=HealthPolicyConfig(
             warn_ratio=0.005,
             critical_warn_ratio=0.001,
-            critical_columns=("supertrend", "alphatrend", "rsi"),
+            critical_columns=("EMA_200", "EMA_600", "EMA_1200"),
         ),
+        config_hash="unit",
+        indicator_spec_version=INDICATOR_SPEC_VERSION,
     )
 
 
