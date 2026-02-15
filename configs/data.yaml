@@ -1,0 +1,29 @@
+input_root: /mnt/c/Users/YASİN/OneDrive/Desktop/Codex_Deneme
+output_root: data/standardized
+reports_root: data/reports
+csv_glob: "**/*.csv"
+timestamp_aliases:
+  - timestamp
+  - ts
+  - date
+  - datetime
+  - time
+  - candle_time
+  - open_time
+  - close_time
+required_columns:
+  - open
+  - high
+  - low
+  - close
+  - volume
+float_columns:
+  - open
+  - high
+  - low
+  - close
+  - volume
+fail_on_critical: true
+duplicate_policy: last
+seed: 42
+
