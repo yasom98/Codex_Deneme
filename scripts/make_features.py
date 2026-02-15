@@ -19,7 +19,14 @@ from core.io_atomic import atomic_write_json, atomic_write_parquet
 from core.logging import get_logger, setup_logging
 from core.paths import build_report_path
 from data.feature_health import FeatureHealthReport, add_error, evaluate_feature_health, summarize_feature_reports
-from data.features import build_feature_artifacts, build_feature_output_path, discover_parquet_files, load_feature_config
+from data.features import (
+    build_feature_artifacts,
+    build_feature_output_path,
+    compute_formula_fingerprint_bundle,
+    compute_formula_fingerprints,
+    discover_parquet_files,
+    load_feature_config,
+)
 
 try:
     from tqdm import tqdm
@@ -39,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Run feature generation without writing output parquet files.")
     parser.add_argument("--run-id", type=str, default="", help="Custom run id. Default: current UTC timestamp.")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
+    parser.add_argument(
+        "--strict-parity",
+        type=str,
+        default="true",
+        choices=("true", "false"),
+        help="Fail run on parity mismatch when true (default).",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +86,9 @@ def main() -> int:
 
     cfg = load_feature_config(args.config)
     set_global_seed(cfg.seed)
+    strict_parity = args.strict_parity.strip().lower() == "true"
+    formula_fingerprints = compute_formula_fingerprints(cfg)
+    formula_fingerprint_bundle = compute_formula_fingerprint_bundle(formula_fingerprints)
 
     run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_root = cfg.runs_root / run_id / "data_features"
@@ -107,6 +124,9 @@ def main() -> int:
                 pivot_first_session_fill=cfg.pivot.first_session_fill,
                 indicator_parity_status=artifacts.indicator_parity_status,
                 indicator_parity_details=artifacts.indicator_parity_details,
+                formula_fingerprints=artifacts.formula_fingerprints,
+                formula_fingerprint_bundle=artifacts.formula_fingerprint_bundle,
+                strict_parity=strict_parity,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             add_error(report, stage="build", code="FEATURE_BUILD_FAILED", message=str(exc))
@@ -132,7 +152,12 @@ def main() -> int:
         if not args.dry_run:
             atomic_write_json(report.to_dict(), report_path)
 
-    summary = summarize_feature_reports(reports)
+    summary = summarize_feature_reports(
+        reports,
+        formula_fingerprints=formula_fingerprints,
+        formula_fingerprint_bundle=formula_fingerprint_bundle,
+        strict_parity=strict_parity,
+    )
     summary["run_id"] = run_id
     summary["run_root"] = str(run_root)
     summary["indicator_spec_version"] = cfg.indicator_spec_version

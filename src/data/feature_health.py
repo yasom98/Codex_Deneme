@@ -42,10 +42,14 @@ class FeatureHealthReport:
     leakfree_ok: bool = False
     nan_ratio_ok: bool = False
     parity_ok: bool = False
+    parity_gate_ok: bool = False
+    strict_parity_enabled: bool = True
     status: str = "failed"
     output_file: str | None = None
     indicator_parity_status: str = "not_checked"
     indicator_parity_details: dict[str, bool] = field(default_factory=dict)
+    formula_fingerprints: dict[str, str] = field(default_factory=dict)
+    formula_fingerprint_bundle: str = ""
     pivot_first_session_allowed_nan: bool = False
     pivot_first_session_rows: int = 0
     pivot_nonnull_ratio_after_first_session: float = 1.0
@@ -101,6 +105,9 @@ def evaluate_feature_health(
     pivot_first_session_fill: str,
     indicator_parity_status: str,
     indicator_parity_details: dict[str, bool],
+    formula_fingerprints: dict[str, str],
+    formula_fingerprint_bundle: str,
+    strict_parity: bool,
 ) -> FeatureHealthReport:
     """Run strict QC gates for feature outputs and update report in place."""
 
@@ -132,8 +139,12 @@ def evaluate_feature_health(
 
     report.indicator_parity_status = indicator_parity_status
     report.indicator_parity_details = dict(indicator_parity_details)
+    report.formula_fingerprints = dict(formula_fingerprints)
+    report.formula_fingerprint_bundle = str(formula_fingerprint_bundle)
+    report.strict_parity_enabled = bool(strict_parity)
     report.parity_ok = indicator_parity_status in {"passed", "disabled"}
-    if not report.parity_ok:
+    report.parity_gate_ok = report.parity_ok if report.strict_parity_enabled else True
+    if not report.parity_ok and report.strict_parity_enabled:
         failed = sorted(key for key, passed in report.indicator_parity_details.items() if not passed)
         add_error(
             report,
@@ -141,6 +152,13 @@ def evaluate_feature_health(
             code="INDICATOR_PARITY_FAILED",
             message="Indicator parity check failed.",
             failed_columns=failed,
+        )
+    elif not report.parity_ok:
+        failed = sorted(key for key, passed in report.indicator_parity_details.items() if not passed)
+        add_warning(
+            report,
+            "Indicator parity mismatch ignored due to strict_parity=false"
+            f" failed_columns={failed}",
         )
 
     report.nan_ratio_ok = True
@@ -307,13 +325,18 @@ def health_check(report: FeatureHealthReport) -> bool:
         and report.dtype_ok
         and report.leakfree_ok
         and report.nan_ratio_ok
-        and report.parity_ok
+        and report.parity_gate_ok
         and report.rows_out > 0
         and len(report.errors) == 0
     )
 
 
-def summarize_feature_reports(reports: list[FeatureHealthReport]) -> dict[str, Any]:
+def summarize_feature_reports(
+    reports: list[FeatureHealthReport],
+    formula_fingerprints: dict[str, str],
+    formula_fingerprint_bundle: str,
+    strict_parity: bool,
+) -> dict[str, Any]:
     """Create global feature summary report."""
 
     total_files = len(reports)
@@ -330,4 +353,7 @@ def summarize_feature_reports(reports: list[FeatureHealthReport]) -> dict[str, A
         "total_rows_out": sum(report.rows_out for report in reports),
         "failed_inputs": [report.input_file for report in reports if report.status == "failed"],
         "parity_status_overall": parity_status_overall,
+        "strict_parity": bool(strict_parity),
+        "formula_fingerprints": dict(formula_fingerprints),
+        "formula_fingerprint_bundle": str(formula_fingerprint_bundle),
     }

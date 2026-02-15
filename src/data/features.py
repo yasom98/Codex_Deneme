@@ -58,6 +58,7 @@ _LOCKED_SUPERTREND_MULTIPLIER: float = 3.0
 _LOCKED_SUPERTREND_SOURCE: str = "hl2"
 _LOCKED_SUPERTREND_CHANGE_ATR_METHOD: bool = True
 _LOCKED_PIVOT_TF: str = "1D"
+_LOCKED_SHIFT_POLICY: str = "strict_shift_1"
 
 _ALLOWED_PIVOT_WARMUP_POLICIES: tuple[str, ...] = ("allow_first_session_nan",)
 _ALLOWED_PIVOT_FIRST_SESSION_FILL: tuple[str, ...] = ("none", "ffill_from_second_session")
@@ -136,6 +137,8 @@ class FeatureBuildArtifacts:
     shifted_events: pd.DataFrame
     indicator_parity_status: str
     indicator_parity_details: dict[str, bool]
+    formula_fingerprints: dict[str, str]
+    formula_fingerprint_bundle: str
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,62 @@ class IndicatorCoreOutput:
 
     continuous: pd.DataFrame
     raw_events: pd.DataFrame
+
+
+def _compact_fingerprint(payload: dict[str, Any]) -> str:
+    """Return compact stable fingerprint for a formula payload."""
+
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_formula_fingerprints(cfg: FeatureBuildConfig) -> dict[str, str]:
+    """Build compact formula fingerprints for each indicator path."""
+
+    payloads: dict[str, dict[str, Any]] = {
+        "pivot_traditional": {
+            "spec_version": INDICATOR_SPEC_VERSION,
+            "pivot_tf": cfg.pivot.pivot_tf,
+            "warmup_policy": cfg.pivot.warmup_policy,
+            "first_session_fill": cfg.pivot.first_session_fill,
+            "logic_mode": "prev_htf_shift_1_ffill",
+        },
+        "ema_set": {
+            "spec_version": INDICATOR_SPEC_VERSION,
+            "price_col": "close",
+            "periods": [200, 600, 1200],
+            "ewm_adjust": False,
+            "min_periods": "period",
+        },
+        "alphatrend": {
+            "spec_version": INDICATOR_SPEC_VERSION,
+            "coeff": cfg.alphatrend.coeff,
+            "ap": cfg.alphatrend.ap,
+            "use_no_volume": cfg.alphatrend.use_no_volume,
+            "atr_mode": "sma_true_range",
+            "signal_mode": "crossover_at_vs_shift2_with_barssince_gating",
+        },
+        "supertrend": {
+            "spec_version": INDICATOR_SPEC_VERSION,
+            "periods": cfg.supertrend.periods,
+            "multiplier": cfg.supertrend.multiplier,
+            "source": cfg.supertrend.source,
+            "change_atr_method": cfg.supertrend.change_atr_method,
+            "signal_mode": "trend_flip_cross",
+        },
+        "event_shift_policy": {
+            "spec_version": INDICATOR_SPEC_VERSION,
+            "shift_policy": _LOCKED_SHIFT_POLICY,
+            "raw_to_event": RAW_TO_EVENT_COLUMN,
+        },
+    }
+    return {name: _compact_fingerprint(payload) for name, payload in payloads.items()}
+
+
+def compute_formula_fingerprint_bundle(fingerprints: dict[str, str]) -> str:
+    """Return bundle fingerprint from per-indicator fingerprints."""
+
+    return _compact_fingerprint({"fingerprints": fingerprints, "spec_version": INDICATOR_SPEC_VERSION})
 
 
 def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -615,6 +674,8 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
         raise ValueError("Strict shift(1) validation failed for event columns")
 
     parity_status, parity_details = evaluate_indicator_parity(ohlcv, core_output, cfg)
+    formula_fingerprints = compute_formula_fingerprints(cfg)
+    formula_fingerprint_bundle = compute_formula_fingerprint_bundle(formula_fingerprints)
 
     frame = pd.concat(
         [
@@ -632,4 +693,6 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
         shifted_events=shifted_events,
         indicator_parity_status=parity_status,
         indicator_parity_details=parity_details,
+        formula_fingerprints=formula_fingerprints,
+        formula_fingerprint_bundle=formula_fingerprint_bundle,
     )
