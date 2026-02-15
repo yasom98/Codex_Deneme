@@ -162,6 +162,40 @@ def _drop_duplicate_timestamps(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return out, dropped
 
 
+def _normalize_numeric_text(series: pd.Series) -> pd.Series:
+    """Normalize locale-specific numeric text into parseable canonical form."""
+    text = series.astype("string").str.strip()
+    text = text.str.replace(" ", "", regex=False)
+
+    sci_decimal_comma_mask = text.str.match(r"(?i)^[-+]?\d+,\d+e[-+]?\d+$", na=False)
+    if bool(sci_decimal_comma_mask.any()):
+        text.loc[sci_decimal_comma_mask] = text.loc[sci_decimal_comma_mask].str.replace(",", ".", regex=False)
+
+    euro_mask = text.str.match(r"^[-+]?\d{1,3}(\.\d{3})+,\d+$", na=False)
+    if bool(euro_mask.any()):
+        text.loc[euro_mask] = (
+            text.loc[euro_mask].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+        )
+
+    us_thousands_mask = text.str.match(r"^[-+]?\d{1,3}(,\d{3})+(\.\d+)?$", na=False)
+    if bool(us_thousands_mask.any()):
+        text.loc[us_thousands_mask] = text.loc[us_thousands_mask].str.replace(",", "", regex=False)
+
+    decimal_comma_mask = text.str.match(r"^[-+]?\d+,\d+$", na=False)
+    if bool(decimal_comma_mask.any()):
+        text.loc[decimal_comma_mask] = text.loc[decimal_comma_mask].str.replace(",", ".", regex=False)
+
+    return text
+
+
+def _coerce_numeric_series(series: pd.Series) -> pd.Series:
+    """Convert numeric series with locale-aware normalization."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+    normalized = _normalize_numeric_text(series)
+    return pd.to_numeric(normalized, errors="coerce")
+
+
 def _convert_numeric_and_drop_invalid(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Convert OHLCV numeric columns and drop rows with conversion failures."""
     out = df.copy()
@@ -170,7 +204,7 @@ def _convert_numeric_and_drop_invalid(df: pd.DataFrame) -> tuple[pd.DataFrame, i
 
     for col in NUMERIC_COLUMNS:
         LOGGER.info("Converting numeric column | column=%s", col)
-        series = pd.to_numeric(out[col], errors="coerce")
+        series = _coerce_numeric_series(out[col])
         converted[col] = series
         invalid_mask |= series.isna()
 
