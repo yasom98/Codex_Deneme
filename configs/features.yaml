@@ -29,3 +29,11 @@ events:
   rsi_centerline: 50.0
   rsi_overbought: 70.0
   rsi_oversold: 30.0
+
+health:
+  warn_ratio: 0.005
+  critical_warn_ratio: 0.001
+  critical_columns:
+    - supertrend
+    - alphatrend
+    - rsi

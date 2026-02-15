@@ -85,6 +85,15 @@ class EventConfig:
 
 
 @dataclass(frozen=True)
+class HealthPolicyConfig:
+    """NaN ratio thresholds for feature health checks."""
+
+    warn_ratio: float
+    critical_warn_ratio: float
+    critical_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class FeatureBuildConfig:
     """Feature build configuration loaded from YAML."""
 
@@ -96,6 +105,7 @@ class FeatureBuildConfig:
     alphatrend: AlphaTrendConfig
     rsi: RsiConfig
     events: EventConfig
+    health: HealthPolicyConfig
 
 
 @dataclass(frozen=True)
@@ -567,6 +577,9 @@ def load_feature_config(path: Path) -> FeatureBuildConfig:
     alphatrend_cfg = _get_required_dict(raw, "alphatrend")
     rsi_cfg = _get_required_dict(raw, "rsi")
     events_cfg = _get_required_dict(raw, "events")
+    health_cfg = raw.get("health", {})
+    if not isinstance(health_cfg, dict):
+        raise ValueError("health must be a dictionary if provided")
 
     cfg = FeatureBuildConfig(
         input_root=_resolve_path(str(raw.get("input_root", "")), base_dir),
@@ -594,6 +607,13 @@ def load_feature_config(path: Path) -> FeatureBuildConfig:
             rsi_overbought=float(events_cfg.get("rsi_overbought", 70.0)),
             rsi_oversold=float(events_cfg.get("rsi_oversold", 30.0)),
         ),
+        health=HealthPolicyConfig(
+            warn_ratio=float(health_cfg.get("warn_ratio", 0.005)),
+            critical_warn_ratio=float(health_cfg.get("critical_warn_ratio", 0.001)),
+            critical_columns=tuple(
+                str(col) for col in health_cfg.get("critical_columns", ("supertrend", "alphatrend", "rsi"))
+            ),
+        ),
     )
     validate_feature_config(cfg)
     return cfg
@@ -612,6 +632,14 @@ def validate_feature_config(cfg: FeatureBuildConfig) -> None:
         raise ValueError("seed must be >= 0")
     if cfg.events.rsi_oversold >= cfg.events.rsi_overbought:
         raise ValueError("events.rsi_oversold must be < events.rsi_overbought")
+    if not (0.0 <= cfg.health.warn_ratio <= 1.0):
+        raise ValueError("health.warn_ratio must be in [0.0, 1.0]")
+    if not (0.0 <= cfg.health.critical_warn_ratio <= 1.0):
+        raise ValueError("health.critical_warn_ratio must be in [0.0, 1.0]")
+    if cfg.health.critical_warn_ratio > cfg.health.warn_ratio:
+        raise ValueError("health.critical_warn_ratio must be <= health.warn_ratio")
+    if not cfg.health.critical_columns:
+        raise ValueError("health.critical_columns cannot be empty")
     if cfg.alphatrend.long_rule.signal.strip() == "":
         raise ValueError("alphatrend.long_rule.signal is required")
     if cfg.alphatrend.short_rule.signal.strip() == "":

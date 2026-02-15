@@ -15,8 +15,10 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from core.io_atomic import atomic_write_parquet
+from core.io_atomic import atomic_write_json, atomic_write_parquet
 from core.logging import get_logger, setup_logging
+from core.paths import build_report_path
+from data.feature_health import FeatureHealthReport, add_error, evaluate_feature_health, summarize_feature_reports
 from data.features import build_feature_artifacts, build_feature_output_path, discover_parquet_files, load_feature_config
 
 try:
@@ -74,37 +76,75 @@ def main() -> int:
     run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_root = cfg.runs_root / run_id / "data_features"
     parquet_root = run_root / "parquet"
+    reports_root = run_root / "reports"
+    per_file_reports_root = reports_root / "per_file"
 
     src_files = discover_parquet_files(cfg.input_root, cfg.parquet_glob)
     LOGGER.info("Discovered standardized parquet files | count=%d input_root=%s", len(src_files), cfg.input_root)
 
-    succeeded = 0
-    failed = 0
+    reports: list[FeatureHealthReport] = []
 
     for src_path in tqdm(src_files, desc="Building features"):
+        report = FeatureHealthReport(input_file=str(src_path))
         output_path = build_feature_output_path(src_path, cfg.input_root, parquet_root)
+        report_path = build_report_path(src_path, cfg.input_root, per_file_reports_root)
+        feature_df: pd.DataFrame | None = None
 
         try:
             src_df = pd.read_parquet(src_path)
+            report.rows_in = int(len(src_df))
             artifacts = build_feature_artifacts(src_df, cfg)
+            feature_df = artifacts.frame
+            evaluate_feature_health(
+                report=report,
+                feature_df=artifacts.frame,
+                raw_events=artifacts.raw_events,
+                shifted_events=artifacts.shifted_events,
+                warn_ratio=cfg.health.warn_ratio,
+                critical_warn_ratio=cfg.health.critical_warn_ratio,
+                critical_columns=cfg.health.critical_columns,
+            )
         except (ValueError, RuntimeError, OSError) as exc:
-            failed += 1
-            LOGGER.error("Feature build failed | input=%s error=%s", src_path, exc)
-            continue
+            add_error(report, stage="build", code="FEATURE_BUILD_FAILED", message=str(exc))
+            report.status = "failed"
+
+        if report.status == "success" and not args.dry_run and feature_df is not None:
+            try:
+                atomic_write_parquet(feature_df, output_path)
+                report.output_file = str(output_path)
+            except RuntimeError as exc:
+                add_error(report, stage="write", code="FEATURE_WRITE_FAILED", message=str(exc))
+                report.status = "failed"
+
+        reports.append(report)
+        LOGGER.info(
+            "Feature file processed | input=%s status=%s rows_in=%d rows_out=%d",
+            src_path,
+            report.status,
+            report.rows_in,
+            report.rows_out,
+        )
 
         if not args.dry_run:
-            try:
-                atomic_write_parquet(artifacts.frame, output_path)
-            except RuntimeError as exc:
-                failed += 1
-                LOGGER.error("Feature parquet write failed | output=%s error=%s", output_path, exc)
-                continue
+            atomic_write_json(report.to_dict(), report_path)
 
-        succeeded += 1
-        LOGGER.info("Feature file processed | input=%s output=%s rows=%d", src_path, output_path, len(artifacts.frame))
+    summary = summarize_feature_reports(reports)
+    summary["run_id"] = run_id
+    summary["run_root"] = str(run_root)
 
-    LOGGER.info("Feature build summary | run_id=%s succeeded=%d failed=%d", run_id, succeeded, failed)
-    return 0 if failed == 0 else 1
+    LOGGER.info(
+        "Feature build summary | run_id=%s total=%d success=%d failed=%d",
+        run_id,
+        summary["total_files"],
+        summary["succeeded_files"],
+        summary["failed_files"],
+    )
+
+    if not args.dry_run:
+        summary_path = reports_root / "summary.json"
+        atomic_write_json(summary, summary_path)
+
+    return 0 if summary["failed_files"] == 0 else 1
 
 
 if __name__ == "__main__":
