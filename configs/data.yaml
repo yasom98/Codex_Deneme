@@ -1,6 +1,5 @@
 input_root: /mnt/c/Users/YASİN/OneDrive/Desktop/Codex_Deneme
-output_root: data/standardized
-reports_root: data/reports
+runs_root: runs
 csv_glob: "**/*.csv"
 timestamp_aliases:
   - timestamp
@@ -23,7 +22,5 @@ float_columns:
   - low
   - close
   - volume
-fail_on_critical: true
 duplicate_policy: last
 seed: 42
-
