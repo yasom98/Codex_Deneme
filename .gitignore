@@ -3,3 +3,22 @@ __pycache__/
 .venv/
 .env
 .DS_Store
+# Data & artifacts
+runs/
+data/
+datasets/
+artifacts/
+checkpoints/
+*.parquet
+*.feather
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.joblib
+*.pkl
+
+# Large raw files
+*.csv
+!configs/*.csv
+!tests/data/*.csv
