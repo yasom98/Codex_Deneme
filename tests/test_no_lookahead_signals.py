@@ -17,6 +17,7 @@ from data.features import (
     PivotPolicyConfig,
     SuperTrendConfig,
     build_feature_artifacts,
+    validate_shift_one,
 )
 
 
@@ -65,3 +66,10 @@ def test_all_shifted_signal_columns_are_strict_shift_one() -> None:
         shifted = artifacts.shifted_events[col].to_numpy(dtype=np.uint8)
         assert shifted[0] == 0
         np.testing.assert_array_equal(shifted[1:], raw[:-1])
+
+
+def test_shift_policy_violation_is_detected() -> None:
+    artifacts = build_feature_artifacts(_fixture_df(), _cfg())
+    broken = artifacts.shifted_events.copy()
+    broken.iloc[0, 0] = 1
+    assert validate_shift_one(artifacts.raw_events, broken) is False

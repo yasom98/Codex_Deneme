@@ -134,10 +134,17 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert per_file_payload["pivot_first_session_rows"] == 1
     assert per_file_payload["pivot_nonnull_ratio_after_first_session"] == 1.0
     assert per_file_payload["pivot_fill_strategy_applied"] == "none"
+    assert isinstance(per_file_payload["formula_fingerprints"], dict)
+    assert "alphatrend" in per_file_payload["formula_fingerprints"]
+    assert isinstance(per_file_payload["formula_fingerprint_bundle"], str)
+    assert per_file_payload["strict_parity_enabled"] is True
 
     assert summary_payload["succeeded_files"] == 1
     assert summary_payload["failed_files"] == 0
     assert summary_payload["parity_status_overall"] is True
+    assert summary_payload["strict_parity"] is True
+    assert isinstance(summary_payload["formula_fingerprints"], dict)
+    assert isinstance(summary_payload["formula_fingerprint_bundle"], str)
     assert "indicator_spec_version" in summary_payload
     assert "config_hash" in summary_payload
     assert not list(run_root.rglob("*.tmp"))
@@ -239,3 +246,112 @@ def test_make_features_cli_blocks_output_when_health_fails(monkeypatch: object, 
     assert per_file_payload["status"] == "failed"
     assert len(per_file_payload["errors"]) > 0
     assert summary_payload["failed_files"] == 1
+
+
+def test_make_features_cli_fails_on_parity_mismatch_when_strict(monkeypatch: object, tmp_path: Path) -> None:
+    input_root = tmp_path / "in"
+    runs_root = tmp_path / "runs"
+    input_root.mkdir(parents=True, exist_ok=True)
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    (input_root / "parity_strict.parquet").write_text("placeholder", encoding="utf-8")
+    config_path = tmp_path / "features.yaml"
+    _write_config(config_path, input_root=input_root, runs_root=runs_root)
+
+    def fake_read_parquet(path: Path) -> pd.DataFrame:
+        del path
+        return _healthy_df()
+
+    def fake_to_parquet(self: pd.DataFrame, path: Path, index: bool = False) -> None:
+        del self, index
+        Path(path).write_text("ok", encoding="utf-8")
+
+    def fake_parity(*_: object, **__: object) -> tuple[str, dict[str, bool]]:
+        return "failed", {"EMA_200": False}
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
+    monkeypatch.setattr("data.features.evaluate_indicator_parity", fake_parity)
+
+    main = _load_main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["make_features.py", "--config", str(config_path), "--run-id", "parity_strict_run"],
+    )
+
+    exit_code = int(main())
+    assert exit_code == 1
+
+    run_root = runs_root / "parity_strict_run" / "data_features"
+    per_file_report = run_root / "reports" / "per_file" / "parity_strict.json"
+    summary_report = run_root / "reports" / "summary.json"
+
+    per_file_payload = json.loads(per_file_report.read_text(encoding="utf-8"))
+    summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
+
+    assert per_file_payload["status"] == "failed"
+    assert per_file_payload["parity_ok"] is False
+    assert per_file_payload["parity_gate_ok"] is False
+    assert per_file_payload["strict_parity_enabled"] is True
+    assert any(error["code"] == "INDICATOR_PARITY_FAILED" for error in per_file_payload["errors"])
+    assert summary_payload["failed_files"] == 1
+
+
+def test_make_features_cli_allows_parity_mismatch_when_not_strict(monkeypatch: object, tmp_path: Path) -> None:
+    input_root = tmp_path / "in"
+    runs_root = tmp_path / "runs"
+    input_root.mkdir(parents=True, exist_ok=True)
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    (input_root / "parity_relaxed.parquet").write_text("placeholder", encoding="utf-8")
+    config_path = tmp_path / "features.yaml"
+    _write_config(config_path, input_root=input_root, runs_root=runs_root)
+
+    def fake_read_parquet(path: Path) -> pd.DataFrame:
+        del path
+        return _healthy_df()
+
+    def fake_to_parquet(self: pd.DataFrame, path: Path, index: bool = False) -> None:
+        del self, index
+        Path(path).write_text("ok", encoding="utf-8")
+
+    def fake_parity(*_: object, **__: object) -> tuple[str, dict[str, bool]]:
+        return "failed", {"EMA_200": False}
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
+    monkeypatch.setattr("data.features.evaluate_indicator_parity", fake_parity)
+
+    main = _load_main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "make_features.py",
+            "--config",
+            str(config_path),
+            "--run-id",
+            "parity_relaxed_run",
+            "--strict-parity",
+            "false",
+        ],
+    )
+
+    exit_code = int(main())
+    assert exit_code == 0
+
+    run_root = runs_root / "parity_relaxed_run" / "data_features"
+    per_file_report = run_root / "reports" / "per_file" / "parity_relaxed.json"
+    summary_report = run_root / "reports" / "summary.json"
+
+    per_file_payload = json.loads(per_file_report.read_text(encoding="utf-8"))
+    summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
+
+    assert per_file_payload["status"] == "success"
+    assert per_file_payload["parity_ok"] is False
+    assert per_file_payload["parity_gate_ok"] is True
+    assert per_file_payload["strict_parity_enabled"] is False
+    assert not any(error["code"] == "INDICATOR_PARITY_FAILED" for error in per_file_payload["errors"])
+    assert summary_payload["failed_files"] == 0
+    assert summary_payload["strict_parity"] is False
