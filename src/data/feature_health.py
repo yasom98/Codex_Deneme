@@ -135,14 +135,20 @@ def evaluate_feature_health(
     pivot_present = all(col in feature_df.columns for col in pivot_columns)
     if pivot_present and len(feature_df) > 0:
         pivot_frame = feature_df.loc[:, pivot_columns]
+        after_first_session = pivot_frame.loc[~first_session_mask]
+        after_first_rows = int(after_first_session.shape[0])
+
         if bool(pivot_frame.isna().all(axis=0).all()):
-            report.nan_ratio_ok = False
-            add_error(
-                report,
-                stage="gates",
-                code="PIVOT_MAPPING_EMPTY",
-                message="All pivot mapping columns are fully NaN across the file.",
-            )
+            if after_first_rows > 0:
+                report.nan_ratio_ok = False
+                add_error(
+                    report,
+                    stage="gates",
+                    code="PIVOT_MAPPING_EMPTY",
+                    message="All pivot mapping columns are fully NaN across the file.",
+                )
+            else:
+                add_warning(report, "Pivot columns are NaN only in first session warmup window.")
 
         first_session_pivots = pivot_frame.loc[first_session_mask]
         first_session_has_nan = bool(first_session_pivots.isna().any(axis=0).any())
@@ -161,7 +167,6 @@ def evaluate_feature_health(
                 message="Pivot columns contain NaN values in first session but warmup policy disallows it.",
             )
 
-        after_first_session = pivot_frame.loc[~first_session_mask]
         total_after_first = int(after_first_session.shape[0] * after_first_session.shape[1])
         if total_after_first > 0:
             nonnull_after_first = int(after_first_session.notna().sum().sum())
@@ -192,9 +197,11 @@ def evaluate_feature_health(
             col in PIVOT_FEATURE_COLUMNS
             and report.pivot_first_session_allowed_nan
             and report.pivot_first_session_rows > 0
-            and len(feature_df) > report.pivot_first_session_rows
         ):
-            gate_ratio = float(feature_df.loc[~first_session_mask, col].isna().mean())
+            if len(feature_df) > report.pivot_first_session_rows:
+                gate_ratio = float(feature_df.loc[~first_session_mask, col].isna().mean())
+            else:
+                gate_ratio = 0.0
 
         if gate_ratio > warn_ratio:
             add_warning(report, f"NaN ratio high | column={col} ratio={gate_ratio:.6f} warn_ratio={warn_ratio:.6f}")
