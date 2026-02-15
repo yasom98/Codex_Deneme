@@ -14,13 +14,11 @@ class PipelineConfig:
     """Pipeline configuration values."""
 
     input_root: Path
-    output_root: Path
-    reports_root: Path
+    runs_root: Path
     csv_glob: str
     timestamp_aliases: tuple[str, ...]
     required_columns: tuple[str, ...]
     float_columns: tuple[str, ...]
-    fail_on_critical: bool
     duplicate_policy: str
     seed: int
 
@@ -46,13 +44,11 @@ def load_config(path: Path) -> PipelineConfig:
 
     cfg = PipelineConfig(
         input_root=_resolve_path(str(_get_required(raw, "input_root")), base_dir),
-        output_root=_resolve_path(str(_get_required(raw, "output_root")), base_dir),
-        reports_root=_resolve_path(str(_get_required(raw, "reports_root")), base_dir),
+        runs_root=_resolve_path(str(raw.get("runs_root", "runs")), base_dir),
         csv_glob=str(raw.get("csv_glob", "**/*.csv")),
         timestamp_aliases=tuple(raw.get("timestamp_aliases", [])),
         required_columns=tuple(raw.get("required_columns", ("open", "high", "low", "close", "volume"))),
         float_columns=tuple(raw.get("float_columns", ("open", "high", "low", "close", "volume"))),
-        fail_on_critical=bool(raw.get("fail_on_critical", True)),
         duplicate_policy=str(raw.get("duplicate_policy", "last")),
         seed=int(raw.get("seed", 42)),
     )
@@ -70,8 +66,11 @@ def validate_config(cfg: PipelineConfig) -> None:
         raise ValueError("csv_glob cannot be empty.")
     if not cfg.timestamp_aliases:
         raise ValueError("timestamp_aliases cannot be empty.")
+    if cfg.required_columns != ("open", "high", "low", "close", "volume"):
+        raise ValueError("required_columns must be exactly: open, high, low, close, volume")
+    if cfg.float_columns != ("open", "high", "low", "close", "volume"):
+        raise ValueError("float_columns must be exactly: open, high, low, close, volume")
     if cfg.duplicate_policy != "last":
         raise ValueError("Only duplicate_policy='last' is supported in this sprint.")
     if cfg.seed < 0:
         raise ValueError("seed must be >= 0.")
-

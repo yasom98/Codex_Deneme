@@ -50,16 +50,18 @@ def _is_hidden_or_system(path: Path, input_root: Path) -> bool:
 
 
 def build_output_parquet_path(src_csv: Path, input_root: Path, output_root: Path) -> Path:
-    """Build mirrored parquet output path for a source CSV file."""
+    """Build parquet output path for a source CSV file."""
     rel_path = src_csv.resolve().relative_to(input_root.resolve())
-    out_path = (output_root / rel_path).with_suffix(".parquet")
+    stem = "__".join(rel_path.with_suffix("").parts)
+    out_path = output_root / f"{stem}.parquet"
     ensure_within_root(out_path, output_root)
     return out_path
 
 
 def build_report_path(src_csv: Path, input_root: Path, reports_root: Path) -> Path:
-    """Build mirrored health-report path for a source CSV file."""
+    """Build per-file health-report path for a source CSV file."""
     rel_path = src_csv.resolve().relative_to(input_root.resolve())
-    report_path = (reports_root / rel_path).with_suffix(".health.json")
+    stem = "__".join(rel_path.with_suffix("").parts)
+    report_path = reports_root / f"{stem}.json"
     ensure_within_root(report_path, reports_root)
     return report_path

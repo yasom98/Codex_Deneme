@@ -9,6 +9,7 @@ from typing import Sequence
 import pandas as pd
 
 CANONICAL_COLUMNS: tuple[str, ...] = ("timestamp", "open", "high", "low", "close", "volume")
+NUMERIC_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
 
 _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "open": ("open", "o"),
@@ -110,33 +111,39 @@ def map_to_canonical(df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
     return mapped.loc[:, list(CANONICAL_COLUMNS)].copy()
 
 
-def enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Enforce timestamp ordering/uniqueness and float32 dtypes."""
-    validate_required_columns(df, CANONICAL_COLUMNS)
+def convert_numeric_with_drop(df: pd.DataFrame, numeric_cols: Sequence[str]) -> tuple[pd.DataFrame, int]:
+    """Convert numeric columns; drop rows where conversion fails."""
     out = df.copy()
+    converted_cols: dict[str, pd.Series] = {}
 
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-    invalid_timestamps = int(out["timestamp"].isna().sum())
-    if invalid_timestamps > 0:
-        raise ValueError(f"Unparseable timestamps detected: {invalid_timestamps}")
+    for col in numeric_cols:
+        converted_cols[col] = pd.to_numeric(out[col], errors="coerce")
 
-    out = out.sort_values("timestamp", kind="mergesort")
-    out = out.drop_duplicates(subset=["timestamp"], keep="last")
+    invalid_mask = pd.Series(False, index=out.index)
+    for col in numeric_cols:
+        invalid_mask |= converted_cols[col].isna()
 
-    if out.empty:
-        raise ValueError("Dataframe is empty after schema enforcement.")
+    dropped = int(invalid_mask.sum())
+    out = out.loc[~invalid_mask].copy()
 
-    for col in ("open", "high", "low", "close", "volume"):
-        original = out[col]
-        converted = pd.to_numeric(original, errors="coerce")
-        invalid_numeric = int((original.notna() & converted.isna()).sum())
-        if invalid_numeric > 0:
-            raise ValueError(f"Invalid numeric values in {col}: {invalid_numeric}")
-        out[col] = converted.astype("float32")
+    for col in numeric_cols:
+        out[col] = converted_cols[col].loc[out.index].astype("float32")
 
-    if not out["timestamp"].is_monotonic_increasing:
-        raise ValueError("Timestamps are not monotonic increasing after enforcement.")
-    if out["timestamp"].duplicated().any():
-        raise ValueError("Timestamps are not unique after enforcement.")
+    return out, dropped
 
-    return out.loc[:, list(CANONICAL_COLUMNS)].reset_index(drop=True)
+
+def final_gate_checks(df: pd.DataFrame) -> dict[str, bool]:
+    """Run strict final gate checks for standardized output."""
+    schema_ok = all(col in df.columns for col in CANONICAL_COLUMNS)
+    monotonic_ok = bool(df["timestamp"].is_monotonic_increasing) if schema_ok else False
+    unique_ts_ok = bool(df["timestamp"].is_unique) if schema_ok else False
+    dtype_ok = bool(all(str(df[col].dtype) == "float32" for col in NUMERIC_COLUMNS)) if schema_ok else False
+    no_nan_ok = bool(not df[list(CANONICAL_COLUMNS)].isna().any().any()) if schema_ok else False
+
+    return {
+        "schema_ok": schema_ok,
+        "monotonic_ok": monotonic_ok,
+        "unique_ts_ok": unique_ts_ok,
+        "dtype_ok": dtype_ok,
+        "no_nan_ok": no_nan_ok,
+    }
