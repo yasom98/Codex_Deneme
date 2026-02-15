@@ -17,12 +17,30 @@ from core.paths import ensure_within_root
 LOGGER = get_logger(__name__)
 
 REQUIRED_OHLCV_COLUMNS: tuple[str, ...] = ("timestamp", "open", "high", "low", "close", "volume")
+ALPHATREND_LOCK_PERIOD: int = 11
+ALPHATREND_LOCK_ATR_MULTIPLIER: float = 3.0
 CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
     "supertrend",
     "alphatrend",
     "rsi",
     "rsi_slope",
     "rsi_zscore",
+    "ema_200",
+    "ema_600",
+    "ema_1200",
+    "pivot_p",
+    "pivot_s1",
+    "pivot_s2",
+    "pivot_s3",
+    "pivot_r1",
+    "pivot_r2",
+    "pivot_r3",
+    "pivot_std_upper_1",
+    "pivot_std_upper_2",
+    "pivot_std_upper_3",
+    "pivot_std_lower_1",
+    "pivot_std_lower_2",
+    "pivot_std_lower_3",
 )
 EVENT_FLAG_COLUMNS: tuple[str, ...] = (
     "evt_supertrend_flip_up",
@@ -332,6 +350,75 @@ def compute_rsi_derivatives(df: pd.DataFrame, cfg: RsiConfig) -> pd.DataFrame:
     )
 
 
+def compute_ema_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute long-horizon EMA features from close prices."""
+
+    close = df["close"].astype("float64")
+    return pd.DataFrame(
+        {
+            "ema_200": close.ewm(span=200, adjust=False, min_periods=1).mean().astype("float32"),
+            "ema_600": close.ewm(span=600, adjust=False, min_periods=1).mean().astype("float32"),
+            "ema_1200": close.ewm(span=1200, adjust=False, min_periods=1).mean().astype("float32"),
+        },
+        index=df.index,
+    )
+
+
+def compute_daily_pivots_with_std_bands(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute previous-session daily pivots and std bands mapped to intraday bars.
+
+    All pivot/std-band levels for a session are derived from the previous UTC day.
+    """
+
+    sessions = df["timestamp"].dt.floor("D")
+    grouped = (
+        df.assign(_session=sessions)
+        .groupby("_session", sort=True)
+        .agg(
+            day_high=("high", "max"),
+            day_low=("low", "min"),
+            day_close=("close", "last"),
+        )
+    )
+
+    close_std = (
+        df.assign(_session=sessions)
+        .groupby("_session", sort=True)["close"]
+        .std(ddof=0)
+        .rename("day_close_std")
+        .fillna(0.0)
+    )
+    daily = grouped.join(close_std)
+
+    pivot = (daily["day_high"] + daily["day_low"] + daily["day_close"]) / 3.0
+    day_range = daily["day_high"] - daily["day_low"]
+
+    levels = pd.DataFrame(index=daily.index)
+    levels["pivot_p"] = pivot
+    levels["pivot_r1"] = (2.0 * pivot) - daily["day_low"]
+    levels["pivot_s1"] = (2.0 * pivot) - daily["day_high"]
+    levels["pivot_r2"] = pivot + day_range
+    levels["pivot_s2"] = pivot - day_range
+    levels["pivot_r3"] = daily["day_high"] + (2.0 * (pivot - daily["day_low"]))
+    levels["pivot_s3"] = daily["day_low"] - (2.0 * (daily["day_high"] - pivot))
+
+    std = daily["day_close_std"]
+    levels["pivot_std_upper_1"] = pivot + std
+    levels["pivot_std_upper_2"] = pivot + (2.0 * std)
+    levels["pivot_std_upper_3"] = pivot + (3.0 * std)
+    levels["pivot_std_lower_1"] = pivot - std
+    levels["pivot_std_lower_2"] = pivot - (2.0 * std)
+    levels["pivot_std_lower_3"] = pivot - (3.0 * std)
+
+    shifted_levels = levels.shift(1)
+
+    intraday = pd.DataFrame(index=df.index)
+    for col in shifted_levels.columns:
+        intraday[col] = sessions.map(shifted_levels[col])
+
+    return intraday.astype("float32")
+
+
 def _operator_callable(operator: str) -> Callable[[pd.Series, float], pd.Series]:
     if operator == ">":
         return lambda series, threshold: series > threshold
@@ -436,19 +523,23 @@ def compute_indicator_core(
     alphatrend_cfg: AlphaTrendConfig,
     rsi_cfg: RsiConfig,
 ) -> pd.DataFrame:
-    """Compute core continuous indicators and internal trend directions."""
+    """Compute continuous indicators and internal trend-direction helpers."""
 
     ohlcv = validate_ohlcv_frame(df)
 
     supertrend, supertrend_direction = compute_supertrend(ohlcv, supertrend_cfg)
     alphatrend, alphatrend_direction = compute_alphatrend(ohlcv, alphatrend_cfg)
     rsi_derivatives = compute_rsi_derivatives(ohlcv, rsi_cfg)
+    ema_features = compute_ema_features(ohlcv)
+    pivot_features = compute_daily_pivots_with_std_bands(ohlcv)
 
     features = pd.concat(
         [
             supertrend,
             alphatrend,
             rsi_derivatives,
+            ema_features,
+            pivot_features,
             supertrend_direction,
             alphatrend_direction,
         ],
@@ -547,6 +638,13 @@ def _get_required_dict(raw: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _get_required_numeric(raw: dict[str, Any], key: str) -> float:
+    value = raw.get(key, None)
+    if value is None:
+        raise ValueError(f"alphatrend.{key} is required")
+    return float(value)
+
+
 def _parse_rule(raw: dict[str, Any], key: str) -> ThresholdRule:
     node = _get_required_dict(raw, key)
     signal = str(node.get("signal", "")).strip()
@@ -591,8 +689,8 @@ def load_feature_config(path: Path) -> FeatureBuildConfig:
             multiplier=float(supertrend_cfg.get("multiplier", 3.0)),
         ),
         alphatrend=AlphaTrendConfig(
-            period=int(alphatrend_cfg.get("period", 14)),
-            atr_multiplier=float(alphatrend_cfg.get("atr_multiplier", 1.0)),
+            period=int(_get_required_numeric(alphatrend_cfg, "period")),
+            atr_multiplier=float(_get_required_numeric(alphatrend_cfg, "atr_multiplier")),
             signal_period=int(alphatrend_cfg.get("signal_period", 14)),
             long_rule=_parse_rule(alphatrend_cfg, "long_rule"),
             short_rule=_parse_rule(alphatrend_cfg, "short_rule"),
@@ -640,6 +738,10 @@ def validate_feature_config(cfg: FeatureBuildConfig) -> None:
         raise ValueError("health.critical_warn_ratio must be <= health.warn_ratio")
     if not cfg.health.critical_columns:
         raise ValueError("health.critical_columns cannot be empty")
+    if cfg.alphatrend.period != ALPHATREND_LOCK_PERIOD:
+        raise ValueError(f"alphatrend.period must be fixed at {ALPHATREND_LOCK_PERIOD}")
+    if cfg.alphatrend.atr_multiplier != ALPHATREND_LOCK_ATR_MULTIPLIER:
+        raise ValueError(f"alphatrend.atr_multiplier must be fixed at {ALPHATREND_LOCK_ATR_MULTIPLIER}")
     if cfg.alphatrend.long_rule.signal.strip() == "":
         raise ValueError("alphatrend.long_rule.signal is required")
     if cfg.alphatrend.short_rule.signal.strip() == "":
