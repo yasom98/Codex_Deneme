@@ -173,8 +173,10 @@ def test_make_features_cli_fails_on_empty_pivot_mapping(monkeypatch: object, tmp
         warmup_policy: str = "allow_first_session_nan",
         first_session_fill: str = "none",
         pivot_tf: str = "1D",
+        assume_validated: bool = False,
+        indexed_ohlcv: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        del warmup_policy, first_session_fill, pivot_tf
+        del warmup_policy, first_session_fill, pivot_tf, assume_validated, indexed_ohlcv
         return pd.DataFrame({col: np.full(len(df), np.nan, dtype=np.float32) for col in PIVOT_FEATURE_COLUMNS}, index=df.index)
 
     monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)

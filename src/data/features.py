@@ -306,6 +306,8 @@ def compute_daily_pivots_with_std_bands(
     warmup_policy: str = "allow_first_session_nan",
     first_session_fill: str = "none",
     pivot_tf: str = "1D",
+    assume_validated: bool = False,
+    indexed_ohlcv: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compute leak-free traditional pivots with warmup policy handling."""
 
@@ -313,11 +315,13 @@ def compute_daily_pivots_with_std_bands(
     if pivot_tf.strip() != _LOCKED_PIVOT_TF:
         raise ValueError(f"pivot.pivot_tf must be fixed at {_LOCKED_PIVOT_TF}")
 
-    ohlcv = validate_ohlcv_frame(df)
-    indexed = _to_datetime_index(ohlcv)
+    ohlcv = df if assume_validated else validate_ohlcv_frame(df)
+    indexed = indexed_ohlcv if indexed_ohlcv is not None else _to_datetime_index(ohlcv)
+    if len(indexed) != len(ohlcv):
+        raise ValueError("indexed_ohlcv length mismatch for pivot computation")
     pivots = ref.compute_pivots_traditional(indexed, pivot_tf=pivot_tf)
 
-    out = pivots.reset_index(drop=True)
+    out = pivots.copy()
     out.index = ohlcv.index
     sessions = ohlcv["timestamp"].dt.floor("D")
     out = _apply_first_session_fill(out, sessions=sessions, first_session_fill=first_session_fill)
@@ -333,9 +337,12 @@ def _build_indicator_core(ohlcv: pd.DataFrame, cfg: FeatureBuildConfig) -> Indic
         warmup_policy=cfg.pivot.warmup_policy,
         first_session_fill=cfg.pivot.first_session_fill,
         pivot_tf=cfg.pivot.pivot_tf,
+        assume_validated=True,
+        indexed_ohlcv=indexed,
     )
 
-    ema_block = ref.compute_ema_set(indexed, price_col="close").reset_index(drop=True)
+    shared_tr = ref.true_range(indexed["high"], indexed["low"], indexed["close"])
+    ema_block = ref.compute_ema_set(indexed, price_col="close")
     ema_block.index = ohlcv.index
 
     alpha_block = ref.compute_alphatrend(
@@ -346,7 +353,8 @@ def _build_indicator_core(ohlcv: pd.DataFrame, cfg: FeatureBuildConfig) -> Indic
             use_no_volume=cfg.alphatrend.use_no_volume,
         ),
         show_progress=False,
-    ).reset_index(drop=True)
+        precomputed_tr=shared_tr,
+    )
     alpha_block.index = ohlcv.index
 
     supertrend_block = ref.compute_supertrend(
@@ -358,7 +366,8 @@ def _build_indicator_core(ohlcv: pd.DataFrame, cfg: FeatureBuildConfig) -> Indic
             change_atr_method=cfg.supertrend.change_atr_method,
         ),
         show_progress=False,
-    ).reset_index(drop=True)
+        precomputed_tr=shared_tr,
+    )
     supertrend_block.index = ohlcv.index
 
     continuous = pd.concat(

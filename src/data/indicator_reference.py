@@ -185,6 +185,7 @@ def compute_alphatrend(
     df: pd.DataFrame,
     cfg: AlphaTrendConfig = AlphaTrendConfig(),
     show_progress: bool = False,
+    precomputed_tr: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Compute reference AlphaTrend and strict buy/sell signal set."""
 
@@ -195,7 +196,11 @@ def compute_alphatrend(
         raise ValueError(f"Missing columns: {missing}")
 
     high, low, close = df["high"], df["low"], df["close"]
-    tr = true_range(high, low, close)
+    tr = true_range(high, low, close) if precomputed_tr is None else precomputed_tr
+    if len(tr) != len(df):
+        raise ValueError("precomputed_tr length mismatch for AlphaTrend")
+    if not tr.index.equals(df.index):
+        raise ValueError("precomputed_tr index mismatch for AlphaTrend")
     atr = sma(tr, cfg.ap)
     up_t = low - (atr * cfg.coeff)
     down_t = high + (atr * cfg.coeff)
@@ -205,20 +210,24 @@ def compute_alphatrend(
     else:
         regime = mfi(high, low, close, df["volume"], cfg.ap) >= 50
 
-    at = np.full(len(df), np.nan, dtype=np.float64)
-    it: Iterable[int] = range(len(df))
+    rows = len(df)
+    at = np.full(rows, np.nan, dtype=np.float64)
+    up_arr = up_t.to_numpy(dtype=np.float64, copy=False)
+    down_arr = down_t.to_numpy(dtype=np.float64, copy=False)
+    regime_arr = regime.to_numpy(dtype=np.bool_, copy=False)
+    it: Iterable[int] = range(rows)
     for i in it:
         if i == 0:
             at[i] = np.nan
             continue
         prev_at = at[i - 1]
         if np.isnan(prev_at):
-            at[i] = up_t.iat[i] if regime.iat[i] else down_t.iat[i]
+            at[i] = up_arr[i] if regime_arr[i] else down_arr[i]
             continue
-        if regime.iat[i]:
-            at[i] = prev_at if up_t.iat[i] < prev_at else up_t.iat[i]
+        if regime_arr[i]:
+            at[i] = prev_at if up_arr[i] < prev_at else up_arr[i]
         else:
-            at[i] = prev_at if down_t.iat[i] > prev_at else down_t.iat[i]
+            at[i] = prev_at if down_arr[i] > prev_at else down_arr[i]
 
     at_s = pd.Series(at, index=df.index, name="AlphaTrend")
     at2 = at_s.shift(2)
@@ -265,6 +274,7 @@ def compute_supertrend(
     df: pd.DataFrame,
     cfg: SupertrendConfig = SupertrendConfig(),
     show_progress: bool = False,
+    precomputed_tr: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Compute reference Supertrend and strict buy/sell signal set."""
 
@@ -280,39 +290,48 @@ def compute_supertrend(
     else:
         src = close
 
-    tr = true_range(high, low, close)
+    tr = true_range(high, low, close) if precomputed_tr is None else precomputed_tr
+    if len(tr) != len(df):
+        raise ValueError("precomputed_tr length mismatch for Supertrend")
+    if not tr.index.equals(df.index):
+        raise ValueError("precomputed_tr index mismatch for Supertrend")
     atr = _wilder_atr(tr, cfg.periods) if cfg.change_atr_method else sma(tr, cfg.periods)
     up = src - (cfg.multiplier * atr)
     dn = src + (cfg.multiplier * atr)
 
-    up_band = np.full(len(df), np.nan, dtype=np.float64)
-    dn_band = np.full(len(df), np.nan, dtype=np.float64)
-    trend = np.full(len(df), np.nan, dtype=np.float64)
+    rows = len(df)
+    up_arr = up.to_numpy(dtype=np.float64, copy=False)
+    dn_arr = dn.to_numpy(dtype=np.float64, copy=False)
+    close_arr = close.to_numpy(dtype=np.float64, copy=False)
 
-    for i in range(len(df)):
+    up_band = np.full(rows, np.nan, dtype=np.float64)
+    dn_band = np.full(rows, np.nan, dtype=np.float64)
+    trend = np.full(rows, np.nan, dtype=np.float64)
+
+    for i in range(rows):
         if i == 0:
-            up_band[i] = up.iat[i]
-            dn_band[i] = dn.iat[i]
+            up_band[i] = up_arr[i]
+            dn_band[i] = dn_arr[i]
             trend[i] = 1.0
             continue
 
         up1 = up_band[i - 1]
         dn1 = dn_band[i - 1]
 
-        if close.iat[i - 1] > up1:
-            up_band[i] = max(up.iat[i], up1)
+        if close_arr[i - 1] > up1:
+            up_band[i] = max(up_arr[i], up1)
         else:
-            up_band[i] = up.iat[i]
+            up_band[i] = up_arr[i]
 
-        if close.iat[i - 1] < dn1:
-            dn_band[i] = min(dn.iat[i], dn1)
+        if close_arr[i - 1] < dn1:
+            dn_band[i] = min(dn_arr[i], dn1)
         else:
-            dn_band[i] = dn.iat[i]
+            dn_band[i] = dn_arr[i]
 
         prev_trend = trend[i - 1]
-        if (prev_trend == -1.0) and (close.iat[i] > dn1):
+        if (prev_trend == -1.0) and (close_arr[i] > dn1):
             trend[i] = 1.0
-        elif (prev_trend == 1.0) and (close.iat[i] < up1):
+        elif (prev_trend == 1.0) and (close_arr[i] < up1):
             trend[i] = -1.0
         else:
             trend[i] = prev_trend
