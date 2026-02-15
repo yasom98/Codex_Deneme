@@ -20,6 +20,16 @@ CONTINUOUS_FEATURE_COLUMNS: tuple[str, ...] = (
     "rsi_slope",
     "rsi_zscore",
 )
+EVENT_FLAG_COLUMNS: tuple[str, ...] = (
+    "evt_supertrend_flip_up",
+    "evt_supertrend_flip_down",
+    "evt_alphatrend_flip_up",
+    "evt_alphatrend_flip_down",
+    "evt_rsi_cross_center_up",
+    "evt_rsi_cross_center_down",
+    "evt_rsi_overbought",
+    "evt_rsi_oversold",
+)
 
 _ALLOWED_RULE_OPERATORS: tuple[str, ...] = (">", ">=", "<", "<=", "==", "!=")
 
@@ -59,6 +69,15 @@ class RsiConfig:
     period: int
     slope_lag: int
     zscore_window: int
+
+
+@dataclass(frozen=True)
+class EventConfig:
+    """Event threshold settings for RSI-based and trend-flip events."""
+
+    rsi_centerline: float
+    rsi_overbought: float
+    rsi_oversold: float
 
 
 def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -400,3 +419,80 @@ def compute_indicator_core(
     )
 
     return features
+
+
+def generate_raw_event_flags(indicators: pd.DataFrame, cfg: EventConfig) -> pd.DataFrame:
+    """Generate raw event flags before leak-free shift(1) enforcement."""
+
+    required = {"supertrend_direction_raw", "alphatrend_direction_raw", "rsi"}
+    missing = sorted(required.difference(indicators.columns))
+    if missing:
+        raise ValueError(f"Missing required indicator columns for event generation: {missing}")
+
+    if cfg.rsi_oversold >= cfg.rsi_overbought:
+        raise ValueError("events.rsi_oversold must be strictly less than events.rsi_overbought")
+
+    super_dir = indicators["supertrend_direction_raw"].astype("int8")
+    alpha_dir = indicators["alphatrend_direction_raw"].astype("int8")
+    rsi = indicators["rsi"].astype("float32")
+
+    prev_super_dir = super_dir.shift(1).fillna(super_dir.iloc[0]).astype("int8")
+    prev_alpha_dir = alpha_dir.shift(1).fillna(alpha_dir.iloc[0]).astype("int8")
+    prev_rsi = rsi.shift(1).fillna(rsi.iloc[0]).astype("float32")
+
+    raw_events = pd.DataFrame(
+        {
+            "evt_supertrend_flip_up": (super_dir.eq(1) & prev_super_dir.eq(-1)),
+            "evt_supertrend_flip_down": (super_dir.eq(-1) & prev_super_dir.eq(1)),
+            "evt_alphatrend_flip_up": (alpha_dir.eq(1) & prev_alpha_dir.eq(-1)),
+            "evt_alphatrend_flip_down": (alpha_dir.eq(-1) & prev_alpha_dir.eq(1)),
+            "evt_rsi_cross_center_up": (rsi >= cfg.rsi_centerline) & (prev_rsi < cfg.rsi_centerline),
+            "evt_rsi_cross_center_down": (rsi <= cfg.rsi_centerline) & (prev_rsi > cfg.rsi_centerline),
+            "evt_rsi_overbought": (rsi >= cfg.rsi_overbought) & (prev_rsi < cfg.rsi_overbought),
+            "evt_rsi_oversold": (rsi <= cfg.rsi_oversold) & (prev_rsi > cfg.rsi_oversold),
+        },
+        index=indicators.index,
+    )
+    return raw_events
+
+
+def _shift_flag_one(raw_flag: pd.Series) -> pd.Series:
+    """Shift a boolean event by exactly one bar and convert to uint8."""
+
+    raw_uint8 = raw_flag.fillna(False).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+    shifted = np.zeros(len(raw_uint8), dtype=np.uint8)
+    if len(raw_uint8) > 1:
+        shifted[1:] = raw_uint8[:-1]
+    return pd.Series(shifted, index=raw_flag.index, dtype="uint8")
+
+
+def enforce_shift_one(raw_events: pd.DataFrame) -> pd.DataFrame:
+    """Enforce strict leak-free shift(1) for every event column."""
+
+    out = pd.DataFrame(index=raw_events.index)
+    for col in EVENT_FLAG_COLUMNS:
+        if col not in raw_events.columns:
+            raise ValueError(f"Missing raw event column: {col}")
+        out[col] = _shift_flag_one(raw_events[col])
+    return out
+
+
+def validate_shift_one(raw_events: pd.DataFrame, shifted_events: pd.DataFrame) -> bool:
+    """Validate strict shift(1) relation between raw and final event flags."""
+
+    for col in EVENT_FLAG_COLUMNS:
+        if col not in raw_events.columns or col not in shifted_events.columns:
+            return False
+
+        raw_uint8 = raw_events[col].fillna(False).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+        shifted_uint8 = shifted_events[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False)
+
+        if len(raw_uint8) != len(shifted_uint8):
+            return False
+        if len(raw_uint8) == 0:
+            continue
+        if shifted_uint8[0] != 0:
+            return False
+        if len(raw_uint8) > 1 and not np.array_equal(shifted_uint8[1:], raw_uint8[:-1]):
+            return False
+    return True
