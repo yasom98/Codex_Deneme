@@ -6,9 +6,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 
 from data.features import CONTINUOUS_FEATURE_COLUMNS, EVENT_FLAG_COLUMNS, PIVOT_FEATURE_COLUMNS, validate_shift_one
+
+_EMA_WARMUP_ROWS: dict[str, int] = {
+    "EMA_200": 199,
+    "EMA_600": 599,
+    "EMA_1200": 1199,
+}
 
 
 @dataclass
@@ -213,6 +220,30 @@ def evaluate_feature_health(
     else:
         report.pivot_nonnull_ratio_after_first_session = 1.0
 
+    if "ST_up" in feature_df.columns and "ST_dn" in feature_df.columns and len(feature_df) > 0:
+        st_nonnull_union = feature_df["ST_up"].notna() | feature_df["ST_dn"].notna()
+        if bool(st_nonnull_union.any()):
+            first_valid_pos = int(np.flatnonzero(st_nonnull_union.to_numpy(dtype=bool, copy=False))[0])
+            post_warmup_union = st_nonnull_union.iloc[first_valid_pos:]
+            invalid_ratio = float((~post_warmup_union).mean())
+            if invalid_ratio > 0.0:
+                report.nan_ratio_ok = False
+                add_error(
+                    report,
+                    stage="gates",
+                    code="SUPERTREND_BAND_COVERAGE_FAILED",
+                    message="ST_up/ST_dn coverage invalid after warmup.",
+                    invalid_ratio=invalid_ratio,
+                )
+        else:
+            report.nan_ratio_ok = False
+            add_error(
+                report,
+                stage="gates",
+                code="SUPERTREND_BAND_EMPTY",
+                message="Both ST_up and ST_dn are NaN for all rows.",
+            )
+
     for col in _continuous_columns():
         if col not in feature_df.columns:
             continue
@@ -220,6 +251,16 @@ def evaluate_feature_health(
         ratio = float(feature_df[col].isna().mean())
         report.nan_ratios[col] = ratio
         gate_ratio = ratio
+
+        if col in _EMA_WARMUP_ROWS:
+            warmup_rows = _EMA_WARMUP_ROWS[col]
+            if len(feature_df) > warmup_rows:
+                gate_ratio = float(feature_df[col].iloc[warmup_rows:].isna().mean())
+            else:
+                gate_ratio = 0.0
+
+        if col in {"ST_up", "ST_dn"}:
+            gate_ratio = 0.0
 
         if (
             col in PIVOT_FEATURE_COLUMNS
