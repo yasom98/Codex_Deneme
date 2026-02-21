@@ -8,8 +8,6 @@ import numpy as np
 import pandas as pd
 
 from data.features import (
-    CONTINUOUS_FEATURE_COLUMNS,
-    EVENT_FLAG_COLUMNS,
     AlphaTrendConfig,
     FeatureBuildConfig,
     HealthPolicyConfig,
@@ -63,9 +61,9 @@ def test_dtype_policy_continuous_float32_flags_uint8() -> None:
     artifacts = build_feature_artifacts(_sample_ohlcv(), _config())
     out = artifacts.frame
 
-    continuous = ("open", "high", "low", "close", "volume", *CONTINUOUS_FEATURE_COLUMNS)
+    continuous = ("open", "high", "low", "close", "volume", *artifacts.continuous_feature_columns)
     for col in continuous:
         assert str(out[col].dtype) == "float32"
 
-    for col in EVENT_FLAG_COLUMNS:
+    for col in artifacts.flag_feature_columns:
         assert str(out[col].dtype) == "uint8"

@@ -9,7 +9,14 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from data.features import CONTINUOUS_FEATURE_COLUMNS, EVENT_FLAG_COLUMNS, PIVOT_FEATURE_COLUMNS, validate_shift_one
+from data.features import (
+    CONTINUOUS_FEATURE_COLUMNS,
+    EVENT_FLAG_COLUMNS,
+    PIVOT_FEATURE_COLUMNS,
+    REGIME_FLAG_COLUMNS,
+    validate_shift_one,
+    validate_shift_one_for_columns,
+)
 
 _EMA_WARMUP_ROWS: dict[str, int] = {
     "EMA_200": 199,
@@ -64,6 +71,9 @@ class FeatureHealthReport:
     pivot_first_session_rows: int = 0
     pivot_nonnull_ratio_after_first_session: float = 1.0
     pivot_fill_strategy_applied: str = "none"
+    feature_count: int = 0
+    timestamp_min_utc: str | None = None
+    timestamp_max_utc: str | None = None
     nan_ratios: dict[str, float] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     errors: list[StructuredError] = field(default_factory=list)
@@ -120,10 +130,26 @@ def evaluate_feature_health(
     formula_fingerprints: dict[str, str],
     formula_fingerprint_bundle: str,
     strict_parity: bool,
+    continuous_feature_columns: Sequence[str] | None = None,
+    flag_feature_columns: Sequence[str] | None = None,
+    warmup_rows_by_column: dict[str, int] | None = None,
+    raw_regime_flags: pd.DataFrame | None = None,
+    shifted_regime_flags: pd.DataFrame | None = None,
 ) -> FeatureHealthReport:
     """Run strict QC gates for feature outputs and update report in place."""
 
-    expected = _expected_columns()
+    resolved_continuous = tuple(continuous_feature_columns) if continuous_feature_columns else CONTINUOUS_FEATURE_COLUMNS
+    resolved_flags = tuple(flag_feature_columns) if flag_feature_columns else EVENT_FLAG_COLUMNS
+    expected = (
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        *resolved_continuous,
+        *resolved_flags,
+    )
     missing = [col for col in expected if col not in feature_df.columns]
     report.schema_ok = len(missing) == 0
     if missing:
@@ -139,13 +165,24 @@ def evaluate_feature_health(
         if not report.unique_ts_ok:
             add_error(report, stage="gates", code="TIMESTAMP_NOT_UNIQUE", message="timestamp is not unique")
 
-        dtype_ok_continuous = all(str(feature_df[col].dtype) == "float32" for col in _continuous_columns())
-        dtype_ok_flags = all(str(feature_df[col].dtype) == "uint8" for col in EVENT_FLAG_COLUMNS)
+        dtype_ok_continuous = all(
+            str(feature_df[col].dtype) == "float32" for col in ("open", "high", "low", "close", "volume", *resolved_continuous)
+        )
+        dtype_ok_flags = all(str(feature_df[col].dtype) == "uint8" for col in resolved_flags)
         report.dtype_ok = bool(dtype_ok_continuous and dtype_ok_flags)
         if not report.dtype_ok:
             add_error(report, stage="gates", code="DTYPE_POLICY_FAILED", message="Dtype policy failed for continuous/event columns")
 
     report.leakfree_ok = validate_shift_one(raw_events, shifted_events)
+    if raw_regime_flags is not None and shifted_regime_flags is not None:
+        report.leakfree_ok = bool(
+            report.leakfree_ok
+            and validate_shift_one_for_columns(
+                raw_regime_flags,
+                shifted_regime_flags,
+                REGIME_FLAG_COLUMNS,
+            )
+        )
     if not report.leakfree_ok:
         add_error(report, stage="gates", code="LEAKFREE_SHIFT_FAILED", message="Event flags are not strict shift(1)")
 
@@ -312,7 +349,11 @@ def evaluate_feature_health(
                 message="Both ST_up and ST_dn are NaN for all rows.",
             )
 
-    for col in _continuous_columns():
+    merged_warmup_rows = dict(_EMA_WARMUP_ROWS)
+    if warmup_rows_by_column:
+        merged_warmup_rows.update({str(k): int(v) for k, v in warmup_rows_by_column.items()})
+
+    for col in ("open", "high", "low", "close", "volume", *resolved_continuous):
         if col not in feature_df.columns:
             continue
 
@@ -320,8 +361,8 @@ def evaluate_feature_health(
         report.nan_ratios[col] = ratio
         gate_ratio = ratio
 
-        if col in _EMA_WARMUP_ROWS:
-            warmup_rows = _EMA_WARMUP_ROWS[col]
+        if col in merged_warmup_rows:
+            warmup_rows = merged_warmup_rows[col]
             if len(feature_df) > warmup_rows:
                 gate_ratio = float(feature_df[col].iloc[warmup_rows:].isna().mean())
             else:
@@ -358,6 +399,10 @@ def evaluate_feature_health(
             )
 
     report.rows_out = int(len(feature_df))
+    report.feature_count = int(feature_df.shape[1])
+    if report.rows_out > 0:
+        report.timestamp_min_utc = pd.Timestamp(feature_df["timestamp"].iloc[0]).isoformat()
+        report.timestamp_max_utc = pd.Timestamp(feature_df["timestamp"].iloc[-1]).isoformat()
     if report.rows_out <= 0:
         add_error(report, stage="gates", code="EMPTY_OUTPUT", message="Feature output has no rows")
 
@@ -409,4 +454,5 @@ def summarize_feature_reports(
         "strict_parity": bool(strict_parity),
         "formula_fingerprints": dict(formula_fingerprints),
         "formula_fingerprint_bundle": str(formula_fingerprint_bundle),
+        "feature_count": max((report.feature_count for report in reports), default=0),
     }

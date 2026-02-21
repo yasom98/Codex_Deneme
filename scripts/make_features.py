@@ -21,10 +21,13 @@ from core.paths import build_report_path
 from data.feature_health import FeatureHealthReport, add_error, evaluate_feature_health, summarize_feature_reports
 from data.features import (
     build_feature_artifacts,
+    build_feature_manifest_payload,
     build_feature_output_path,
     compute_formula_fingerprint_bundle,
     compute_formula_fingerprints,
     discover_parquet_files,
+    get_expected_column_dtypes,
+    get_feature_groups,
     load_feature_config,
 )
 
@@ -134,6 +137,10 @@ def _build_mismatch_summary(
         "strict_parity": True,
         "formula_fingerprints": {},
         "formula_fingerprint_bundle": "",
+        "feature_count": 0,
+        "manifest_generated": False,
+        "manifest_path": None,
+        "manifest_error": None,
         "run_id": run_id,
         "run_root": str(run_root),
         "input_run_id_resolved": input_run_id_resolved,
@@ -218,6 +225,12 @@ def main() -> int:
     )
 
     reports: list[FeatureHealthReport] = []
+    manifest_feature_groups: dict[str, tuple[str, ...]] | None = None
+    manifest_column_dtypes: dict[str, str] | None = None
+    manifest_rows: int = 0
+    manifest_date_min_utc: str | None = None
+    manifest_date_max_utc: str | None = None
+    manifest_error: str | None = None
 
     for src_path in tqdm(src_files, desc="Building features"):
         report = FeatureHealthReport(input_file=str(src_path))
@@ -252,6 +265,11 @@ def main() -> int:
                 formula_fingerprints=artifacts.formula_fingerprints,
                 formula_fingerprint_bundle=artifacts.formula_fingerprint_bundle,
                 strict_parity=strict_parity,
+                continuous_feature_columns=artifacts.continuous_feature_columns,
+                flag_feature_columns=artifacts.flag_feature_columns,
+                warmup_rows_by_column=artifacts.warmup_rows_by_column,
+                raw_regime_flags=artifacts.raw_regime_flags,
+                shifted_regime_flags=artifacts.shifted_regime_flags,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             add_error(report, stage="build", code="FEATURE_BUILD_FAILED", message=str(exc))
@@ -264,6 +282,22 @@ def main() -> int:
             except RuntimeError as exc:
                 add_error(report, stage="write", code="FEATURE_WRITE_FAILED", message=str(exc))
                 report.status = "failed"
+
+        if report.status == "success" and feature_df is not None:
+            current_dtypes = {col: str(dtype) for col, dtype in feature_df.dtypes.items()}
+            if manifest_column_dtypes is None:
+                manifest_column_dtypes = current_dtypes
+            elif manifest_column_dtypes != current_dtypes and manifest_error is None:
+                manifest_error = "INCONSISTENT_OUTPUT_SCHEMA: feature output columns/dtypes differ across files"
+
+            if manifest_feature_groups is None:
+                manifest_feature_groups = artifacts.feature_groups
+
+            manifest_rows += int(len(feature_df))
+            current_min = feature_df["timestamp"].iloc[0].isoformat()
+            current_max = feature_df["timestamp"].iloc[-1].isoformat()
+            manifest_date_min_utc = current_min if manifest_date_min_utc is None else min(manifest_date_min_utc, current_min)
+            manifest_date_max_utc = current_max if manifest_date_max_utc is None else max(manifest_date_max_utc, current_max)
 
         reports.append(report)
         LOGGER.info(
@@ -291,6 +325,31 @@ def main() -> int:
     summary["output_root_resolved"] = str(parquet_root.resolve())
     summary["indicator_spec_version"] = cfg.indicator_spec_version
     summary["config_hash"] = cfg.config_hash
+
+    manifest_path = reports_root / "feature_manifest.json"
+    manifest_generated = False
+    if not args.dry_run:
+        if manifest_error is None:
+            try:
+                manifest_payload = build_feature_manifest_payload(
+                    run_id=run_id,
+                    cfg=cfg,
+                    feature_groups=manifest_feature_groups or get_feature_groups(cfg),
+                    column_dtypes=manifest_column_dtypes or get_expected_column_dtypes(cfg),
+                    row_count=manifest_rows,
+                    date_min_utc=manifest_date_min_utc,
+                    date_max_utc=manifest_date_max_utc,
+                    formula_fingerprints=formula_fingerprints,
+                    formula_fingerprint_bundle=formula_fingerprint_bundle,
+                )
+                atomic_write_json(manifest_payload, manifest_path)
+                manifest_generated = True
+            except (RuntimeError, ValueError, OSError) as exc:
+                manifest_error = str(exc)
+
+    summary["manifest_generated"] = manifest_generated
+    summary["manifest_path"] = str(manifest_path) if manifest_generated else None
+    summary["manifest_error"] = manifest_error
 
     LOGGER.info(
         "Feature build summary | run_id=%s total=%d success=%d failed=%d",

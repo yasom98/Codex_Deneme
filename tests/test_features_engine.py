@@ -149,13 +149,16 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     out_parquet = run_root / "parquet" / "sample.parquet"
     per_file_report = run_root / "reports" / "per_file" / "sample.json"
     summary_report = run_root / "reports" / "summary.json"
+    manifest_report = run_root / "reports" / "feature_manifest.json"
 
     assert out_parquet.exists()
     assert per_file_report.exists()
     assert summary_report.exists()
+    assert manifest_report.exists()
 
     per_file_payload = json.loads(per_file_report.read_text(encoding="utf-8"))
     summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
+    manifest_payload = json.loads(manifest_report.read_text(encoding="utf-8"))
 
     assert per_file_payload["status"] == "success"
     assert per_file_payload["indicator_parity_status"] == "passed"
@@ -176,6 +179,9 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert per_file_payload["output_run_id"] == run_id
     assert per_file_payload["input_root_resolved"] == str(_run_input_root(runs_root, run_id).resolve())
     assert per_file_payload["output_root_resolved"] == str((run_root / "parquet").resolve())
+    assert per_file_payload["feature_count"] > 0
+    assert isinstance(per_file_payload["timestamp_min_utc"], str)
+    assert isinstance(per_file_payload["timestamp_max_utc"], str)
 
     assert summary_payload["succeeded_files"] == 1
     assert summary_payload["failed_files"] == 0
@@ -190,6 +196,19 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert summary_payload["output_run_id"] == run_id
     assert summary_payload["input_root_resolved"] == str(_run_input_root(runs_root, run_id).resolve())
     assert summary_payload["output_root_resolved"] == str((run_root / "parquet").resolve())
+    assert summary_payload["feature_count"] > 0
+    assert summary_payload["manifest_generated"] is True
+    assert summary_payload["manifest_path"] == str(manifest_report)
+    assert summary_payload["manifest_error"] is None
+
+    assert manifest_payload["run_id"] == run_id
+    assert manifest_payload["timestamp_column"] == "timestamp"
+    assert manifest_payload["row_count"] == per_file_payload["rows_out"]
+    assert "feature_groups" in manifest_payload
+    assert "price_derived" in manifest_payload["feature_groups"]
+    assert "column_dtypes" in manifest_payload
+    assert manifest_payload["column_dtypes"]["evt_at_buy"] == "uint8"
+    assert manifest_payload["column_dtypes"]["EMA_200"] == "float32"
     assert not list(run_root.rglob("*.tmp"))
 
 
@@ -579,6 +598,8 @@ def test_make_features_cli_fails_on_input_output_run_mismatch(monkeypatch: objec
     assert summary_payload["output_run_id"] == output_run_id
     assert summary_payload["input_run_id_resolved"] == input_run_id
     assert summary_payload["indicator_validation_overall"] is False
+    assert summary_payload["manifest_generated"] is False
+    assert summary_payload["manifest_path"] is None
     assert any(error["code"] == "INPUT_OUTPUT_RUN_MISMATCH" for error in summary_payload["errors"])
 
 

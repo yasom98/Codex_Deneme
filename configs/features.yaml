@@ -35,3 +35,9 @@ health:
     - AlphaTrend
     - ST_up
     - ST_dn
+
+rl_features:
+  rolling_vol_windows: [20, 50]
+  zscore_window: 50
+  zscore_source: "return"
+  volatility_regime_bins: 3

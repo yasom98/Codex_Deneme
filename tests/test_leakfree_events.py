@@ -15,9 +15,11 @@ from data.features import (
     INDICATOR_SPEC_VERSION,
     ParityPolicyConfig,
     PivotPolicyConfig,
+    REGIME_FLAG_COLUMNS,
     SuperTrendConfig,
     build_feature_artifacts,
     validate_shift_one,
+    validate_shift_one_for_columns,
 )
 
 
@@ -68,10 +70,21 @@ def test_event_columns_are_strict_shift_one() -> None:
     artifacts = build_feature_artifacts(_sample_ohlcv(), _config())
 
     assert validate_shift_one(artifacts.raw_events, artifacts.shifted_events)
+    assert validate_shift_one_for_columns(
+        artifacts.raw_regime_flags,
+        artifacts.shifted_regime_flags,
+        REGIME_FLAG_COLUMNS,
+    )
 
     for col in EVENT_FLAG_COLUMNS:
         raw = artifacts.raw_events[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8)
         shifted = artifacts.shifted_events[col].to_numpy(dtype=np.uint8)
 
+        assert shifted[0] == 0
+        np.testing.assert_array_equal(shifted[1:], raw[:-1])
+
+    for col in REGIME_FLAG_COLUMNS:
+        raw = artifacts.raw_regime_flags[col].fillna(0).astype("uint8").to_numpy(dtype=np.uint8)
+        shifted = artifacts.shifted_regime_flags[col].to_numpy(dtype=np.uint8)
         assert shifted[0] == 0
         np.testing.assert_array_equal(shifted[1:], raw[:-1])
