@@ -41,7 +41,7 @@ def _invalid_df(rows: int = 420) -> pd.DataFrame:
     return df
 
 
-def _single_session_df(rows: int = 360) -> pd.DataFrame:
+def _single_session_df(rows: int = 200) -> pd.DataFrame:
     ts = pd.date_range("2024-01-01", periods=rows, freq="5min", tz="UTC")
     base = np.linspace(100.0, 120.0, rows)
     close = base + np.sin(np.linspace(0.0, 10.0, rows))

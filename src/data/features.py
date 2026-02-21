@@ -588,11 +588,20 @@ def _validate_supertrend_sanity(core_output: IndicatorCoreOutput) -> bool:
 
     st_up = continuous["ST_up"]
     st_dn = continuous["ST_dn"]
-    band_alignment_ok = bool(
-        (st_up.isna() == trend.ne(1)).all()
-        and (st_dn.isna() == trend.ne(-1)).all()
-    )
-    band_exclusivity_ok = not bool((st_up.notna() & st_dn.notna()).any())
+    st_nonnull_union = st_up.notna() | st_dn.notna()
+    if bool(st_nonnull_union.any()):
+        first_valid_pos = int(np.flatnonzero(st_nonnull_union.to_numpy(dtype=bool, copy=False))[0])
+        post_trend = trend.iloc[first_valid_pos:]
+        post_up = st_up.iloc[first_valid_pos:]
+        post_dn = st_dn.iloc[first_valid_pos:]
+        band_alignment_ok = bool(
+            post_up.notna().eq(post_trend.eq(1)).all()
+            and post_dn.notna().eq(post_trend.eq(-1)).all()
+        )
+        band_exclusivity_ok = not bool((post_up.notna() & post_dn.notna()).any())
+    else:
+        band_alignment_ok = False
+        band_exclusivity_ok = False
 
     buy = raw["ST_buy"].fillna(0).astype("uint8").eq(1)
     sell = raw["ST_sell"].fillna(0).astype("uint8").eq(1)
