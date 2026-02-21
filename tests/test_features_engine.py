@@ -168,6 +168,12 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert isinstance(per_file_payload["pivot_reference_validation_details"], dict)
     assert per_file_payload["pivot_reference_source"] == "indicator_specs/pivot_traditional.py"
     assert per_file_payload["pivot_reference_type"] == "Traditional"
+    assert per_file_payload["alphatrend_reference_validation_status"] == "passed"
+    assert isinstance(per_file_payload["alphatrend_reference_validation_details"], dict)
+    assert per_file_payload["alphatrend_reference_source"] == "indicator_specs/alphatrend.py"
+    assert per_file_payload["supertrend_reference_validation_status"] == "passed"
+    assert isinstance(per_file_payload["supertrend_reference_validation_details"], dict)
+    assert per_file_payload["supertrend_reference_source"] == "indicator_specs/supertrend.py"
     assert per_file_payload["session_count"] >= 2
     assert per_file_payload["first_session_row_count"] == 1
     assert per_file_payload["pivot_first_session_allowed_nan"] is True
@@ -192,6 +198,8 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert summary_payload["parity_status_overall"] is True
     assert summary_payload["indicator_validation_overall"] is True
     assert summary_payload["pivot_reference_validation_overall"] is True
+    assert summary_payload["alphatrend_reference_validation_overall"] is True
+    assert summary_payload["supertrend_reference_validation_overall"] is True
     assert summary_payload["strict_parity"] is True
     assert isinstance(summary_payload["formula_fingerprints"], dict)
     assert isinstance(summary_payload["formula_fingerprint_bundle"], str)
@@ -382,6 +390,65 @@ def test_make_features_cli_blocks_output_when_health_fails(monkeypatch: object, 
     assert per_file_payload["status"] == "failed"
     assert len(per_file_payload["errors"]) > 0
     assert summary_payload["failed_files"] == 1
+
+
+def test_make_features_cli_fail_closed_on_supertrend_reference_execution_error(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    config_input_root = tmp_path / "in"
+    runs_root = tmp_path / "runs"
+    config_input_root.mkdir(parents=True, exist_ok=True)
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    run_id = "supertrend_ref_fail_run"
+    _seed_standardized_parquet(runs_root, run_id, "supertrend_ref_fail.parquet")
+    config_path = tmp_path / "features.yaml"
+    _write_config(config_path, input_root=config_input_root, runs_root=runs_root)
+
+    def fake_read_parquet(path: Path) -> pd.DataFrame:
+        del path
+        return _healthy_df()
+
+    def fake_to_parquet(self: pd.DataFrame, path: Path, index: bool = False) -> None:
+        del self, index
+        Path(path).write_text("ok", encoding="utf-8")
+
+    def broken_supertrend_reference(*_: object, **__: object) -> pd.DataFrame:
+        raise RuntimeError("reference execution failed")
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
+    monkeypatch.setattr("data.features.compute_reference_supertrend", broken_supertrend_reference)
+
+    main = _load_main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["make_features.py", "--config", str(config_path), "--run-id", run_id],
+    )
+
+    exit_code = int(main())
+    assert exit_code == 1
+
+    run_root = runs_root / run_id / "data_features"
+    out_parquet = run_root / "parquet" / "supertrend_ref_fail.parquet"
+    per_file_report = run_root / "reports" / "per_file" / "supertrend_ref_fail.json"
+    summary_report = run_root / "reports" / "summary.json"
+
+    assert not out_parquet.exists()
+    assert per_file_report.exists()
+    assert summary_report.exists()
+
+    per_file_payload = json.loads(per_file_report.read_text(encoding="utf-8"))
+    summary_payload = json.loads(summary_report.read_text(encoding="utf-8"))
+
+    assert per_file_payload["status"] == "failed"
+    assert per_file_payload["indicator_validation_status"] == "failed"
+    assert per_file_payload["supertrend_reference_validation_status"] == "failed"
+    assert any(error["code"] == "SUPERTREND_REFERENCE_VALIDATION_FAILED" for error in per_file_payload["errors"])
+    assert summary_payload["failed_files"] == 1
+    assert summary_payload["supertrend_reference_validation_overall"] is False
 
 
 def test_make_features_cli_fails_on_indicator_validation_even_when_parity_gate_passes(

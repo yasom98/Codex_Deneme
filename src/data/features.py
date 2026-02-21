@@ -15,6 +15,14 @@ import yaml
 from core.logging import get_logger
 from core.paths import ensure_within_root
 from data import indicator_reference as ref
+from data.reference_indicators import (
+    ALPHATREND_REFERENCE_SOURCE,
+    SUPERTREND_REFERENCE_SOURCE,
+    alphatrend_reference_available,
+    compute_reference_alphatrend,
+    compute_reference_supertrend,
+    supertrend_reference_available,
+)
 from data.reference_pivots import (
     PIVOT_REFERENCE_SOURCE,
     PIVOT_REFERENCE_TYPE,
@@ -940,6 +948,166 @@ def _evaluate_pivot_reference_validation(
     return bool(details["pivot_reference_parity"]), details
 
 
+def _evaluate_alphatrend_reference_validation(
+    ohlcv: pd.DataFrame,
+    core_output: IndicatorCoreOutput,
+    cfg: FeatureBuildConfig,
+) -> tuple[bool, dict[str, bool]]:
+    """Validate AlphaTrend outputs against user-provided reference implementation."""
+
+    details: dict[str, bool] = {}
+    details["alphatrend_reference_available"] = alphatrend_reference_available()
+    if not details["alphatrend_reference_available"]:
+        LOGGER.error("AlphaTrend reference missing | source=%s", ALPHATREND_REFERENCE_SOURCE)
+        details["alphatrend_reference_execution_ok"] = False
+        details["alphatrend_reference_AlphaTrend_parity"] = False
+        details["alphatrend_reference_AlphaTrend_2_parity"] = False
+        details["alphatrend_reference_AT_buy_parity"] = False
+        details["alphatrend_reference_AT_sell_parity"] = False
+        details["alphatrend_reference_parity"] = False
+        return False, details
+
+    try:
+        reference = compute_reference_alphatrend(
+            ohlcv,
+            coeff=cfg.alphatrend.coeff,
+            ap=cfg.alphatrend.ap,
+            use_no_volume=cfg.alphatrend.use_no_volume,
+        )
+        details["alphatrend_reference_execution_ok"] = True
+    except Exception as exc:  # pragma: no cover - fail closed on user spec runtime/import errors.
+        LOGGER.error("AlphaTrend reference execution failed | source=%s error=%s", ALPHATREND_REFERENCE_SOURCE, exc)
+        details["alphatrend_reference_execution_ok"] = False
+        details["alphatrend_reference_AlphaTrend_parity"] = False
+        details["alphatrend_reference_AlphaTrend_2_parity"] = False
+        details["alphatrend_reference_AT_buy_parity"] = False
+        details["alphatrend_reference_AT_sell_parity"] = False
+        details["alphatrend_reference_parity"] = False
+        return False, details
+
+    details["alphatrend_reference_AlphaTrend_parity"] = _float_parity_equal(
+        core_output.continuous["AlphaTrend"],
+        reference["AlphaTrend"],
+        atol=cfg.parity.float_atol,
+        rtol=cfg.parity.float_rtol,
+    )
+    details["alphatrend_reference_AlphaTrend_2_parity"] = _float_parity_equal(
+        core_output.continuous["AlphaTrend_2"],
+        reference["AlphaTrend_2"],
+        atol=cfg.parity.float_atol,
+        rtol=cfg.parity.float_rtol,
+    )
+    details["alphatrend_reference_AT_buy_parity"] = bool(
+        np.array_equal(
+            core_output.raw_events["AT_buy_raw"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+            reference["AT_buy"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+        )
+    )
+    details["alphatrend_reference_AT_sell_parity"] = bool(
+        np.array_equal(
+            core_output.raw_events["AT_sell_raw"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+            reference["AT_sell"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+        )
+    )
+    details["alphatrend_reference_parity"] = bool(
+        details["alphatrend_reference_AlphaTrend_parity"]
+        and details["alphatrend_reference_AlphaTrend_2_parity"]
+        and details["alphatrend_reference_AT_buy_parity"]
+        and details["alphatrend_reference_AT_sell_parity"]
+    )
+    return bool(details["alphatrend_reference_parity"]), details
+
+
+def _evaluate_supertrend_reference_validation(
+    ohlcv: pd.DataFrame,
+    core_output: IndicatorCoreOutput,
+    cfg: FeatureBuildConfig,
+) -> tuple[bool, dict[str, bool]]:
+    """Validate SuperTrend outputs against user-provided reference implementation."""
+
+    details: dict[str, bool] = {}
+    details["supertrend_reference_available"] = supertrend_reference_available()
+    if not details["supertrend_reference_available"]:
+        LOGGER.error("SuperTrend reference missing | source=%s", SUPERTREND_REFERENCE_SOURCE)
+        details["supertrend_reference_execution_ok"] = False
+        details["supertrend_reference_ST_trend_parity"] = False
+        details["supertrend_reference_ST_up_parity"] = False
+        details["supertrend_reference_ST_dn_parity"] = False
+        details["supertrend_reference_ST_buy_parity"] = False
+        details["supertrend_reference_ST_sell_parity"] = False
+        details["supertrend_reference_ST_change_parity"] = False
+        details["supertrend_reference_parity"] = False
+        return False, details
+
+    try:
+        reference = compute_reference_supertrend(
+            ohlcv,
+            periods=cfg.supertrend.periods,
+            multiplier=cfg.supertrend.multiplier,
+            source=cfg.supertrend.source,
+            change_atr_method=cfg.supertrend.change_atr_method,
+        )
+        details["supertrend_reference_execution_ok"] = True
+    except Exception as exc:  # pragma: no cover - fail closed on user spec runtime/import errors.
+        LOGGER.error("SuperTrend reference execution failed | source=%s error=%s", SUPERTREND_REFERENCE_SOURCE, exc)
+        details["supertrend_reference_execution_ok"] = False
+        details["supertrend_reference_ST_trend_parity"] = False
+        details["supertrend_reference_ST_up_parity"] = False
+        details["supertrend_reference_ST_dn_parity"] = False
+        details["supertrend_reference_ST_buy_parity"] = False
+        details["supertrend_reference_ST_sell_parity"] = False
+        details["supertrend_reference_ST_change_parity"] = False
+        details["supertrend_reference_parity"] = False
+        return False, details
+
+    details["supertrend_reference_ST_trend_parity"] = _float_parity_equal(
+        core_output.continuous["ST_trend"],
+        reference["ST_trend"],
+        atol=cfg.parity.float_atol,
+        rtol=cfg.parity.float_rtol,
+    )
+    details["supertrend_reference_ST_up_parity"] = _float_parity_equal(
+        core_output.continuous["ST_up"],
+        reference["ST_up"],
+        atol=cfg.parity.float_atol,
+        rtol=cfg.parity.float_rtol,
+    )
+    details["supertrend_reference_ST_dn_parity"] = _float_parity_equal(
+        core_output.continuous["ST_dn"],
+        reference["ST_dn"],
+        atol=cfg.parity.float_atol,
+        rtol=cfg.parity.float_rtol,
+    )
+    details["supertrend_reference_ST_buy_parity"] = bool(
+        np.array_equal(
+            core_output.raw_events["ST_buy"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+            reference["ST_buy"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+        )
+    )
+    details["supertrend_reference_ST_sell_parity"] = bool(
+        np.array_equal(
+            core_output.raw_events["ST_sell"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+            reference["ST_sell"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+        )
+    )
+    derived_change = (core_output.continuous["ST_trend"] != core_output.continuous["ST_trend"].shift(1)).astype("uint8")
+    details["supertrend_reference_ST_change_parity"] = bool(
+        np.array_equal(
+            derived_change.to_numpy(dtype=np.uint8, copy=False),
+            reference["ST_change"].fillna(0).astype("uint8").to_numpy(dtype=np.uint8, copy=False),
+        )
+    )
+    details["supertrend_reference_parity"] = bool(
+        details["supertrend_reference_ST_trend_parity"]
+        and details["supertrend_reference_ST_up_parity"]
+        and details["supertrend_reference_ST_dn_parity"]
+        and details["supertrend_reference_ST_buy_parity"]
+        and details["supertrend_reference_ST_sell_parity"]
+        and details["supertrend_reference_ST_change_parity"]
+    )
+    return bool(details["supertrend_reference_parity"]), details
+
+
 def _is_binary_signal(series: pd.Series) -> bool:
     """Return True when signal contains only 0/1 values."""
 
@@ -1068,6 +1236,12 @@ def evaluate_indicator_validation(
     pivot_reference_ok, pivot_reference_details = _evaluate_pivot_reference_validation(ohlcv, core_output, cfg)
     details.update(pivot_reference_details)
     required_checks["pivot_reference_parity"] = pivot_reference_ok
+    alphatrend_reference_ok, alphatrend_reference_details = _evaluate_alphatrend_reference_validation(ohlcv, core_output, cfg)
+    details.update(alphatrend_reference_details)
+    required_checks["alphatrend_reference_parity"] = alphatrend_reference_ok
+    supertrend_reference_ok, supertrend_reference_details = _evaluate_supertrend_reference_validation(ohlcv, core_output, cfg)
+    details.update(supertrend_reference_details)
+    required_checks["supertrend_reference_parity"] = supertrend_reference_ok
 
     failed = sorted(key for key, passed in required_checks.items() if not passed)
     if failed:

@@ -135,6 +135,8 @@ def _build_mismatch_summary(
         "parity_status_overall": False,
         "indicator_validation_overall": False,
         "pivot_reference_validation_overall": False,
+        "alphatrend_reference_validation_overall": False,
+        "supertrend_reference_validation_overall": False,
         "strict_parity": True,
         "formula_fingerprints": {},
         "formula_fingerprint_bundle": "",

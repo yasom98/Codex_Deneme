@@ -18,6 +18,7 @@ from data.features import (
     SuperTrendConfig,
     build_feature_artifacts,
 )
+from data.reference_indicators import compute_reference_alphatrend, compute_reference_supertrend
 from data.reference_pivots import compute_reference_pivots_intraday
 
 
@@ -98,8 +99,7 @@ def test_alphatrend_parity_against_reference() -> None:
     cfg = _cfg()
     artifacts = build_feature_artifacts(df, cfg)
 
-    indexed = df.set_index("timestamp")
-    at_ref = ref.compute_alphatrend(indexed, cfg=ref.AlphaTrendConfig(coeff=3.0, ap=11, use_no_volume=False), show_progress=False)
+    at_ref = compute_reference_alphatrend(df, coeff=3.0, ap=11, use_no_volume=False)
 
     for col in ("AlphaTrend", "AlphaTrend_2"):
         np.testing.assert_allclose(
@@ -110,10 +110,8 @@ def test_alphatrend_parity_against_reference() -> None:
             equal_nan=True,
         )
 
-    np.testing.assert_array_equal(artifacts.raw_events["evt_at_buy_raw"].to_numpy(), at_ref["AT_buy_raw"].to_numpy())
-    np.testing.assert_array_equal(artifacts.raw_events["evt_at_sell_raw"].to_numpy(), at_ref["AT_sell_raw"].to_numpy())
-    np.testing.assert_array_equal(artifacts.raw_events["evt_at_buy"].to_numpy(), at_ref["AT_buy"].to_numpy())
-    np.testing.assert_array_equal(artifacts.raw_events["evt_at_sell"].to_numpy(), at_ref["AT_sell"].to_numpy())
+    np.testing.assert_array_equal(artifacts.raw_events["evt_at_buy_raw"].to_numpy(), at_ref["AT_buy"].to_numpy())
+    np.testing.assert_array_equal(artifacts.raw_events["evt_at_sell_raw"].to_numpy(), at_ref["AT_sell"].to_numpy())
 
 
 def test_supertrend_parity_against_reference() -> None:
@@ -121,12 +119,7 @@ def test_supertrend_parity_against_reference() -> None:
     cfg = _cfg()
     artifacts = build_feature_artifacts(df, cfg)
 
-    indexed = df.set_index("timestamp")
-    st_ref = ref.compute_supertrend(
-        indexed,
-        cfg=ref.SupertrendConfig(periods=10, multiplier=3.0, source="hl2", change_atr_method=True),
-        show_progress=False,
-    )
+    st_ref = compute_reference_supertrend(df, periods=10, multiplier=3.0, source="hl2", change_atr_method=True)
 
     np.testing.assert_allclose(
         artifacts.frame["ST_trend"].to_numpy(dtype=np.float64),
@@ -151,3 +144,5 @@ def test_supertrend_parity_against_reference() -> None:
     )
     np.testing.assert_array_equal(artifacts.raw_events["evt_st_buy"].to_numpy(), st_ref["ST_buy"].to_numpy())
     np.testing.assert_array_equal(artifacts.raw_events["evt_st_sell"].to_numpy(), st_ref["ST_sell"].to_numpy())
+    st_change = (artifacts.frame["ST_trend"] != artifacts.frame["ST_trend"].shift(1)).astype("uint8")
+    np.testing.assert_array_equal(st_change.to_numpy(dtype=np.uint8), st_ref["ST_change"].to_numpy(dtype=np.uint8))

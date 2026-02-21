@@ -17,6 +17,7 @@ from data.features import (
     validate_shift_one,
     validate_shift_one_for_columns,
 )
+from data.reference_indicators import ALPHATREND_REFERENCE_SOURCE, SUPERTREND_REFERENCE_SOURCE
 from data.reference_pivots import PIVOT_REFERENCE_SOURCE, PIVOT_REFERENCE_TYPE
 
 _EMA_WARMUP_ROWS: dict[str, int] = {
@@ -67,6 +68,12 @@ class FeatureHealthReport:
     pivot_reference_validation_details: dict[str, bool] = field(default_factory=dict)
     pivot_reference_source: str | None = None
     pivot_reference_type: str | None = None
+    alphatrend_reference_validation_status: str = "not_checked"
+    alphatrend_reference_validation_details: dict[str, bool] = field(default_factory=dict)
+    alphatrend_reference_source: str | None = None
+    supertrend_reference_validation_status: str = "not_checked"
+    supertrend_reference_validation_details: dict[str, bool] = field(default_factory=dict)
+    supertrend_reference_source: str | None = None
     strict_parity_gate_passed_but_indicator_validation_failed: bool = False
     formula_fingerprints: dict[str, str] = field(default_factory=dict)
     formula_fingerprint_bundle: str = ""
@@ -212,6 +219,30 @@ def evaluate_feature_health(
         report.pivot_reference_validation_status = (
             "passed" if (pivot_reference_execution_ok and pivot_reference_parity) else "failed"
         )
+    alphatrend_reference_details = {
+        key: bool(value) for key, value in indicator_validation_details.items() if key.startswith("alphatrend_reference_")
+    }
+    report.alphatrend_reference_validation_details = dict(sorted(alphatrend_reference_details.items()))
+    alphatrend_reference_available = bool(alphatrend_reference_details.get("alphatrend_reference_available", False))
+    alphatrend_reference_execution_ok = bool(alphatrend_reference_details.get("alphatrend_reference_execution_ok", False))
+    alphatrend_reference_parity = bool(alphatrend_reference_details.get("alphatrend_reference_parity", False))
+    report.alphatrend_reference_source = ALPHATREND_REFERENCE_SOURCE
+    report.alphatrend_reference_validation_status = (
+        "passed" if (alphatrend_reference_available and alphatrend_reference_execution_ok and alphatrend_reference_parity) else "failed"
+    )
+
+    supertrend_reference_details = {
+        key: bool(value) for key, value in indicator_validation_details.items() if key.startswith("supertrend_reference_")
+    }
+    report.supertrend_reference_validation_details = dict(sorted(supertrend_reference_details.items()))
+    supertrend_reference_available = bool(supertrend_reference_details.get("supertrend_reference_available", False))
+    supertrend_reference_execution_ok = bool(supertrend_reference_details.get("supertrend_reference_execution_ok", False))
+    supertrend_reference_parity = bool(supertrend_reference_details.get("supertrend_reference_parity", False))
+    report.supertrend_reference_source = SUPERTREND_REFERENCE_SOURCE
+    report.supertrend_reference_validation_status = (
+        "passed" if (supertrend_reference_available and supertrend_reference_execution_ok and supertrend_reference_parity) else "failed"
+    )
+
     report.formula_fingerprints = dict(formula_fingerprints)
     report.formula_fingerprint_bundle = str(formula_fingerprint_bundle)
     report.strict_parity_enabled = bool(strict_parity)
@@ -266,6 +297,30 @@ def evaluate_feature_health(
             failed_checks=pivot_failed_checks,
             source=report.pivot_reference_source,
             pivot_type=report.pivot_reference_type,
+        )
+    if report.alphatrend_reference_validation_status == "failed":
+        alphatrend_failed_checks = sorted(
+            key for key, passed in report.alphatrend_reference_validation_details.items() if not passed
+        )
+        add_error(
+            report,
+            stage="gates",
+            code="ALPHATREND_REFERENCE_VALIDATION_FAILED",
+            message="AlphaTrend reference validation mismatch or execution failure.",
+            failed_checks=alphatrend_failed_checks,
+            source=report.alphatrend_reference_source,
+        )
+    if report.supertrend_reference_validation_status == "failed":
+        supertrend_failed_checks = sorted(
+            key for key, passed in report.supertrend_reference_validation_details.items() if not passed
+        )
+        add_error(
+            report,
+            stage="gates",
+            code="SUPERTREND_REFERENCE_VALIDATION_FAILED",
+            message="SuperTrend reference validation mismatch or execution failure.",
+            failed_checks=supertrend_failed_checks,
+            source=report.supertrend_reference_source,
         )
 
     report.nan_ratio_ok = True
@@ -478,6 +533,12 @@ def summarize_feature_reports(
     pivot_reference_validation_overall = all(
         report.pivot_reference_validation_status in {"passed", "not_provided"} for report in reports
     )
+    alphatrend_reference_validation_overall = all(
+        report.alphatrend_reference_validation_status == "passed" for report in reports
+    )
+    supertrend_reference_validation_overall = all(
+        report.supertrend_reference_validation_status == "passed" for report in reports
+    )
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -490,6 +551,8 @@ def summarize_feature_reports(
         "parity_status_overall": parity_status_overall,
         "indicator_validation_overall": indicator_validation_overall,
         "pivot_reference_validation_overall": pivot_reference_validation_overall,
+        "alphatrend_reference_validation_overall": alphatrend_reference_validation_overall,
+        "supertrend_reference_validation_overall": supertrend_reference_validation_overall,
         "strict_parity": bool(strict_parity),
         "formula_fingerprints": dict(formula_fingerprints),
         "formula_fingerprint_bundle": str(formula_fingerprint_bundle),
