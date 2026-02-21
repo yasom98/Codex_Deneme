@@ -17,6 +17,7 @@ from data.features import (
     validate_shift_one,
     validate_shift_one_for_columns,
 )
+from data.reference_pivots import PIVOT_REFERENCE_SOURCE, PIVOT_REFERENCE_TYPE
 
 _EMA_WARMUP_ROWS: dict[str, int] = {
     "EMA_200": 199,
@@ -62,6 +63,10 @@ class FeatureHealthReport:
     indicator_validation_status: str = "not_checked"
     indicator_validation_details: dict[str, bool] = field(default_factory=dict)
     indicator_validation_ok: bool = False
+    pivot_reference_validation_status: str = "not_checked"
+    pivot_reference_validation_details: dict[str, bool] = field(default_factory=dict)
+    pivot_reference_source: str | None = None
+    pivot_reference_type: str | None = None
     strict_parity_gate_passed_but_indicator_validation_failed: bool = False
     formula_fingerprints: dict[str, str] = field(default_factory=dict)
     formula_fingerprint_bundle: str = ""
@@ -190,6 +195,23 @@ def evaluate_feature_health(
     report.indicator_parity_details = dict(indicator_parity_details)
     report.indicator_validation_status = indicator_validation_status
     report.indicator_validation_details = dict(indicator_validation_details)
+    pivot_reference_details = {
+        key: bool(value) for key, value in indicator_validation_details.items() if key.startswith("pivot_reference_")
+    }
+    report.pivot_reference_validation_details = dict(sorted(pivot_reference_details.items()))
+    pivot_reference_available = bool(pivot_reference_details.get("pivot_reference_available", False))
+    pivot_reference_execution_ok = bool(pivot_reference_details.get("pivot_reference_execution_ok", True))
+    pivot_reference_parity = bool(pivot_reference_details.get("pivot_reference_parity", True))
+    if not pivot_reference_available:
+        report.pivot_reference_validation_status = "not_provided"
+        report.pivot_reference_source = None
+        report.pivot_reference_type = None
+    else:
+        report.pivot_reference_source = PIVOT_REFERENCE_SOURCE
+        report.pivot_reference_type = PIVOT_REFERENCE_TYPE
+        report.pivot_reference_validation_status = (
+            "passed" if (pivot_reference_execution_ok and pivot_reference_parity) else "failed"
+        )
     report.formula_fingerprints = dict(formula_fingerprints)
     report.formula_fingerprint_bundle = str(formula_fingerprint_bundle)
     report.strict_parity_enabled = bool(strict_parity)
@@ -232,6 +254,19 @@ def evaluate_feature_health(
                 report,
                 "strict_parity gate passed but indicator_validation failed; write blocked by mandatory validation gate.",
             )
+    if report.pivot_reference_validation_status == "failed":
+        pivot_failed_checks = sorted(
+            key for key, passed in report.pivot_reference_validation_details.items() if not passed
+        )
+        add_error(
+            report,
+            stage="gates",
+            code="PIVOT_REFERENCE_VALIDATION_FAILED",
+            message="Pivot reference validation mismatch or execution failure.",
+            failed_checks=pivot_failed_checks,
+            source=report.pivot_reference_source,
+            pivot_type=report.pivot_reference_type,
+        )
 
     report.nan_ratio_ok = True
     critical_set = {col.strip() for col in critical_columns if str(col).strip()}
@@ -440,6 +475,9 @@ def summarize_feature_reports(
     failed_files = total_files - succeeded_files
     parity_status_overall = all(report.parity_ok for report in reports)
     indicator_validation_overall = all(report.indicator_validation_ok for report in reports)
+    pivot_reference_validation_overall = all(
+        report.pivot_reference_validation_status in {"passed", "not_provided"} for report in reports
+    )
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -451,6 +489,7 @@ def summarize_feature_reports(
         "failed_inputs": [report.input_file for report in reports if report.status == "failed"],
         "parity_status_overall": parity_status_overall,
         "indicator_validation_overall": indicator_validation_overall,
+        "pivot_reference_validation_overall": pivot_reference_validation_overall,
         "strict_parity": bool(strict_parity),
         "formula_fingerprints": dict(formula_fingerprints),
         "formula_fingerprint_bundle": str(formula_fingerprint_bundle),
