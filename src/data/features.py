@@ -137,6 +137,8 @@ class FeatureBuildArtifacts:
     shifted_events: pd.DataFrame
     indicator_parity_status: str
     indicator_parity_details: dict[str, bool]
+    indicator_validation_status: str
+    indicator_validation_details: dict[str, bool]
     formula_fingerprints: dict[str, str]
     formula_fingerprint_bundle: str
 
@@ -498,6 +500,164 @@ def evaluate_indicator_parity(
     return "passed", details
 
 
+def _compute_pivot_reference_previous_session(ohlcv: pd.DataFrame, first_session_fill: str) -> pd.DataFrame:
+    """Compute explicit traditional pivots from previous daily session OHLC."""
+
+    sessions = ohlcv["timestamp"].dt.floor("D")
+    session_ohlc = ohlcv.groupby(sessions, sort=False).agg(
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+    )
+    prev = session_ohlc.shift(1)
+
+    prev_high = sessions.map(prev["high"])
+    prev_low = sessions.map(prev["low"])
+    prev_close = sessions.map(prev["close"])
+
+    pp = (prev_high + prev_low + prev_close) / 3.0
+    rng = prev_high - prev_low
+
+    pivots = pd.DataFrame(
+        {
+            "PP": pp,
+            "R1": (2.0 * pp) - prev_low,
+            "S1": (2.0 * pp) - prev_high,
+            "R2": pp + rng,
+            "S2": pp - rng,
+            "R3": (2.0 * pp) + prev_high - (2.0 * prev_low),
+            "S3": (2.0 * pp) - ((2.0 * prev_high) - prev_low),
+            "R4": (3.0 * pp) + prev_high - (3.0 * prev_low),
+            "S4": (3.0 * pp) - ((3.0 * prev_high) - prev_low),
+            "R5": (4.0 * pp) + prev_high - (4.0 * prev_low),
+            "S5": (4.0 * pp) - ((4.0 * prev_high) - prev_low),
+        },
+        index=ohlcv.index,
+    )
+    return _apply_first_session_fill(
+        pivots,
+        sessions=sessions,
+        first_session_fill=first_session_fill,
+    ).astype("float32")
+
+
+def _is_binary_signal(series: pd.Series) -> bool:
+    """Return True when signal contains only 0/1 values."""
+
+    values = series.fillna(0).to_numpy(dtype=np.int64, copy=False)
+    return bool(np.isin(values, np.array([0, 1], dtype=np.int64)).all())
+
+
+def _validate_alphatrend_sanity(
+    core_output: IndicatorCoreOutput,
+    atol: float,
+    rtol: float,
+) -> bool:
+    """Validate AlphaTrend structural invariants."""
+
+    continuous = core_output.continuous
+    raw = core_output.raw_events
+
+    at_shift_ok = _float_parity_equal(
+        continuous["AlphaTrend_2"],
+        continuous["AlphaTrend"].shift(2),
+        atol=atol,
+        rtol=rtol,
+    )
+    binary_ok = all(_is_binary_signal(raw[col]) for col in ("AT_buy_raw", "AT_sell_raw", "AT_buy", "AT_sell"))
+
+    buy_raw = raw["AT_buy_raw"].fillna(0).astype("uint8")
+    sell_raw = raw["AT_sell_raw"].fillna(0).astype("uint8")
+    buy = raw["AT_buy"].fillna(0).astype("uint8")
+    sell = raw["AT_sell"].fillna(0).astype("uint8")
+
+    confirmed_subset_ok = bool(((buy <= buy_raw) & (sell <= sell_raw)).all())
+    exclusivity_ok = bool((buy_raw + sell_raw <= 1).all() and (buy + sell <= 1).all())
+    return bool(at_shift_ok and binary_ok and confirmed_subset_ok and exclusivity_ok)
+
+
+def _validate_supertrend_sanity(core_output: IndicatorCoreOutput) -> bool:
+    """Validate SuperTrend structural invariants."""
+
+    continuous = core_output.continuous
+    raw = core_output.raw_events
+
+    trend = continuous["ST_trend"]
+    trend_values = trend.fillna(0).to_numpy(dtype=np.int8, copy=False)
+    trend_domain_ok = bool(np.isin(trend_values, np.array([-1, 1], dtype=np.int8)).all())
+
+    st_up = continuous["ST_up"]
+    st_dn = continuous["ST_dn"]
+    band_alignment_ok = bool(
+        (st_up.isna() == trend.ne(1)).all()
+        and (st_dn.isna() == trend.ne(-1)).all()
+    )
+    band_exclusivity_ok = not bool((st_up.notna() & st_dn.notna()).any())
+
+    buy = raw["ST_buy"].fillna(0).astype("uint8").eq(1)
+    sell = raw["ST_sell"].fillna(0).astype("uint8").eq(1)
+    binary_ok = _is_binary_signal(raw["ST_buy"]) and _is_binary_signal(raw["ST_sell"])
+    transition_ok = bool(
+        ((~buy) | ((trend == 1) & (trend.shift(1) == -1))).all()
+        and ((~sell) | ((trend == -1) & (trend.shift(1) == 1))).all()
+    )
+    signal_exclusivity_ok = not bool((buy & sell).any())
+
+    return bool(
+        trend_domain_ok
+        and band_alignment_ok
+        and band_exclusivity_ok
+        and binary_ok
+        and transition_ok
+        and signal_exclusivity_ok
+    )
+
+
+def evaluate_indicator_validation(
+    ohlcv: pd.DataFrame,
+    core_output: IndicatorCoreOutput,
+    raw_events: pd.DataFrame,
+    shifted_events: pd.DataFrame,
+    cfg: FeatureBuildConfig,
+) -> tuple[str, dict[str, bool]]:
+    """Run mandatory indicator correctness validation checks."""
+
+    details: dict[str, bool] = {}
+    close = ohlcv["close"]
+    for period in (200, 600, 1200):
+        expected = close.ewm(span=period, adjust=False, min_periods=period).mean()
+        details[f"ema_{period}_parity"] = _float_parity_equal(
+            core_output.continuous[f"EMA_{period}"],
+            expected,
+            atol=cfg.parity.float_atol,
+            rtol=cfg.parity.float_rtol,
+        )
+
+    pivot_reference = _compute_pivot_reference_previous_session(ohlcv, first_session_fill=cfg.pivot.first_session_fill)
+    details["pivot_parity"] = all(
+        _float_parity_equal(
+            core_output.continuous[col],
+            pivot_reference[col],
+            atol=cfg.parity.float_atol,
+            rtol=cfg.parity.float_rtol,
+        )
+        for col in PIVOT_FEATURE_COLUMNS
+    )
+    details["alphatrend_sanity"] = _validate_alphatrend_sanity(
+        core_output,
+        atol=cfg.parity.float_atol,
+        rtol=cfg.parity.float_rtol,
+    )
+    details["supertrend_sanity"] = _validate_supertrend_sanity(core_output)
+    details["event_shift_one"] = validate_shift_one(raw_events, shifted_events)
+
+    failed = sorted(key for key, passed in details.items() if not passed)
+    if failed:
+        LOGGER.error("Indicator validation failed | checks=%s", failed)
+        return "failed", details
+    return "passed", details
+
+
 def _resolve_path(value: str, base_dir: Path) -> Path:
     """Resolve relative path against config directory."""
 
@@ -683,6 +843,13 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
         raise ValueError("Strict shift(1) validation failed for event columns")
 
     parity_status, parity_details = evaluate_indicator_parity(ohlcv, core_output, cfg)
+    validation_status, validation_details = evaluate_indicator_validation(
+        ohlcv=ohlcv,
+        core_output=core_output,
+        raw_events=raw_events,
+        shifted_events=shifted_events,
+        cfg=cfg,
+    )
     formula_fingerprints = compute_formula_fingerprints(cfg)
     formula_fingerprint_bundle = compute_formula_fingerprint_bundle(formula_fingerprints)
 
@@ -702,6 +869,8 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
         shifted_events=shifted_events,
         indicator_parity_status=parity_status,
         indicator_parity_details=parity_details,
+        indicator_validation_status=validation_status,
+        indicator_validation_details=validation_details,
         formula_fingerprints=formula_fingerprints,
         formula_fingerprint_bundle=formula_fingerprint_bundle,
     )
