@@ -6,6 +6,8 @@ __pycache__/
 # Data & artifacts
 runs/
 data/
+!src/data/
+!src/data/*.py
 datasets/
 artifacts/
 checkpoints/
