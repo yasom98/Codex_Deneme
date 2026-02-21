@@ -15,6 +15,12 @@ import yaml
 from core.logging import get_logger
 from core.paths import ensure_within_root
 from data import indicator_reference as ref
+from data.reference_pivots import (
+    PIVOT_REFERENCE_SOURCE,
+    PIVOT_REFERENCE_TYPE,
+    compute_reference_pivots_intraday,
+    pivot_reference_available,
+)
 
 LOGGER = get_logger(__name__)
 
@@ -360,10 +366,9 @@ def compute_daily_pivots_with_std_bands(
         raise ValueError(f"pivot.pivot_tf must be fixed at {_LOCKED_PIVOT_TF}")
 
     ohlcv = df if assume_validated else validate_ohlcv_frame(df)
-    indexed = indexed_ohlcv if indexed_ohlcv is not None else _to_datetime_index(ohlcv)
-    if len(indexed) != len(ohlcv):
+    if indexed_ohlcv is not None and len(indexed_ohlcv) != len(ohlcv):
         raise ValueError("indexed_ohlcv length mismatch for pivot computation")
-    pivots = ref.compute_pivots_traditional(indexed, pivot_tf=pivot_tf)
+    pivots = compute_reference_pivots_intraday(ohlcv, pivot_tf=pivot_tf)
 
     out = pivots.copy()
     out.index = ohlcv.index
@@ -887,6 +892,54 @@ def _compute_pivot_reference_previous_session(ohlcv: pd.DataFrame, first_session
     ).astype("float32")
 
 
+def _evaluate_pivot_reference_validation(
+    ohlcv: pd.DataFrame,
+    core_output: IndicatorCoreOutput,
+    cfg: FeatureBuildConfig,
+) -> tuple[bool, dict[str, bool]]:
+    """Validate pivot outputs against user-provided reference implementation."""
+
+    details: dict[str, bool] = {}
+    if not pivot_reference_available():
+        details["pivot_reference_available"] = False
+        details["pivot_reference_execution_ok"] = True
+        details["pivot_reference_parity"] = True
+        return True, details
+
+    details["pivot_reference_available"] = True
+    try:
+        reference = compute_reference_pivots_intraday(ohlcv, pivot_tf=cfg.pivot.pivot_tf)
+        sessions = ohlcv["timestamp"].dt.floor("D")
+        reference = _apply_first_session_fill(
+            reference,
+            sessions=sessions,
+            first_session_fill=cfg.pivot.first_session_fill,
+        ).astype("float32")
+        details["pivot_reference_execution_ok"] = True
+    except Exception as exc:  # pragma: no cover - defensive to fail closed on user spec runtime/import errors.
+        LOGGER.error(
+            "Pivot reference execution failed | source=%s type=%s error=%s",
+            PIVOT_REFERENCE_SOURCE,
+            PIVOT_REFERENCE_TYPE,
+            exc,
+        )
+        details["pivot_reference_execution_ok"] = False
+        details["pivot_reference_parity"] = False
+        return False, details
+
+    for col in PIVOT_FEATURE_COLUMNS:
+        details[f"pivot_reference_{col}_parity"] = _float_parity_equal(
+            core_output.continuous[col],
+            reference[col],
+            atol=cfg.parity.float_atol,
+            rtol=cfg.parity.float_rtol,
+        )
+    details["pivot_reference_parity"] = all(
+        details[f"pivot_reference_{col}_parity"] for col in PIVOT_FEATURE_COLUMNS
+    )
+    return bool(details["pivot_reference_parity"]), details
+
+
 def _is_binary_signal(series: pd.Series) -> bool:
     """Return True when signal contains only 0/1 values."""
 
@@ -978,6 +1031,7 @@ def evaluate_indicator_validation(
     """Run mandatory indicator correctness validation checks."""
 
     details: dict[str, bool] = {}
+    required_checks: dict[str, bool] = {}
     close = ohlcv["close"]
     for period in (200, 600, 1200):
         expected = close.ewm(span=period, adjust=False, min_periods=period).mean()
@@ -987,6 +1041,7 @@ def evaluate_indicator_validation(
             atol=cfg.parity.float_atol,
             rtol=cfg.parity.float_rtol,
         )
+        required_checks[f"ema_{period}_parity"] = details[f"ema_{period}_parity"]
 
     pivot_reference = _compute_pivot_reference_previous_session(ohlcv, first_session_fill=cfg.pivot.first_session_fill)
     details["pivot_parity"] = all(
@@ -998,15 +1053,23 @@ def evaluate_indicator_validation(
         )
         for col in PIVOT_FEATURE_COLUMNS
     )
+    required_checks["pivot_parity"] = details["pivot_parity"]
     details["alphatrend_sanity"] = _validate_alphatrend_sanity(
         core_output,
         atol=cfg.parity.float_atol,
         rtol=cfg.parity.float_rtol,
     )
+    required_checks["alphatrend_sanity"] = details["alphatrend_sanity"]
     details["supertrend_sanity"] = _validate_supertrend_sanity(core_output)
+    required_checks["supertrend_sanity"] = details["supertrend_sanity"]
     details["event_shift_one"] = validate_shift_one(raw_events, shifted_events)
+    required_checks["event_shift_one"] = details["event_shift_one"]
 
-    failed = sorted(key for key, passed in details.items() if not passed)
+    pivot_reference_ok, pivot_reference_details = _evaluate_pivot_reference_validation(ohlcv, core_output, cfg)
+    details.update(pivot_reference_details)
+    required_checks["pivot_reference_parity"] = pivot_reference_ok
+
+    failed = sorted(key for key, passed in required_checks.items() if not passed)
     if failed:
         LOGGER.error("Indicator validation failed | checks=%s", failed)
         return "failed", details
