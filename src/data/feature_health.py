@@ -46,10 +46,20 @@ class FeatureHealthReport:
     strict_parity_enabled: bool = True
     status: str = "failed"
     output_file: str | None = None
+    input_run_id_resolved: str | None = None
+    output_run_id: str | None = None
+    input_root_resolved: str | None = None
+    output_root_resolved: str | None = None
     indicator_parity_status: str = "not_checked"
     indicator_parity_details: dict[str, bool] = field(default_factory=dict)
+    indicator_validation_status: str = "not_checked"
+    indicator_validation_details: dict[str, bool] = field(default_factory=dict)
+    indicator_validation_ok: bool = False
+    strict_parity_gate_passed_but_indicator_validation_failed: bool = False
     formula_fingerprints: dict[str, str] = field(default_factory=dict)
     formula_fingerprint_bundle: str = ""
+    session_count: int = 0
+    first_session_row_count: int = 0
     pivot_first_session_allowed_nan: bool = False
     pivot_first_session_rows: int = 0
     pivot_nonnull_ratio_after_first_session: float = 1.0
@@ -105,6 +115,8 @@ def evaluate_feature_health(
     pivot_first_session_fill: str,
     indicator_parity_status: str,
     indicator_parity_details: dict[str, bool],
+    indicator_validation_status: str,
+    indicator_validation_details: dict[str, bool],
     formula_fingerprints: dict[str, str],
     formula_fingerprint_bundle: str,
     strict_parity: bool,
@@ -139,6 +151,8 @@ def evaluate_feature_health(
 
     report.indicator_parity_status = indicator_parity_status
     report.indicator_parity_details = dict(indicator_parity_details)
+    report.indicator_validation_status = indicator_validation_status
+    report.indicator_validation_details = dict(indicator_validation_details)
     report.formula_fingerprints = dict(formula_fingerprints)
     report.formula_fingerprint_bundle = str(formula_fingerprint_bundle)
     report.strict_parity_enabled = bool(strict_parity)
@@ -161,6 +175,27 @@ def evaluate_feature_health(
             f" failed_columns={failed}",
         )
 
+    report.indicator_validation_ok = report.indicator_validation_status == "passed"
+    report.strict_parity_gate_passed_but_indicator_validation_failed = bool(
+        report.parity_gate_ok and (not report.indicator_validation_ok)
+    )
+    if not report.indicator_validation_ok:
+        failed_checks = sorted(key for key, passed in report.indicator_validation_details.items() if not passed)
+        add_error(
+            report,
+            stage="gates",
+            code="INDICATOR_VALIDATION_FAILED",
+            message="Mandatory indicator validation failed.",
+            failed_checks=failed_checks,
+            strict_parity_enabled=report.strict_parity_enabled,
+            parity_gate_ok=report.parity_gate_ok,
+        )
+        if report.strict_parity_gate_passed_but_indicator_validation_failed:
+            add_warning(
+                report,
+                "strict_parity gate passed but indicator_validation failed; write blocked by mandatory validation gate.",
+            )
+
     report.nan_ratio_ok = True
     critical_set = {col.strip() for col in critical_columns if str(col).strip()}
     normalized_pivot_policy = pivot_warmup_policy.strip().lower()
@@ -171,9 +206,11 @@ def evaluate_feature_health(
     first_session_mask = pd.Series(False, index=feature_df.index, dtype=bool)
     if len(feature_df) > 0:
         sessions = feature_df["timestamp"].dt.floor("D")
+        report.session_count = int(sessions.nunique())
         first_session = sessions.iloc[0]
         first_session_mask = sessions.eq(first_session)
         report.pivot_first_session_rows = int(first_session_mask.sum())
+        report.first_session_row_count = report.pivot_first_session_rows
 
     pivot_columns = list(PIVOT_FEATURE_COLUMNS)
     pivot_present = all(col in feature_df.columns for col in pivot_columns)
@@ -181,9 +218,24 @@ def evaluate_feature_health(
         pivot_frame = feature_df.loc[:, pivot_columns]
         after_first_session = pivot_frame.loc[~first_session_mask]
         after_first_rows = int(after_first_session.shape[0])
+        all_nan_after_first = bool(after_first_rows > 0 and after_first_session.isna().all(axis=0).all())
+        all_nan_all_rows = bool(pivot_frame.isna().all(axis=0).all())
 
-        if bool(pivot_frame.isna().all(axis=0).all()):
-            if after_first_rows > 0:
+        if all_nan_after_first:
+            report.nan_ratio_ok = False
+            add_error(
+                report,
+                stage="gates",
+                code="PIVOT_ALL_NAN_AFTER_FIRST_SESSION",
+                message="All pivot columns are NaN from second session onward.",
+                session_count=report.session_count,
+                first_session_row_count=report.first_session_row_count,
+            )
+
+        if all_nan_all_rows:
+            if report.session_count <= 1:
+                add_warning(report, "Pivot columns are NaN only in single-session warmup window.")
+            else:
                 report.nan_ratio_ok = False
                 add_error(
                     report,
@@ -191,8 +243,6 @@ def evaluate_feature_health(
                     code="PIVOT_MAPPING_EMPTY",
                     message="All pivot mapping columns are fully NaN across the file.",
                 )
-            else:
-                add_warning(report, "Pivot columns are NaN only in first session warmup window.")
 
         first_session_pivots = pivot_frame.loc[first_session_mask]
         if (
@@ -224,7 +274,7 @@ def evaluate_feature_health(
             nonnull_after_first = int(after_first_session.notna().sum().sum())
             ratio_after_first = nonnull_after_first / float(total_after_first)
             report.pivot_nonnull_ratio_after_first_session = ratio_after_first
-            if ratio_after_first < 1.0:
+            if ratio_after_first < 1.0 and (not all_nan_after_first):
                 report.nan_ratio_ok = False
                 add_error(
                     report,
@@ -326,6 +376,7 @@ def health_check(report: FeatureHealthReport) -> bool:
         and report.leakfree_ok
         and report.nan_ratio_ok
         and report.parity_gate_ok
+        and report.indicator_validation_ok
         and report.rows_out > 0
         and len(report.errors) == 0
     )
@@ -343,6 +394,7 @@ def summarize_feature_reports(
     succeeded_files = sum(1 for report in reports if report.status == "success")
     failed_files = total_files - succeeded_files
     parity_status_overall = all(report.parity_ok for report in reports)
+    indicator_validation_overall = all(report.indicator_validation_ok for report in reports)
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -353,6 +405,7 @@ def summarize_feature_reports(
         "total_rows_out": sum(report.rows_out for report in reports),
         "failed_inputs": [report.input_file for report in reports if report.status == "failed"],
         "parity_status_overall": parity_status_overall,
+        "indicator_validation_overall": indicator_validation_overall,
         "strict_parity": bool(strict_parity),
         "formula_fingerprints": dict(formula_fingerprints),
         "formula_fingerprint_bundle": str(formula_fingerprint_bundle),

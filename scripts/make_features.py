@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs" / "features.yaml", help="YAML config path.")
     parser.add_argument("--dry-run", action="store_true", help="Run feature generation without writing output parquet files.")
     parser.add_argument("--run-id", type=str, default="", help="Custom run id. Default: current UTC timestamp.")
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=None,
+        help="Optional standardized parquet input root. Default: runs/{run_id}/data_standardized/parquet",
+    )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
     parser.add_argument(
         "--strict-parity",
@@ -78,6 +84,79 @@ def set_global_seed(seed: int) -> None:
             torch.cuda.manual_seed_all(seed)
 
 
+def _default_input_root(runs_root: Path, run_id: str) -> Path:
+    """Build default standardized input root for a run id."""
+    return runs_root / run_id / "data_standardized" / "parquet"
+
+
+def _resolve_input_root(runs_root: Path, run_id: str, cli_input_root: Path | None) -> Path:
+    """Resolve input root from CLI override or run-scoped default."""
+    if cli_input_root is not None:
+        return cli_input_root.resolve()
+    return _default_input_root(runs_root, run_id).resolve()
+
+
+def _resolve_input_run_id(input_root: Path, runs_root: Path) -> str | None:
+    """Resolve input run id from standardized parquet root path."""
+    resolved_input = input_root.resolve()
+    resolved_runs_root = runs_root.resolve()
+    try:
+        rel = resolved_input.relative_to(resolved_runs_root)
+    except ValueError:
+        return None
+
+    parts = rel.parts
+    if len(parts) < 3:
+        return None
+    if parts[1] != "data_standardized" or parts[2] != "parquet":
+        return None
+    return parts[0]
+
+
+def _build_mismatch_summary(
+    run_id: str,
+    run_root: Path,
+    input_root: Path,
+    output_root: Path,
+    input_run_id_resolved: str | None,
+) -> dict[str, object]:
+    """Build summary payload for input/output run wiring mismatch."""
+    summary: dict[str, object] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "total_files": 0,
+        "succeeded_files": 0,
+        "failed_files": 1,
+        "total_rows_in": 0,
+        "total_rows_out": 0,
+        "failed_inputs": [str(input_root)],
+        "parity_status_overall": False,
+        "indicator_validation_overall": False,
+        "strict_parity": True,
+        "formula_fingerprints": {},
+        "formula_fingerprint_bundle": "",
+        "run_id": run_id,
+        "run_root": str(run_root),
+        "input_run_id_resolved": input_run_id_resolved,
+        "output_run_id": run_id,
+        "input_root_resolved": str(input_root.resolve()),
+        "output_root_resolved": str(output_root.resolve()),
+        "errors": [
+            {
+                "stage": "run_wiring",
+                "code": "INPUT_OUTPUT_RUN_MISMATCH",
+                "message": "Input root run_id does not match output run_id.",
+                "context": {
+                    "input_run_id_resolved": input_run_id_resolved,
+                    "output_run_id": run_id,
+                    "input_root_resolved": str(input_root.resolve()),
+                    "output_root_resolved": str(output_root.resolve()),
+                },
+            }
+        ],
+    }
+    return summary
+
+
 def main() -> int:
     """Run feature build pipeline and return process exit code."""
 
@@ -95,16 +174,60 @@ def main() -> int:
     parquet_root = run_root / "parquet"
     reports_root = run_root / "reports"
     per_file_reports_root = reports_root / "per_file"
+    resolved_input_root = _resolve_input_root(cfg.runs_root, run_id=run_id, cli_input_root=args.input_root)
+    input_run_id_resolved = _resolve_input_run_id(resolved_input_root, cfg.runs_root)
 
-    src_files = discover_parquet_files(cfg.input_root, cfg.parquet_glob)
-    LOGGER.info("Discovered standardized parquet files | count=%d input_root=%s", len(src_files), cfg.input_root)
+    if input_run_id_resolved != run_id:
+        LOGGER.error(
+            "INPUT_OUTPUT_RUN_MISMATCH | output_run_id=%s input_run_id_resolved=%s input_root=%s output_root=%s discovered_files=%d",
+            run_id,
+            input_run_id_resolved,
+            resolved_input_root,
+            parquet_root,
+            0,
+        )
+        if not args.dry_run:
+            summary_path = reports_root / "summary.json"
+            mismatch_summary = _build_mismatch_summary(
+                run_id=run_id,
+                run_root=run_root,
+                input_root=resolved_input_root,
+                output_root=parquet_root,
+                input_run_id_resolved=input_run_id_resolved,
+            )
+            mismatch_summary["indicator_spec_version"] = cfg.indicator_spec_version
+            mismatch_summary["config_hash"] = cfg.config_hash
+            mismatch_summary["strict_parity"] = bool(strict_parity)
+            mismatch_summary["formula_fingerprints"] = dict(formula_fingerprints)
+            mismatch_summary["formula_fingerprint_bundle"] = str(formula_fingerprint_bundle)
+            atomic_write_json(mismatch_summary, summary_path)
+        return 1
+
+    if not resolved_input_root.exists():
+        raise FileNotFoundError(f"input_root does not exist: {resolved_input_root}")
+    if not resolved_input_root.is_dir():
+        raise NotADirectoryError(f"input_root is not a directory: {resolved_input_root}")
+
+    src_files = discover_parquet_files(resolved_input_root, cfg.parquet_glob)
+    LOGGER.info(
+        "Feature wiring | run_id=%s input_root=%s output_root=%s discovered_files=%d",
+        run_id,
+        resolved_input_root,
+        parquet_root,
+        len(src_files),
+    )
 
     reports: list[FeatureHealthReport] = []
 
     for src_path in tqdm(src_files, desc="Building features"):
         report = FeatureHealthReport(input_file=str(src_path))
-        output_path = build_feature_output_path(src_path, cfg.input_root, parquet_root)
-        report_path = build_report_path(src_path, cfg.input_root, per_file_reports_root)
+        report.input_run_id_resolved = input_run_id_resolved
+        report.output_run_id = run_id
+        report.input_root_resolved = str(resolved_input_root)
+        report.output_root_resolved = str(parquet_root.resolve())
+
+        output_path = build_feature_output_path(src_path, resolved_input_root, parquet_root)
+        report_path = build_report_path(src_path, resolved_input_root, per_file_reports_root)
         feature_df: pd.DataFrame | None = None
 
         try:
@@ -124,6 +247,8 @@ def main() -> int:
                 pivot_first_session_fill=cfg.pivot.first_session_fill,
                 indicator_parity_status=artifacts.indicator_parity_status,
                 indicator_parity_details=artifacts.indicator_parity_details,
+                indicator_validation_status=artifacts.indicator_validation_status,
+                indicator_validation_details=artifacts.indicator_validation_details,
                 formula_fingerprints=artifacts.formula_fingerprints,
                 formula_fingerprint_bundle=artifacts.formula_fingerprint_bundle,
                 strict_parity=strict_parity,
@@ -160,6 +285,10 @@ def main() -> int:
     )
     summary["run_id"] = run_id
     summary["run_root"] = str(run_root)
+    summary["input_run_id_resolved"] = input_run_id_resolved
+    summary["output_run_id"] = run_id
+    summary["input_root_resolved"] = str(resolved_input_root)
+    summary["output_root_resolved"] = str(parquet_root.resolve())
     summary["indicator_spec_version"] = cfg.indicator_spec_version
     summary["config_hash"] = cfg.config_hash
 
