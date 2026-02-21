@@ -164,6 +164,10 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert per_file_payload["indicator_parity_status"] == "passed"
     assert per_file_payload["indicator_validation_status"] == "passed"
     assert isinstance(per_file_payload["indicator_validation_details"], dict)
+    assert per_file_payload["pivot_reference_validation_status"] == "passed"
+    assert isinstance(per_file_payload["pivot_reference_validation_details"], dict)
+    assert per_file_payload["pivot_reference_source"] == "indicator_specs/pivot_traditional.py"
+    assert per_file_payload["pivot_reference_type"] == "Traditional"
     assert per_file_payload["session_count"] >= 2
     assert per_file_payload["first_session_row_count"] == 1
     assert per_file_payload["pivot_first_session_allowed_nan"] is True
@@ -187,6 +191,7 @@ def test_make_features_cli_writes_outputs_and_reports(monkeypatch: object, tmp_p
     assert summary_payload["failed_files"] == 0
     assert summary_payload["parity_status_overall"] is True
     assert summary_payload["indicator_validation_overall"] is True
+    assert summary_payload["pivot_reference_validation_overall"] is True
     assert summary_payload["strict_parity"] is True
     assert isinstance(summary_payload["formula_fingerprints"], dict)
     assert isinstance(summary_payload["formula_fingerprint_bundle"], str)

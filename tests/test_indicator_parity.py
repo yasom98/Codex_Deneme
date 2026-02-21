@@ -18,6 +18,7 @@ from data.features import (
     SuperTrendConfig,
     build_feature_artifacts,
 )
+from data.reference_pivots import compute_reference_pivots_intraday
 
 
 def _fixture_df(rows: int = 2000) -> pd.DataFrame:
@@ -62,8 +63,7 @@ def test_pivot_parity_against_reference() -> None:
     cfg = _cfg()
     artifacts = build_feature_artifacts(df, cfg)
 
-    indexed = df.set_index("timestamp")
-    piv_ref = ref.compute_pivots_traditional(indexed, pivot_tf="1D")
+    piv_ref = compute_reference_pivots_intraday(df, pivot_tf="1D")
 
     for col in ("PP", "R1", "S1", "R2", "S2", "R3", "S3", "R4", "S4", "R5", "S5"):
         np.testing.assert_allclose(
