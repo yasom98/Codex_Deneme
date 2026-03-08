@@ -18,6 +18,8 @@ from data.dataset_builder import (
     DATASET_BUILD_OUTPUT_COMPLETENESS_MISMATCH,
     DATASET_BUILD_OUTPUT_ROOT_EXISTS,
     DATASET_BUILD_PARTITION_TIMESTAMP_DUPLICATE,
+    DATASET_BUILD_RUNTIME_PRICE_COLUMN_MISSING,
+    DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID,
     DATASET_BUILD_RUN_ID_MISMATCH,
     DATASET_BUILD_SPLIT_NOT_PASSED,
     DATASET_BUILD_SPLIT_PARTITION_DEFS_MISSING,
@@ -32,6 +34,8 @@ from data.dataset_builder import (
 def _base_frame(rows: int = 20, freq: str = "1min") -> pd.DataFrame:
     ts = pd.date_range("2024-01-01", periods=rows, freq=freq, tz="UTC")
     frame = pd.DataFrame({"timestamp": ts})
+    frame["open"] = pd.Series(np.linspace(100.0, 100.0 + float(rows - 1), rows), dtype="float32")
+    frame["close"] = pd.Series(np.linspace(100.5, 100.5 + float(rows - 1), rows), dtype="float32")
     frame["feat_cont"] = pd.Series(np.linspace(1.0, 2.0, rows), dtype="float32")
     events = np.zeros(rows, dtype=np.uint8)
     events[::5] = np.uint8(1)
@@ -88,11 +92,13 @@ def _write_manifest(reports_root: Path, run_id: str) -> Path:
         "event_columns": ["evt_flag"],
         "column_dtypes": {
             "timestamp": "datetime64[ns, UTC]",
+            "open": "float32",
+            "close": "float32",
             "feat_cont": "float32",
             "evt_flag": "uint8",
         },
         "feature_groups": {
-            "raw_ohlcv": ["timestamp"],
+            "raw_ohlcv": ["timestamp", "open", "close"],
             "price_derived": [],
             "trend": ["feat_cont"],
             "regime": [],
@@ -238,6 +244,11 @@ def _error_codes(payload: dict[str, Any]) -> set[str]:
     return codes
 
 
+def _materialized_payload(output_root: Path, *, partition: str = "train", rel_name: str = "a.parquet") -> dict[str, Any]:
+    path = output_root / "parquet" / "partitions" / partition / rel_name
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_precondition_manifest_missing_fails(monkeypatch: object, tmp_path: Path) -> None:
     run_id = "dataset_manifest_missing"
     input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", _base_frame())])
@@ -373,6 +384,204 @@ def test_success_path_records_ranges_and_order_contract(monkeypatch: object, tmp
     assert result.manifest_payload["row_order_policy"]["name"] == "timestamp_ascending"
     assert result.manifest_payload["column_selection_contract"]["column_order_hash"]
     assert result.manifest_payload["column_selection_contract"]["dtype_hash"]
+
+
+def test_runtime_price_contract_disabled_path_has_stable_schema(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_runtime_disabled"
+    input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", _base_frame())])
+    output_root = tmp_path / "runs" / run_id / "data_datasets_disabled"
+    _write_manifest(reports_root, run_id)
+    _write_train_input_report(reports_root, run_id, overall=True)
+    _write_split_report_standard(reports_root, run_id, source_paths, frame_map)
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    result = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            output_root=output_root,
+        )
+    )
+
+    assert result.report_payload["dataset_build_overall"] is True
+    assert result.manifest_payload is not None
+
+    expected_contract = {
+        "enabled": False,
+        "timestamp_column": "timestamp",
+        "execution_price_column": None,
+        "mark_to_market_column": None,
+        "required_runtime_columns": [],
+        "artifact_columns": ["timestamp", "feat_cont", "evt_flag"],
+        "runtime_price_dtypes": {},
+        "runtime_columns_already_present_in_observation": [],
+        "price_source_policy": "disabled",
+        "observation_runtime_overlap_allowed": True,
+        "price_contract_hash": None,
+    }
+    assert result.report_payload["runtime_price_contract"] == expected_contract
+    assert result.manifest_payload["runtime_price_contract"] == expected_contract
+    assert _materialized_payload(output_root)["columns"] == ["timestamp", "feat_cont", "evt_flag"]
+
+
+def test_runtime_price_contract_enabled_close_close_materializes_runtime_column(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_runtime_close_close"
+    input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", _base_frame())])
+    output_root = tmp_path / "runs" / run_id / "data_datasets_close"
+    _write_manifest(reports_root, run_id)
+    _write_train_input_report(reports_root, run_id, overall=True)
+    _write_split_report_standard(reports_root, run_id, source_paths, frame_map)
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    result = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            output_root=output_root,
+            execution_price_column="close",
+            mark_to_market_column="close",
+        )
+    )
+
+    assert result.report_payload["dataset_build_overall"] is True
+    assert result.manifest_payload is not None
+    runtime_contract = result.manifest_payload["runtime_price_contract"]
+    assert runtime_contract["enabled"] is True
+    assert runtime_contract["required_runtime_columns"] == ["close"]
+    assert runtime_contract["artifact_columns"] == ["timestamp", "feat_cont", "evt_flag", "close"]
+    assert runtime_contract["runtime_columns_already_present_in_observation"] == []
+    assert runtime_contract["runtime_price_dtypes"] == {"close": "float32"}
+    assert isinstance(runtime_contract["price_contract_hash"], str) and runtime_contract["price_contract_hash"]
+    assert result.manifest_payload["column_selection_contract"]["selected_columns"] == ["timestamp", "feat_cont", "evt_flag"]
+    assert _materialized_payload(output_root)["columns"] == ["timestamp", "feat_cont", "evt_flag", "close"]
+
+
+def test_runtime_price_contract_enabled_open_close_changes_hash_and_order(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_runtime_open_close"
+    input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", _base_frame())])
+    close_root = tmp_path / "runs" / run_id / "data_datasets_close_close"
+    open_close_root = tmp_path / "runs" / run_id / "data_datasets_open_close"
+    _write_manifest(reports_root, run_id)
+    _write_train_input_report(reports_root, run_id, overall=True)
+    _write_split_report_standard(reports_root, run_id, source_paths, frame_map)
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    result_close = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            output_root=close_root,
+            execution_price_column="close",
+            mark_to_market_column="close",
+        )
+    )
+    result_open_close = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            output_root=open_close_root,
+            execution_price_column="open",
+            mark_to_market_column="close",
+        )
+    )
+
+    assert result_close.report_payload["dataset_build_overall"] is True
+    assert result_open_close.report_payload["dataset_build_overall"] is True
+    assert result_open_close.manifest_payload is not None
+
+    runtime_contract = result_open_close.manifest_payload["runtime_price_contract"]
+    assert runtime_contract["required_runtime_columns"] == ["open", "close"]
+    assert runtime_contract["artifact_columns"] == ["timestamp", "feat_cont", "evt_flag", "open", "close"]
+    assert runtime_contract["runtime_price_dtypes"] == {"open": "float32", "close": "float32"}
+    assert _materialized_payload(open_close_root)["columns"] == ["timestamp", "feat_cont", "evt_flag", "open", "close"]
+    assert runtime_contract["price_contract_hash"] != result_close.manifest_payload["runtime_price_contract"]["price_contract_hash"]
+    assert result_open_close.report_payload["dataset_build_id"] != result_close.report_payload["dataset_build_id"]
+
+
+def test_runtime_price_overlap_is_recorded_but_not_duplicated(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_runtime_overlap"
+    input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", _base_frame())])
+    output_root = tmp_path / "runs" / run_id / "data_datasets_overlap"
+    manifest_path = _write_manifest(reports_root, run_id)
+    _write_train_input_report(reports_root, run_id, overall=True)
+    _write_split_report_standard(reports_root, run_id, source_paths, frame_map)
+
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["feature_groups"]["trend"] = ["feat_cont", "open"]
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    result = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            output_root=output_root,
+            include_feature_groups=("trend",),
+            execution_price_column="open",
+            mark_to_market_column="close",
+        )
+    )
+
+    assert result.report_payload["dataset_build_overall"] is True
+    assert result.manifest_payload is not None
+    runtime_contract = result.manifest_payload["runtime_price_contract"]
+    assert result.manifest_payload["column_selection_contract"]["selected_columns"] == ["timestamp", "feat_cont", "open"]
+    assert runtime_contract["required_runtime_columns"] == ["open", "close"]
+    assert runtime_contract["runtime_columns_already_present_in_observation"] == ["open"]
+    assert runtime_contract["artifact_columns"] == ["timestamp", "feat_cont", "open", "close"]
+    assert _materialized_payload(output_root)["columns"] == ["timestamp", "feat_cont", "open", "close"]
+
+
+def test_runtime_price_missing_source_column_fails_closed(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_runtime_missing_col"
+    bad_frame = _base_frame().drop(columns=["close"])
+    input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", bad_frame)])
+    _write_manifest(reports_root, run_id)
+    _write_train_input_report(reports_root, run_id, overall=True)
+    _write_split_report_standard(reports_root, run_id, source_paths, frame_map)
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    result = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            execution_price_column="close",
+            mark_to_market_column="close",
+        )
+    )
+
+    assert DATASET_BUILD_RUNTIME_PRICE_COLUMN_MISSING in _error_codes(result.report_payload)
+
+
+def test_runtime_price_manifest_dtype_mismatch_fails_closed(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_runtime_dtype_mismatch"
+    input_root, reports_root, source_paths, frame_map = _setup_run(tmp_path, run_id, [("a.parquet", _base_frame())])
+    manifest_path = _write_manifest(reports_root, run_id)
+    _write_train_input_report(reports_root, run_id, overall=True)
+    _write_split_report_standard(reports_root, run_id, source_paths, frame_map)
+
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["column_dtypes"]["close"] = "float64"
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    result = build_datasets(
+        DatasetBuildOptions(
+            run_id=run_id,
+            input_root=input_root,
+            reports_root=reports_root,
+            execution_price_column="close",
+            mark_to_market_column="close",
+        )
+    )
+
+    assert DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID in _error_codes(result.report_payload)
 
 
 def test_persisted_metadata_paths_are_promoted_not_staging(monkeypatch: object, tmp_path: Path) -> None:

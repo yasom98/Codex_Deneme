@@ -718,7 +718,8 @@ def _build_rl_feature_output(
     log_return = _safe_log_return(close)
     hl_range = high - low
     body_denominator = hl_range.replace(0.0, np.nan)
-    body_ratio = (close - open_).abs() / body_denominator
+    # A flat candle has no meaningful normalized body expansion relative to range.
+    body_ratio = ((close - open_).abs() / body_denominator).where(hl_range != 0.0, 0.0)
 
     rolling_volatility: dict[str, pd.Series] = {}
     for window in rolling_windows:

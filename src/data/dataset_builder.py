@@ -43,6 +43,8 @@ DATASET_BUILD_LINEAGE_MISMATCH = "DATASET_BUILD_LINEAGE_MISMATCH"
 DATASET_BUILD_OUTPUT_ROOT_EXISTS = "DATASET_BUILD_OUTPUT_ROOT_EXISTS"
 DATASET_BUILD_STAGING_ROOT_COLLISION = "DATASET_BUILD_STAGING_ROOT_COLLISION"
 DATASET_BUILD_COLUMN_SELECTION_INVALID = "DATASET_BUILD_COLUMN_SELECTION_INVALID"
+DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID = "DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID"
+DATASET_BUILD_RUNTIME_PRICE_COLUMN_MISSING = "DATASET_BUILD_RUNTIME_PRICE_COLUMN_MISSING"
 DATASET_BUILD_SOURCE_FILE_MISSING = "DATASET_BUILD_SOURCE_FILE_MISSING"
 DATASET_BUILD_PARTITION_EMPTY = "DATASET_BUILD_PARTITION_EMPTY"
 DATASET_BUILD_PARTITION_TIMESTAMP_DUPLICATE = "DATASET_BUILD_PARTITION_TIMESTAMP_DUPLICATE"
@@ -79,6 +81,8 @@ class DatasetBuildOptions:
     include_feature_groups: tuple[str, ...] = ()
     exclude_columns: tuple[str, ...] = ()
     timestamp_column_override: str | None = None
+    execution_price_column: str | None = None
+    mark_to_market_column: str | None = None
     require_train_input_validation: bool = True
     require_split_validation: bool = True
     aggregate_walk_forward: bool = False
@@ -101,6 +105,8 @@ class DatasetBuildOptions:
             "include_feature_groups": list(self.include_feature_groups),
             "exclude_columns": list(self.exclude_columns),
             "timestamp_column_override": self.timestamp_column_override,
+            "execution_price_column": self.execution_price_column,
+            "mark_to_market_column": self.mark_to_market_column,
             "require_train_input_validation": bool(self.require_train_input_validation),
             "require_split_validation": bool(self.require_split_validation),
             "aggregate_walk_forward": bool(self.aggregate_walk_forward),
@@ -321,6 +327,13 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
     selected_dtype_map: dict[str, str] = {}
     timestamp_column = "timestamp"
     column_selection_contract: dict[str, Any] = {}
+    runtime_price_columns: list[str] = []
+    artifact_columns: list[str] = [timestamp_column]
+    runtime_price_contract = _build_disabled_runtime_price_contract(
+        timestamp_column=timestamp_column,
+        artifact_columns=artifact_columns,
+    )
+    feature_manifest_runtime_dtypes: dict[str, str] = {}
 
     if feature_manifest is not None:
         selected_columns, selected_dtype_map, timestamp_column, column_selection_contract = _resolve_column_selection(
@@ -328,6 +341,14 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
             options=options,
             errors=errors,
             warnings=warnings,
+        )
+        runtime_price_columns, artifact_columns, runtime_price_contract, feature_manifest_runtime_dtypes = _resolve_runtime_price_contract(
+            feature_manifest=feature_manifest,
+            options=options,
+            timestamp_column=timestamp_column,
+            selected_columns=selected_columns,
+            observation_columns=[col for col in selected_columns if col != timestamp_column],
+            errors=errors,
         )
 
     expected_specs: list[MaterializationSpec] = []
@@ -356,6 +377,7 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
     report_payload["output_semantics"] = output_semantics
     report_payload["overwrite_policy"] = overwrite_policy
     report_payload["column_selection_contract"] = column_selection_contract
+    report_payload["runtime_price_contract"] = runtime_price_contract
 
     if errors:
         report_payload["errors"] = [asdict(issue) for issue in errors]
@@ -383,38 +405,6 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
         "source_file_inventory_hash": source_inventory_hash,
     }
 
-    dataset_build_id = _compute_dataset_build_id(
-        run_id=run_id,
-        split_mode=split_mode,
-        output_semantics_mode=str(output_semantics["mode"]),
-        aggregate_walk_forward=bool(options.aggregate_walk_forward),
-        timestamp_column=timestamp_column,
-        column_selection_hash=column_selection_hash,
-        build_mode=options.build_mode,
-        feature_manifest_hash=feature_manifest_hash,
-        train_input_report_hash=train_input_report_hash,
-        split_report_hash=split_report_hash,
-        source_file_inventory_hash=source_inventory_hash,
-    )
-    dataset_build_id_policy = {
-        "algorithm": "sha256",
-        "canonical_json": {"sort_keys": True, "separators": [",", ":"], "ensure_ascii": True},
-        "hash_inputs_order": [
-            "run_id",
-            "builder_version",
-            "build_mode",
-            "split_mode",
-            "output_semantics_mode",
-            "aggregate_walk_forward",
-            "timestamp_column",
-            "column_selection_hash",
-            "feature_manifest_hash",
-            "train_input_report_hash",
-            "split_report_hash",
-            "source_file_inventory_hash",
-        ],
-    }
-
     artifacts: list[MaterializedArtifact] = []
     expected_specs_by_source = _group_specs_by_source(expected_specs)
     partition_frames_for_aggregate: dict[tuple[str, str], list[tuple[int, pd.DataFrame]]] = {}
@@ -423,6 +413,7 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
     rows_written = 0
     files_processed = 0
     files_failed = 0
+    runtime_price_dtypes: dict[str, str] = {}
 
     _prepare_staging_root(staging_root=staging_root, overwrite=bool(options.overwrite), errors=errors)
     if errors:
@@ -472,6 +463,19 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
             files_failed += 1
             continue
 
+        if runtime_price_contract["enabled"]:
+            missing_runtime_columns = [col for col in runtime_price_columns if col not in frame.columns]
+            if missing_runtime_columns:
+                errors.append(
+                    ValidationIssue(
+                        code=DATASET_BUILD_RUNTIME_PRICE_COLUMN_MISSING,
+                        message="Required runtime price columns are missing in source parquet.",
+                        context={"input_file": str(source_path), "missing_columns": missing_runtime_columns},
+                    )
+                )
+                files_failed += 1
+                continue
+
         frame_with_pos = frame.copy()
         frame_with_pos["__row_position"] = pd.Series(range(len(frame_with_pos)), dtype="int64")
 
@@ -499,6 +503,39 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
                         context={"input_file": str(source_path), "column": col, "expected_dtype": expected_dtype, "actual_dtype": actual_dtype},
                     )
                 )
+        for col in runtime_price_columns:
+            actual_dtype = str(frame_with_pos[col].dtype)
+            expected_inferred_dtype = runtime_price_dtypes.get(col)
+            if expected_inferred_dtype is None:
+                runtime_price_dtypes[col] = actual_dtype
+            elif expected_inferred_dtype != actual_dtype:
+                errors.append(
+                    ValidationIssue(
+                        code=DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID,
+                        message="Runtime price dtype is inconsistent across source parquet artifacts.",
+                        context={
+                            "input_file": str(source_path),
+                            "column": col,
+                            "expected_dtype": expected_inferred_dtype,
+                            "actual_dtype": actual_dtype,
+                        },
+                    )
+                )
+
+            manifest_dtype = feature_manifest_runtime_dtypes.get(col)
+            if manifest_dtype is not None and manifest_dtype != actual_dtype:
+                errors.append(
+                    ValidationIssue(
+                        code=DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID,
+                        message="Runtime price dtype does not match feature manifest dtype.",
+                        context={
+                            "input_file": str(source_path),
+                            "column": col,
+                            "expected_dtype": manifest_dtype,
+                            "actual_dtype": actual_dtype,
+                        },
+                    )
+                )
 
         source_rel = str(source_path.resolve().relative_to(input_root))
 
@@ -510,7 +547,7 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
                 end_inclusive_utc=spec.end_inclusive_utc,
             )
             subset = subset.sort_values([timestamp_column, "__row_position"], kind="mergesort").reset_index(drop=True)
-            out_df = subset.loc[:, selected_columns].copy()
+            out_df = subset.loc[:, artifact_columns].copy()
 
             if len(out_df) == 0:
                 errors.append(
@@ -680,6 +717,46 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
     if not output_completeness_ok:
         errors.extend(completeness_errors)
 
+    runtime_price_contract = _finalize_runtime_price_contract(
+        runtime_price_contract=runtime_price_contract,
+        runtime_price_dtypes=runtime_price_dtypes,
+    )
+
+    price_contract_hash = runtime_price_contract["price_contract_hash"] if runtime_price_contract["enabled"] else None
+    dataset_build_id = _compute_dataset_build_id(
+        run_id=run_id,
+        split_mode=split_mode,
+        output_semantics_mode=str(output_semantics["mode"]),
+        aggregate_walk_forward=bool(options.aggregate_walk_forward),
+        timestamp_column=timestamp_column,
+        column_selection_hash=column_selection_hash,
+        build_mode=options.build_mode,
+        feature_manifest_hash=feature_manifest_hash,
+        train_input_report_hash=train_input_report_hash,
+        split_report_hash=split_report_hash,
+        source_file_inventory_hash=source_inventory_hash,
+        price_contract_hash=price_contract_hash,
+    )
+    dataset_build_id_policy = {
+        "algorithm": "sha256",
+        "canonical_json": {"sort_keys": True, "separators": [",", ":"], "ensure_ascii": True},
+        "hash_inputs_order": [
+            "run_id",
+            "builder_version",
+            "build_mode",
+            "split_mode",
+            "output_semantics_mode",
+            "aggregate_walk_forward",
+            "timestamp_column",
+            "column_selection_hash",
+            "feature_manifest_hash",
+            "train_input_report_hash",
+            "split_report_hash",
+            "source_file_inventory_hash",
+            "price_contract_hash_when_enabled",
+        ],
+    }
+
     totals = {
         "files_processed": int(files_processed),
         "files_failed": int(files_failed),
@@ -697,6 +774,7 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
     report_payload["output_completeness_ok"] = bool(output_completeness_ok)
     report_payload["dataset_build_id"] = dataset_build_id
     report_payload["dataset_build_id_policy"] = dataset_build_id_policy
+    report_payload["runtime_price_contract"] = runtime_price_contract
 
     duplicate_timestamp_policy = {
         "default_partition_uniqueness_required": True,
@@ -751,6 +829,7 @@ def build_datasets(options: DatasetBuildOptions) -> DatasetBuildResult:
             **column_selection_contract,
             "column_selection_hash": column_selection_hash,
         },
+        "runtime_price_contract": runtime_price_contract,
         "partition_metadata": [item.to_dict() for item in persisted_artifacts],
         "walk_forward_fold_metadata": _build_walk_forward_fold_metadata(persisted_artifacts),
         "row_order_policy": row_order_policy,
@@ -852,6 +931,10 @@ def _base_report_payload(
         "invocation_args": invocation_args,
         "overwrite_policy": {},
         "column_selection_contract": {},
+        "runtime_price_contract": _build_disabled_runtime_price_contract(
+            timestamp_column="timestamp",
+            artifact_columns=["timestamp"],
+        ),
         "source_hashes": {},
         "errors": [],
         "warnings": [],
@@ -1103,6 +1186,163 @@ def _resolve_column_selection(
         "dtype_hash": dtype_hash,
     }
     return selected_columns, selected_dtype_map, timestamp_column, contract
+
+
+def _build_disabled_runtime_price_contract(*, timestamp_column: str, artifact_columns: Sequence[str]) -> dict[str, Any]:
+    """Build stable disabled runtime price contract schema."""
+
+    normalized_artifact_columns = [str(item).strip() for item in artifact_columns if isinstance(item, str) and str(item).strip()]
+    artifact_columns_out = _stable_unique([timestamp_column, *[item for item in normalized_artifact_columns if item != timestamp_column]])
+    return {
+        "enabled": False,
+        "timestamp_column": timestamp_column,
+        "execution_price_column": None,
+        "mark_to_market_column": None,
+        "required_runtime_columns": [],
+        "artifact_columns": artifact_columns_out,
+        "runtime_price_dtypes": {},
+        "runtime_columns_already_present_in_observation": [],
+        "price_source_policy": "disabled",
+        "observation_runtime_overlap_allowed": True,
+        "price_contract_hash": None,
+    }
+
+
+def _resolve_runtime_price_contract(
+    *,
+    feature_manifest: Mapping[str, Any],
+    options: DatasetBuildOptions,
+    timestamp_column: str,
+    selected_columns: Sequence[str],
+    observation_columns: Sequence[str],
+    errors: list[ValidationIssue],
+) -> tuple[list[str], list[str], dict[str, Any], dict[str, str]]:
+    """Resolve optional runtime price contract for dataset artifacts."""
+
+    disabled_contract = _build_disabled_runtime_price_contract(
+        timestamp_column=timestamp_column,
+        artifact_columns=selected_columns if selected_columns else [timestamp_column],
+    )
+
+    execution_raw = options.execution_price_column
+    mark_to_market_raw = options.mark_to_market_column
+    if execution_raw is None and mark_to_market_raw is None:
+        return [], list(disabled_contract["artifact_columns"]), disabled_contract, {}
+
+    execution_price_column = str(execution_raw).strip() if execution_raw is not None else ""
+    mark_to_market_column = str(mark_to_market_raw).strip() if mark_to_market_raw is not None else ""
+    if not execution_price_column or not mark_to_market_column:
+        errors.append(
+            ValidationIssue(
+                code=DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID,
+                message="execution_price_column and mark_to_market_column must be provided together when runtime price contract is enabled.",
+                context={
+                    "execution_price_column": options.execution_price_column,
+                    "mark_to_market_column": options.mark_to_market_column,
+                },
+            )
+        )
+        return [], list(disabled_contract["artifact_columns"]), disabled_contract, {}
+
+    required_runtime_columns = _stable_unique([execution_price_column, mark_to_market_column])
+    invalid_runtime_columns = [col for col in required_runtime_columns if col == timestamp_column]
+    if invalid_runtime_columns:
+        errors.append(
+            ValidationIssue(
+                code=DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID,
+                message="Runtime price columns must be distinct from timestamp_column.",
+                context={"timestamp_column": timestamp_column, "invalid_columns": invalid_runtime_columns},
+            )
+        )
+
+    overlap_columns = [col for col in required_runtime_columns if col in observation_columns]
+    runtime_only_columns = [col for col in required_runtime_columns if col not in observation_columns]
+    artifact_columns = _stable_unique([*selected_columns, *runtime_only_columns]) if selected_columns else [timestamp_column, *runtime_only_columns]
+    expected_artifact_columns = _stable_unique([timestamp_column, *observation_columns, *runtime_only_columns])
+    if artifact_columns != expected_artifact_columns:
+        errors.append(
+            ValidationIssue(
+                code=DATASET_BUILD_RUNTIME_PRICE_CONTRACT_INVALID,
+                message="artifact_columns could not be resolved deterministically for runtime price contract.",
+                context={"expected": expected_artifact_columns, "actual": artifact_columns},
+            )
+        )
+
+    dtype_map_raw = feature_manifest.get("column_dtypes")
+    manifest_runtime_dtypes: dict[str, str] = {}
+    if isinstance(dtype_map_raw, dict):
+        for key, value in dtype_map_raw.items():
+            if isinstance(key, str) and isinstance(value, str) and key in required_runtime_columns:
+                manifest_runtime_dtypes[str(key)] = str(value)
+
+    contract = {
+        "enabled": True,
+        "timestamp_column": timestamp_column,
+        "execution_price_column": execution_price_column,
+        "mark_to_market_column": mark_to_market_column,
+        "required_runtime_columns": required_runtime_columns,
+        "artifact_columns": artifact_columns,
+        "runtime_price_dtypes": {},
+        "runtime_columns_already_present_in_observation": overlap_columns,
+        "price_source_policy": "from_feature_dataset_source",
+        "observation_runtime_overlap_allowed": True,
+        "price_contract_hash": None,
+    }
+    return required_runtime_columns, artifact_columns, contract, manifest_runtime_dtypes
+
+
+def _finalize_runtime_price_contract(
+    *,
+    runtime_price_contract: Mapping[str, Any],
+    runtime_price_dtypes: Mapping[str, str],
+) -> dict[str, Any]:
+    """Finalize runtime price contract payload with inferred dtypes and hash."""
+
+    if not bool(runtime_price_contract.get("enabled", False)):
+        return _build_disabled_runtime_price_contract(
+            timestamp_column=str(runtime_price_contract.get("timestamp_column", "timestamp")),
+            artifact_columns=_parse_string_list(runtime_price_contract.get("artifact_columns")) or [str(runtime_price_contract.get("timestamp_column", "timestamp"))],
+        )
+
+    required_runtime_columns = _parse_string_list(runtime_price_contract.get("required_runtime_columns")) or []
+    finalized_dtypes = {col: str(runtime_price_dtypes[col]) for col in required_runtime_columns if col in runtime_price_dtypes}
+
+    finalized_contract = {
+        "enabled": True,
+        "timestamp_column": str(runtime_price_contract.get("timestamp_column", "timestamp")),
+        "execution_price_column": runtime_price_contract.get("execution_price_column"),
+        "mark_to_market_column": runtime_price_contract.get("mark_to_market_column"),
+        "required_runtime_columns": required_runtime_columns,
+        "artifact_columns": _parse_string_list(runtime_price_contract.get("artifact_columns")) or [],
+        "runtime_price_dtypes": finalized_dtypes,
+        "runtime_columns_already_present_in_observation": _parse_string_list(
+            runtime_price_contract.get("runtime_columns_already_present_in_observation")
+        )
+        or [],
+        "price_source_policy": str(runtime_price_contract.get("price_source_policy", "from_feature_dataset_source")),
+        "observation_runtime_overlap_allowed": bool(runtime_price_contract.get("observation_runtime_overlap_allowed", True)),
+        "price_contract_hash": None,
+    }
+
+    if len(finalized_dtypes) == len(required_runtime_columns):
+        finalized_contract["price_contract_hash"] = _hash_canonical_json(
+            {
+                "enabled": finalized_contract["enabled"],
+                "timestamp_column": finalized_contract["timestamp_column"],
+                "execution_price_column": finalized_contract["execution_price_column"],
+                "mark_to_market_column": finalized_contract["mark_to_market_column"],
+                "required_runtime_columns": finalized_contract["required_runtime_columns"],
+                "artifact_columns": finalized_contract["artifact_columns"],
+                "runtime_price_dtypes": finalized_contract["runtime_price_dtypes"],
+                "runtime_columns_already_present_in_observation": finalized_contract[
+                    "runtime_columns_already_present_in_observation"
+                ],
+                "price_source_policy": finalized_contract["price_source_policy"],
+                "observation_runtime_overlap_allowed": finalized_contract["observation_runtime_overlap_allowed"],
+            }
+        )
+
+    return finalized_contract
 
 
 def _build_expected_specs(
@@ -1810,6 +2050,7 @@ def _compute_dataset_build_id(
     train_input_report_hash: str,
     split_report_hash: str,
     source_file_inventory_hash: str,
+    price_contract_hash: str | None,
 ) -> str:
     """Compute deterministic dataset_build_id.
 
@@ -1834,6 +2075,8 @@ def _compute_dataset_build_id(
         "split_report_hash": split_report_hash,
         "source_file_inventory_hash": source_file_inventory_hash,
     }
+    if price_contract_hash is not None:
+        payload["price_contract_hash"] = price_contract_hash
     return _hash_canonical_json(payload)
 
 

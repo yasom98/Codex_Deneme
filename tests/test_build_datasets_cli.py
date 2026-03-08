@@ -21,6 +21,8 @@ SCRIPT_PATH = PROJECT_ROOT / "scripts" / "build_datasets.py"
 def _base_frame(rows: int = 20, freq: str = "1min") -> pd.DataFrame:
     ts = pd.date_range("2024-01-01", periods=rows, freq=freq, tz="UTC")
     frame = pd.DataFrame({"timestamp": ts})
+    frame["open"] = pd.Series(np.linspace(100.0, 100.0 + float(rows - 1), rows), dtype="float32")
+    frame["close"] = pd.Series(np.linspace(100.5, 100.5 + float(rows - 1), rows), dtype="float32")
     frame["feat_cont"] = pd.Series(np.linspace(1.0, 2.0, rows), dtype="float32")
     events = np.zeros(rows, dtype=np.uint8)
     events[::5] = np.uint8(1)
@@ -70,11 +72,13 @@ def _seed_run(
             "event_columns": ["evt_flag"],
             "column_dtypes": {
                 "timestamp": "datetime64[ns, UTC]",
+                "open": "float32",
+                "close": "float32",
                 "feat_cont": "float32",
                 "evt_flag": "uint8",
             },
             "feature_groups": {
-                "raw_ohlcv": ["timestamp"],
+                "raw_ohlcv": ["timestamp", "open", "close"],
                 "price_derived": [],
                 "trend": ["feat_cont"],
                 "regime": [],
@@ -158,6 +162,15 @@ def _load_main() -> object:
     return module["main"]
 
 
+def _runtime_price_args(*, execution_price_column: str, mark_to_market_column: str) -> list[str]:
+    return [
+        "--execution-price-column",
+        execution_price_column,
+        "--mark-to-market-column",
+        mark_to_market_column,
+    ]
+
+
 def test_cli_help() -> None:
     main = _load_main()
     with pytest.raises(SystemExit) as exc:
@@ -184,8 +197,41 @@ def test_cli_success_exit_zero_and_outputs(monkeypatch: object, tmp_path: Path) 
     assert manifest_path.exists()
 
     payload = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert payload["dataset_build_overall"] is True
     assert payload["invocation_args"]["run_id"] == run_id
+    assert payload["runtime_price_contract"]["enabled"] is False
+    assert payload["runtime_price_contract"]["artifact_columns"] == ["timestamp", "feat_cont", "evt_flag"]
+    assert manifest["runtime_price_contract"]["enabled"] is False
+    assert manifest["runtime_price_contract"]["price_contract_hash"] is None
+
+
+def test_cli_runtime_price_contract_enabled_close_close(monkeypatch: object, tmp_path: Path) -> None:
+    run_id = "dataset_cli_runtime_enabled"
+    input_root, _, _, frame_map = _seed_run(tmp_path, run_id)
+    _patch_parquet_io(monkeypatch, frame_map)
+
+    main = _load_main()
+    monkeypatch.setattr(
+        main.__globals__["sys"],
+        "argv",
+        ["build_datasets.py", "--run-id", run_id, "--input-root", str(input_root), *_runtime_price_args(execution_price_column="close", mark_to_market_column="close")],
+    )
+    monkeypatch.setitem(main.__globals__, "PROJECT_ROOT", tmp_path)
+
+    exit_code = int(main())
+    assert exit_code == 0
+
+    report_path = tmp_path / "runs" / run_id / "data_datasets" / "reports" / "dataset_build_report.json"
+    manifest_path = tmp_path / "runs" / run_id / "data_datasets" / "reports" / "dataset_manifest.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert report["runtime_price_contract"]["enabled"] is True
+    assert report["runtime_price_contract"]["required_runtime_columns"] == ["close"]
+    assert report["runtime_price_contract"]["artifact_columns"] == ["timestamp", "feat_cont", "evt_flag", "close"]
+    assert manifest["runtime_price_contract"]["runtime_price_dtypes"] == {"close": "float32"}
+    assert isinstance(manifest["runtime_price_contract"]["price_contract_hash"], str)
 
 
 def test_cli_contract_fail_exit_two(monkeypatch: object, tmp_path: Path) -> None:

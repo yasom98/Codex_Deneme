@@ -67,3 +67,27 @@ def test_dtype_policy_continuous_float32_flags_uint8() -> None:
 
     for col in artifacts.flag_feature_columns:
         assert str(out[col].dtype) == "uint8"
+
+
+def test_body_ratio_zero_range_candle_is_zero_after_warmup() -> None:
+    df = _sample_ohlcv()
+    flat_index = 1400
+    nearby_index = 1401
+    flat_price = np.float32(df.loc[flat_index, "close"])
+    df.loc[flat_index, ["open", "high", "low", "close"]] = flat_price
+
+    artifacts = build_feature_artifacts(df, _config())
+    out = artifacts.frame
+
+    assert flat_index > artifacts.warmup_rows_by_column["EMA_1200"]
+    assert float(out.loc[flat_index, "hl_range"]) == 0.0
+    assert float(out.loc[flat_index, "body_ratio"]) == 0.0
+    assert np.isfinite(float(out.loc[flat_index, "body_ratio"]))
+    assert str(out["hl_range"].dtype) == "float32"
+    assert str(out["body_ratio"].dtype) == "float32"
+
+    expected_body_ratio = abs(float(df.loc[nearby_index, "close"]) - float(df.loc[nearby_index, "open"])) / (
+        float(df.loc[nearby_index, "high"]) - float(df.loc[nearby_index, "low"])
+    )
+    assert float(out.loc[nearby_index, "hl_range"]) > 0.0
+    assert np.isclose(float(out.loc[nearby_index, "body_ratio"]), expected_body_ratio)

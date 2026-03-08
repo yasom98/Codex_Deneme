@@ -57,6 +57,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-columns", type=str, default="", help="Comma-separated columns to exclude.")
     parser.add_argument("--timestamp-column", type=str, default=None, help="Optional timestamp column override.")
     parser.add_argument(
+        "--execution-price-column",
+        type=str,
+        default=None,
+        help="Optional runtime execution price column to persist in dataset artifacts.",
+    )
+    parser.add_argument(
+        "--mark-to-market-column",
+        type=str,
+        default=None,
+        help="Optional runtime mark-to-market price column to persist in dataset artifacts.",
+    )
+    parser.add_argument(
         "--require-train-input-validation",
         type=str,
         default="true",
@@ -187,6 +199,21 @@ def _build_runtime_error_payload(
             "output_root": str(output_root),
             "overwrite": _to_bool(args.overwrite),
             "aggregate_walk_forward": _to_bool(args.aggregate_walk_forward),
+            "execution_price_column": args.execution_price_column,
+            "mark_to_market_column": args.mark_to_market_column,
+        },
+        "runtime_price_contract": {
+            "enabled": False,
+            "timestamp_column": args.timestamp_column if isinstance(args.timestamp_column, str) and args.timestamp_column.strip() else "timestamp",
+            "execution_price_column": None,
+            "mark_to_market_column": None,
+            "required_runtime_columns": [],
+            "artifact_columns": [args.timestamp_column if isinstance(args.timestamp_column, str) and args.timestamp_column.strip() else "timestamp"],
+            "runtime_price_dtypes": {},
+            "runtime_columns_already_present_in_observation": [],
+            "price_source_policy": "disabled",
+            "observation_runtime_overlap_allowed": True,
+            "price_contract_hash": None,
         },
         "errors": [
             {
@@ -230,6 +257,8 @@ def main() -> int:
             include_feature_groups=_split_csv_arg(args.include_feature_groups),
             exclude_columns=_split_csv_arg(args.exclude_columns),
             timestamp_column_override=args.timestamp_column,
+            execution_price_column=args.execution_price_column,
+            mark_to_market_column=args.mark_to_market_column,
             require_train_input_validation=_to_bool(args.require_train_input_validation),
             require_split_validation=_to_bool(args.require_split_validation),
             aggregate_walk_forward=_to_bool(args.aggregate_walk_forward),
