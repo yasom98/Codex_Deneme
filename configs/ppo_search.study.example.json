@@ -1,0 +1,84 @@
+{
+  "study_id": "m49_contract_smoke_20260308",
+  "milestone": "Milestone 4.9 \u2014 Constrained PPO Hyperparameter Search Orchestrator Contract",
+  "study_mode": "ppo_hparam_search",
+  "search_method": "grid_product_v1",
+  "sampler_seed": 42,
+  "trial_seed": 42,
+  "upstream_refs": {
+    "run_id": "20260215T230000Z_clean15m",
+    "env_config_path": "../runs/20260215T230000Z_clean15m/training_launch/tmp/launcher_env_config.prelaunch.json",
+    "state_manifest_path": "../runs/20260215T230000Z_clean15m/data_states/reports/state_manifest.json",
+    "env_contract_report_path": "../runs/20260215T230000Z_clean15m/env_contract/reports/env_contract_report.json",
+    "readiness_report_path": "../runs/20260215T230000Z_clean15m/env_readiness/reports/training_env_readiness_report.json",
+    "episode_catalog_path": "../runs/20260215T230000Z_clean15m/env_readiness/reports/episode_catalog.json",
+    "split_report_path": "../runs/20260215T230000Z_clean15m/data_features/reports/split_validation_report.json",
+    "artifact_training_config_template_path": "../runs/20260215T230000Z_clean15m/ppo_artifact_production/tmp/training_config.canonical_cpu_20260308.json",
+    "eval_config_template_path": "eval_config.single_path.example.json"
+  },
+  "search_space": {
+    "learning_rate": [
+      0.0002,
+      0.0003
+    ],
+    "n_steps": [
+      8
+    ],
+    "batch_size": [
+      4
+    ],
+    "n_epochs": [
+      2
+    ],
+    "gamma": [
+      0.98,
+      0.99
+    ],
+    "gae_lambda": [
+      0.95
+    ],
+    "clip_range": [
+      0.2
+    ],
+    "ent_coef": [
+      0.0
+    ]
+  },
+  "resource_budget": {
+    "max_trials": 2,
+    "launcher_smoke_learn_timesteps": 8,
+    "probe_train_total_timesteps": 16,
+    "full_train_total_timesteps": 32,
+    "max_eval_episodes": 3,
+    "max_eval_steps": 512
+  },
+  "objective_spec": {
+    "primary_metric": "excess_total_return",
+    "turnover_penalty_weight": 0.05,
+    "instability_penalty_weight": 0.05,
+    "low_trade_count_penalty_weight": 0.05,
+    "soft_trade_rate_target": 0.02
+  },
+  "guardrail_spec": {
+    "require_step_trace": true,
+    "max_strategy_max_drawdown": 0.90,
+    "min_num_trades_hard": 0,
+    "min_num_trades_soft": 1,
+    "max_trade_rate_hard": 0.20
+  },
+  "pruning_spec": {
+    "enabled": true,
+    "warmup_trials": 1,
+    "min_completed_probe_trials": 1,
+    "min_probe_objective_score": -0.50,
+    "relative_to_best_completed_margin": 0.05
+  },
+  "promotion_spec": {
+    "candidate_top_k": 1,
+    "promotion_min_distinct_seeds": 2,
+    "require_positive_objective": true,
+    "max_strategy_max_drawdown": 0.40,
+    "min_num_trades": 1
+  },
+  "output_root": "../runs/20260215T230000Z_clean15m/ppo_search/m49_contract_smoke_20260308_v3"
+}
