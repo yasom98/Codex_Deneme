@@ -14,7 +14,7 @@ from rl.evaluation_backtest import (
     EVAL_OUTPUT_CONFLICT,
     execute_evaluation_backtest,
 )
-from tests.evaluation_backtest_fixtures import FakePredictModel, seed_evaluation_run, write_eval_config
+from tests.evaluation_backtest_fixtures import FakePredictModel, seed_evaluation_run, write_eval_config, write_risk_overlay_config
 
 
 def _run_evaluation(
@@ -29,6 +29,7 @@ def _run_evaluation(
     episode_catalog_path: Path,
     split_report_path: Path,
     output_dir: Path,
+    risk_overlay_config_path: Path | None = None,
 ):
     return execute_evaluation_backtest(
         run_id=run_id,
@@ -41,6 +42,7 @@ def _run_evaluation(
         episode_catalog_path=episode_catalog_path,
         split_report_path=split_report_path,
         output_dir=output_dir,
+        risk_overlay_config_path=risk_overlay_config_path,
     )
 
 
@@ -304,3 +306,131 @@ def test_no_trades_marks_proxy_metric_unsupported(monkeypatch: pytest.MonkeyPatc
     metric_status = result.backtest_payload["metric_status"]["strategy"]["avg_trade_return"]
     assert metric_status["supported"] is False
     assert metric_status["detail"]["metric_policy"] == "narrow_v1_proxy"
+
+
+def test_risk_overlay_writes_minimal_artifacts_and_additive_report_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "eval_risk_overlay_artifacts"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(tmp_path, run_id)
+    risk_overlay_config_path = write_risk_overlay_config(
+        tmp_path,
+        instrument="val_a.parquet",
+    )
+
+    monkeypatch.setattr(
+        "rl.evaluation_backtest._load_ppo_model",
+        lambda model_artifact_path, device: FakePredictModel(actions=[1, 0, 3, 0]),
+    )
+
+    result = _run_evaluation(
+        run_id=run_id,
+        model_artifact_path=seeded["model_artifact_path"],
+        env_config_path=seeded["env_config_path"],
+        eval_config_path=eval_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "eval_risk_overlay_out",
+        risk_overlay_config_path=risk_overlay_config_path,
+    )
+
+    assert result.exit_code == 0
+    assert result.report_paths.risk_decision_log_path is not None
+    assert result.report_paths.risk_overlay_summary_path is not None
+    assert result.report_paths.risk_state_transition_log_path is not None
+    assert result.report_paths.risk_decision_log_path.exists()
+    assert result.report_paths.risk_overlay_summary_path.exists()
+    assert result.report_paths.risk_state_transition_log_path.exists()
+
+    manifest = json.loads(result.report_paths.manifest_path.read_text(encoding="utf-8"))
+    backtest = json.loads(result.report_paths.backtest_report_path.read_text(encoding="utf-8"))
+    summary = json.loads(result.report_paths.risk_overlay_summary_path.read_text(encoding="utf-8"))
+
+    assert manifest["risk_overlay"]["enabled"] is True
+    assert backtest["risk_overlay"]["enabled"] is True
+    assert summary["overlay_enabled"] is True
+    assert summary["decision_counts"]["ALLOW"] >= 1
+
+
+def test_risk_overlay_drawdown_state_machine_clamps_short_under_freeze_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "eval_risk_overlay_freeze"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(tmp_path, run_id)
+    risk_overlay_config_path = write_risk_overlay_config(
+        tmp_path,
+        instrument="val_a.parquet",
+        overrides={
+            "config_version": "risk_overlay.v1",
+            "allowed_instruments": ["val_a.parquet"],
+            "freshness_limits": {
+                "max_market_data_age_seconds": 0,
+                "max_portfolio_state_age_seconds": 0,
+                "max_proposal_age_seconds": 0,
+            },
+            "exposure_limits": {
+                "max_abs_target_exposure": 1.0,
+                "max_gross_exposure": 1.0,
+                "max_net_exposure": 1.0,
+                "max_instrument_exposure": 1.0,
+                "defensive_scale_down": 1.0,
+            },
+            "leverage_limits": {
+                "max_leverage": 1.0,
+                "defensive_scale_down": 1.0,
+            },
+            "drawdown_thresholds": {
+                "defensive_enter_pct": 0.0005,
+                "defensive_exit_pct": 0.0001,
+                "freeze_enter_pct": 0.0015,
+                "freeze_exit_pct": 0.0010,
+                "kill_pct": 0.01,
+            },
+            "hysteresis_bands": {"min_steps_in_state": 1},
+            "recovery_policy": {
+                "freeze_cooldown_steps": 1,
+                "systemic_failure_kill_threshold": 2,
+                "kill_requires_recovery_token": True,
+            },
+        },
+    )
+
+    monkeypatch.setattr(
+        "rl.evaluation_backtest._load_ppo_model",
+        lambda model_artifact_path, device: FakePredictModel(actions=[2, 0, 0, 0]),
+    )
+
+    result = _run_evaluation(
+        run_id=run_id,
+        model_artifact_path=seeded["model_artifact_path"],
+        env_config_path=seeded["env_config_path"],
+        eval_config_path=eval_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "eval_risk_overlay_freeze_out",
+        risk_overlay_config_path=risk_overlay_config_path,
+    )
+
+    assert result.exit_code == 0
+
+    decision_log_lines = result.report_paths.risk_decision_log_path.read_text(encoding="utf-8").strip().splitlines()  # type: ignore[union-attr]
+    decision_rows = [json.loads(line) for line in decision_log_lines if line.strip()]
+    summary = json.loads(result.report_paths.risk_overlay_summary_path.read_text(encoding="utf-8"))  # type: ignore[union-attr]
+    transition_lines = result.report_paths.risk_state_transition_log_path.read_text(encoding="utf-8").strip().splitlines()  # type: ignore[union-attr]
+    transitions = [json.loads(line) for line in transition_lines if line.strip()]
+
+    assert any(row["state_transition"] and row["state_transition"]["to_mode"] == "DEFENSIVE" for row in decision_rows)
+    assert any(row["state_transition"] and row["state_transition"]["to_mode"] == "FREEZE_ENTRIES" for row in decision_rows)
+    assert any(row["decision_type"] == "CLAMP" and row["approved_action"]["action_semantic"] == "CLOSE_POSITION" for row in decision_rows)
+    assert summary["decision_counts"]["CLAMP"] >= 1
+    assert any(item["to_mode"] == "FREEZE_ENTRIES" for item in transitions)

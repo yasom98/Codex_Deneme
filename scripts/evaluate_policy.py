@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-catalog", type=Path, required=True, help="Explicit episode catalog JSON path.")
     parser.add_argument("--split-report", type=Path, required=True, help="Explicit split report JSON path.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Fresh output dir for 4.8 reports.")
+    parser.add_argument(
+        "--risk-overlay-config",
+        type=Path,
+        default=None,
+        help="Optional strict 4.10 risk overlay config JSON path.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
     return parser.parse_args()
 
@@ -53,6 +59,7 @@ def main() -> int:
             episode_catalog_path=args.episode_catalog.resolve(),
             split_report_path=args.split_report.resolve(),
             output_dir=args.output_dir.resolve(),
+            risk_overlay_config_path=args.risk_overlay_config.resolve() if args.risk_overlay_config is not None else None,
         )
         LOGGER.info(
             "Evaluation/backtest summary | run_id=%s exit_code=%d reports_written=%s output_dir=%s",

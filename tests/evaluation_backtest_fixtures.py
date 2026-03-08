@@ -122,6 +122,57 @@ def write_eval_config(tmp_path: Path, run_id: str, *, overrides: dict[str, Any] 
     return config_path
 
 
+def write_risk_overlay_config(
+    tmp_path: Path,
+    *,
+    instrument: str,
+    overrides: dict[str, Any] | None = None,
+) -> Path:
+    """Write a strict 4.10 risk overlay config JSON file."""
+
+    payload: dict[str, Any] = {
+        "config_version": "risk_overlay.v1",
+        "allowed_instruments": [instrument],
+        "freshness_limits": {
+            "max_market_data_age_seconds": 0,
+            "max_portfolio_state_age_seconds": 0,
+            "max_proposal_age_seconds": 0,
+        },
+        "exposure_limits": {
+            "max_abs_target_exposure": 1.0,
+            "max_gross_exposure": 1.0,
+            "max_net_exposure": 1.0,
+            "max_instrument_exposure": 1.0,
+            "defensive_scale_down": 0.5,
+        },
+        "leverage_limits": {
+            "max_leverage": 1.0,
+            "defensive_scale_down": 0.5,
+        },
+        "drawdown_thresholds": {
+            "defensive_enter_pct": 0.02,
+            "defensive_exit_pct": 0.01,
+            "freeze_enter_pct": 0.04,
+            "freeze_exit_pct": 0.025,
+            "kill_pct": 0.08,
+        },
+        "hysteresis_bands": {
+            "min_steps_in_state": 1,
+        },
+        "recovery_policy": {
+            "freeze_cooldown_steps": 1,
+            "systemic_failure_kill_threshold": 2,
+            "kill_requires_recovery_token": True,
+        },
+    }
+    if overrides:
+        payload.update(overrides)
+
+    config_path = tmp_path / f"{instrument.replace('/', '_')}_risk_overlay_config.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    return config_path
+
+
 class FakePredictModel:
     """Simple scripted model stub for deterministic evaluation tests."""
 

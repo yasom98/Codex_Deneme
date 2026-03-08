@@ -21,6 +21,18 @@ import pandas as pd
 from rl.env_adapter_gym import TradingEnvGym
 from rl.env_contract import EnvConfig, parse_env_config
 from rl.env_core import EpisodeRef
+from rl.risk_overlay import (
+    RISK_OVERLAY_CONTRACT_VERSION,
+    MarketSnapshot,
+    PortfolioRiskState,
+    RiskOverlayInput,
+    RiskOverlayReportBundle,
+    RiskOverlaySession,
+    build_risk_overlay_session,
+    derive_action_proposal,
+    load_risk_overlay_config,
+    write_risk_overlay_artifacts,
+)
 
 LOGGER = get_logger(__name__)
 
@@ -107,6 +119,8 @@ EVAL_ENV_INIT_FAILED = "EVAL_ENV_INIT_FAILED"
 EVAL_EXECUTION_FAILED = "EVAL_EXECUTION_FAILED"
 EVAL_BENCHMARK_FAILED = "EVAL_BENCHMARK_FAILED"
 EVAL_REPORT_WRITE_FAILED = "EVAL_REPORT_WRITE_FAILED"
+EVAL_RISK_OVERLAY_CONFIG_REQUIRED = "EVAL_RISK_OVERLAY_CONFIG_REQUIRED"
+EVAL_RISK_OVERLAY_CONFIG_INVALID = "EVAL_RISK_OVERLAY_CONFIG_INVALID"
 
 
 @dataclass
@@ -159,6 +173,9 @@ class ReportPaths:
     manifest_path: Path
     backtest_report_path: Path
     step_trace_path: Path
+    risk_decision_log_path: Path | None = None
+    risk_overlay_summary_path: Path | None = None
+    risk_state_transition_log_path: Path | None = None
 
 
 @dataclass
@@ -199,6 +216,7 @@ def execute_evaluation_backtest(
     episode_catalog_path: Path,
     split_report_path: Path,
     output_dir: Path,
+    risk_overlay_config_path: Path | None = None,
 ) -> EvaluationExecutionResult:
     """Execute strict evaluation/backtest over explicit artifacts."""
 
@@ -212,6 +230,9 @@ def execute_evaluation_backtest(
         manifest_path=output_dir_resolved / "evaluation_manifest.json",
         backtest_report_path=output_dir_resolved / "evaluation_backtest_report.json",
         step_trace_path=output_dir_resolved / "evaluation_step_trace.parquet",
+        risk_decision_log_path=output_dir_resolved / "risk_decision_log.jsonl",
+        risk_overlay_summary_path=output_dir_resolved / "risk_overlay_summary.json",
+        risk_state_transition_log_path=output_dir_resolved / "risk_state_transition_log.jsonl",
     )
     evaluation_session_id = _build_evaluation_session_id(
         run_id=normalized_run_id,
@@ -243,6 +264,8 @@ def execute_evaluation_backtest(
             state_manifest_hash=None,
             episode_catalog_hash=None,
             split_report_hash=None,
+            risk_overlay_enabled=bool(risk_overlay_config_path is not None),
+            risk_overlay_config_hash=None,
             validation_checks=[
                 _validation_check(
                     check_name="startup_policy_fresh_only",
@@ -284,6 +307,12 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            risk_overlay=_risk_overlay_backtest_metadata(
+                enabled=bool(risk_overlay_config_path is not None),
+                config_hash=None,
+                report_paths=report_paths,
+                summary_payload=None,
+            ),
             warnings=[],
             errors=output_guard_issues,
         )
@@ -309,6 +338,9 @@ def execute_evaluation_backtest(
     )
     warnings: list[ValidationIssue] = []
     errors: list[ValidationIssue] = list(load_issues)
+    risk_overlay_session: RiskOverlaySession | None = None
+    risk_overlay_config_hash: str | None = None
+    risk_overlay_bundle: RiskOverlayReportBundle | None = None
 
     model_artifact_hash, model_issues = _validate_model_artifact(model_artifact_path.resolve())
     errors.extend(model_issues)
@@ -319,6 +351,20 @@ def execute_evaluation_backtest(
     state_manifest_hash = _semantic_hash_optional(loaded_inputs.get("state_manifest"))
     episode_catalog_hash = _semantic_hash_optional(loaded_inputs.get("episode_catalog"))
     split_report_hash = _semantic_hash_optional(loaded_inputs.get("split_report"))
+    risk_overlay_enabled = risk_overlay_config_path is not None
+    if risk_overlay_enabled:
+        risk_overlay_result = _load_risk_overlay_config(risk_overlay_config_path)
+        risk_overlay_config = risk_overlay_result["config"]
+        risk_overlay_config_hash = risk_overlay_result["config_hash"]
+        errors.extend(risk_overlay_result["errors"])
+        if risk_overlay_config is not None:
+            risk_overlay_session = build_risk_overlay_session(
+                config=risk_overlay_config,
+                config_path=risk_overlay_config_path.resolve(),
+                config_hash=risk_overlay_config_hash,
+            )
+    else:
+        risk_overlay_config = None
 
     eval_config_result = _validate_eval_config(loaded_inputs.get("eval_config"))
     eval_config = eval_config_result["config"]
@@ -394,6 +440,8 @@ def execute_evaluation_backtest(
         state_manifest_hash=state_manifest_hash,
         episode_catalog_hash=episode_catalog_hash,
         split_report_hash=split_report_hash,
+        risk_overlay_enabled=risk_overlay_enabled,
+        risk_overlay_config_hash=risk_overlay_config_hash,
         validation_checks=validation_checks,
         warnings=warnings,
         errors=errors,
@@ -427,6 +475,12 @@ def execute_evaluation_backtest(
         split_report_hash=split_report_hash,
         output_dir=output_dir_resolved,
         warnings=warnings,
+        risk_overlay_metadata=_risk_overlay_manifest_metadata(
+            enabled=risk_overlay_enabled,
+            config_path=risk_overlay_config_path.resolve() if risk_overlay_enabled else None,
+            config_hash=risk_overlay_config_hash,
+            report_paths=report_paths,
+        ),
     )
 
     if errors:
@@ -454,6 +508,12 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            risk_overlay=_risk_overlay_backtest_metadata(
+                enabled=risk_overlay_enabled,
+                config_hash=risk_overlay_config_hash,
+                report_paths=report_paths,
+                summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+            ),
             warnings=warnings,
             errors=errors,
         )
@@ -462,6 +522,7 @@ def execute_evaluation_backtest(
             manifest_payload=manifest_payload,
             backtest_payload=backtest_payload,
             report_paths=report_paths,
+            risk_overlay_bundle=risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None,
         )
         return EvaluationExecutionResult(
             exit_code=2,
@@ -531,6 +592,12 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            risk_overlay=_risk_overlay_backtest_metadata(
+                enabled=risk_overlay_enabled,
+                config_hash=risk_overlay_config_hash,
+                report_paths=report_paths,
+                summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+            ),
             warnings=warnings,
             errors=[model_error],
         )
@@ -539,6 +606,7 @@ def execute_evaluation_backtest(
             manifest_payload=manifest_payload,
             backtest_payload=backtest_payload,
             report_paths=report_paths,
+            risk_overlay_bundle=risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None,
         )
         return EvaluationExecutionResult(
             exit_code=2,
@@ -590,6 +658,12 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            risk_overlay=_risk_overlay_backtest_metadata(
+                enabled=risk_overlay_enabled,
+                config_hash=risk_overlay_config_hash,
+                report_paths=report_paths,
+                summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+            ),
             warnings=warnings,
             errors=[env_issue],
         )
@@ -598,6 +672,7 @@ def execute_evaluation_backtest(
             manifest_payload=manifest_payload,
             backtest_payload=backtest_payload,
             report_paths=report_paths,
+            risk_overlay_bundle=risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None,
         )
         return EvaluationExecutionResult(
             exit_code=2,
@@ -617,6 +692,8 @@ def execute_evaluation_backtest(
             "deterministic": eval_config.deterministic,
         }
         for episode_index, (episode_ref, env_client) in enumerate(zip(target_resolution.selected_episode_refs, env_clients, strict=True)):
+            if risk_overlay_session is not None:
+                risk_overlay_session.start_episode()
             runtime = _evaluate_single_episode(
                 model=model,
                 env_client=env_client,
@@ -626,6 +703,7 @@ def execute_evaluation_backtest(
                 benchmark_mode=eval_config.benchmark_mode,
                 requested_metrics=eval_config.backtest_metrics,
                 episode_index=episode_index,
+                risk_overlay_session=risk_overlay_session,
             )
             episode_runtimes.append(runtime)
             step_rows.extend(runtime.step_records)
@@ -654,6 +732,12 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            risk_overlay=_risk_overlay_backtest_metadata(
+                enabled=risk_overlay_enabled,
+                config_hash=risk_overlay_config_hash,
+                report_paths=report_paths,
+                summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+            ),
             warnings=warnings,
             errors=[exc.issue],
         )
@@ -662,6 +746,7 @@ def execute_evaluation_backtest(
             manifest_payload=manifest_payload,
             backtest_payload=backtest_payload,
             report_paths=report_paths,
+            risk_overlay_bundle=risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None,
         )
         return EvaluationExecutionResult(
             exit_code=2,
@@ -702,6 +787,7 @@ def execute_evaluation_backtest(
         "write_step_trace": eval_config.write_step_trace,
         "trace_row_count": len(step_rows),
     }
+    risk_overlay_bundle = risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None
     backtest_payload = _build_backtest_payload(
         run_id=normalized_run_id,
         evaluation_session_id=evaluation_session_id,
@@ -722,6 +808,12 @@ def execute_evaluation_backtest(
             "relative": relative_status,
         },
         trace_artifact_path=str(report_paths.step_trace_path) if eval_config.write_step_trace else None,
+        risk_overlay=_risk_overlay_backtest_metadata(
+            enabled=risk_overlay_enabled,
+            config_hash=risk_overlay_config_hash,
+            report_paths=report_paths,
+            summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+        ),
         warnings=warnings,
         errors=[],
     )
@@ -732,6 +824,7 @@ def execute_evaluation_backtest(
         report_paths=report_paths,
         step_rows=step_rows,
         write_step_trace=eval_config.write_step_trace,
+        risk_overlay_bundle=risk_overlay_bundle,
     )
     if not write_ok:
         report_issue = ValidationIssue(
@@ -768,6 +861,12 @@ def execute_evaluation_backtest(
                 "relative": relative_status,
             },
             trace_artifact_path=str(report_paths.step_trace_path) if eval_config.write_step_trace else None,
+            risk_overlay=_risk_overlay_backtest_metadata(
+                enabled=risk_overlay_enabled,
+                config_hash=risk_overlay_config_hash,
+                report_paths=report_paths,
+                summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+            ),
             warnings=warnings,
             errors=[report_issue],
         )
@@ -868,6 +967,101 @@ def _load_json_object(*, path: Path, label: str) -> tuple[dict[str, Any] | None,
             context={"input_label": label, "path": str(path)},
         )
     return payload, None
+
+
+def _load_risk_overlay_config(path: Path | None) -> dict[str, Any]:
+    """Load the optional strict 4.10 risk overlay config."""
+
+    if path is None:
+        return {"config": None, "config_hash": None, "errors": []}
+    try:
+        config, config_hash = load_risk_overlay_config(path.resolve())
+    except FileNotFoundError:
+        return {
+            "config": None,
+            "config_hash": None,
+            "errors": [
+                ValidationIssue(
+                    code=EVAL_RISK_OVERLAY_CONFIG_REQUIRED,
+                    message="risk_overlay_config is required when the overlay flag is provided.",
+                    context={"risk_overlay_config_path": str(path.resolve())},
+                )
+            ],
+        }
+    except ValueError as exc:
+        return {
+            "config": None,
+            "config_hash": None,
+            "errors": [
+                ValidationIssue(
+                    code=EVAL_RISK_OVERLAY_CONFIG_INVALID,
+                    message="risk_overlay_config is invalid.",
+                    context={"risk_overlay_config_path": str(path.resolve()), "error": str(exc)},
+                )
+            ],
+        }
+    return {"config": config, "config_hash": config_hash, "errors": []}
+
+
+def _risk_overlay_manifest_metadata(
+    *,
+    enabled: bool,
+    config_path: Path | None,
+    config_hash: str | None,
+    report_paths: ReportPaths,
+) -> dict[str, Any]:
+    """Build additive manifest metadata for the optional overlay."""
+
+    return {
+        "enabled": bool(enabled),
+        "contract_version": RISK_OVERLAY_CONTRACT_VERSION if enabled else None,
+        "config_path": str(config_path) if config_path is not None else None,
+        "config_hash": config_hash,
+        "artifact_paths": {
+            "risk_decision_log": str(report_paths.risk_decision_log_path) if enabled and report_paths.risk_decision_log_path else None,
+            "risk_overlay_summary": (
+                str(report_paths.risk_overlay_summary_path) if enabled and report_paths.risk_overlay_summary_path else None
+            ),
+            "risk_state_transition_log": (
+                str(report_paths.risk_state_transition_log_path)
+                if enabled and report_paths.risk_state_transition_log_path
+                else None
+            ),
+        },
+    }
+
+
+def _risk_overlay_backtest_metadata(
+    *,
+    enabled: bool,
+    config_hash: str | None,
+    report_paths: ReportPaths,
+    summary_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build additive backtest metadata for the optional overlay."""
+
+    base = {
+        "enabled": bool(enabled),
+        "contract_version": RISK_OVERLAY_CONTRACT_VERSION if enabled else None,
+        "config_hash": config_hash,
+        "artifact_paths": {
+            "risk_decision_log": str(report_paths.risk_decision_log_path) if enabled and report_paths.risk_decision_log_path else None,
+            "risk_overlay_summary": (
+                str(report_paths.risk_overlay_summary_path) if enabled and report_paths.risk_overlay_summary_path else None
+            ),
+            "risk_state_transition_log": (
+                str(report_paths.risk_state_transition_log_path)
+                if enabled and report_paths.risk_state_transition_log_path
+                else None
+            ),
+        },
+        "decision_counts": None,
+        "state_transition_counts": None,
+    }
+    if summary_payload is not None:
+        base["decision_counts"] = dict(summary_payload.get("decision_counts", {}))
+        base["state_transition_counts"] = dict(summary_payload.get("state_transition_counts", {}))
+    return base
 
 
 def _validate_model_artifact(model_artifact_path: Path) -> tuple[str | None, list[ValidationIssue]]:
@@ -1796,6 +1990,7 @@ def _evaluate_single_episode(
     benchmark_mode: str,
     requested_metrics: Sequence[str],
     episode_index: int,
+    risk_overlay_session: RiskOverlaySession | None = None,
 ) -> EpisodeRuntime:
     """Evaluate one isolated environment instance and return machine-readable evidence."""
 
@@ -1825,6 +2020,9 @@ def _evaluate_single_episode(
     closed_trade_proxy_returns: list[float] = []
     closed_trade_pnls: list[float] = []
     step_counter = 0
+    current_exposure = 0
+    current_equity = float(env_client._config.initial_cash)  # type: ignore[attr-defined]
+    peak_equity = current_equity
     while True:
         try:
             raw_action = model.predict(observation, deterministic=deterministic)
@@ -1837,6 +2035,58 @@ def _evaluate_single_episode(
                 )
             ) from exc
         action = _normalize_action(raw_action)
+        risk_decision = None
+        current_index = int(episode_data.episode_valid_start_row) + int(step_counter)
+        decision_timestamp = str(episode_data.timestamp_vector[current_index])
+        if risk_overlay_session is not None:
+            mid_price = float(episode_data.execution_price_vector[current_index])
+            drawdown_pct = 0.0
+            if peak_equity > 0.0:
+                drawdown_pct = max((peak_equity - current_equity) / peak_equity, 0.0)
+            proposal = derive_action_proposal(
+                instrument=str(episode_ref["source_rel"]),
+                timestamp_utc=decision_timestamp,
+                current_exposure=current_exposure,
+                action_raw=action,
+                mid_price=mid_price,
+            )
+            portfolio_state = PortfolioRiskState(
+                state_timestamp_utc=decision_timestamp,
+                equity=float(current_equity),
+                gross_exposure=abs(float(current_exposure)),
+                net_exposure=float(current_exposure),
+                current_leverage=abs(float(current_exposure)),
+                instrument_exposure=float(current_exposure),
+                drawdown_pct=float(drawdown_pct),
+            )
+            market_snapshot = MarketSnapshot(
+                snapshot_timestamp_utc=decision_timestamp,
+                instrument=str(episode_ref["source_rel"]),
+                mid_price=mid_price,
+                tradable=True,
+            )
+            risk_decision = risk_overlay_session.evaluate(
+                RiskOverlayInput(
+                    decision_timestamp_utc=decision_timestamp,
+                    contract_version=RISK_OVERLAY_CONTRACT_VERSION,
+                    agent_action_proposal=proposal,
+                    portfolio_state=portfolio_state,
+                    market_snapshot=market_snapshot,
+                    risk_state=risk_overlay_session.state,
+                    risk_config=risk_overlay_session.config,
+                ),
+                record_context={
+                    "evaluation_episode_index": int(episode_index),
+                    "episode_scope": episode_ref["scope"],
+                    "episode_partition": episode_ref["partition"],
+                    "episode_source_rel": episode_ref["source_rel"],
+                    "episode_fold_id": episode_ref["fold_id"],
+                    "step_ordinal": int(step_counter),
+                    "step_index": current_index,
+                    "timestamp": decision_timestamp,
+                },
+            )
+            action = int(risk_decision.approved_action["action_raw"])
         try:
             observation, reward, terminated, truncated, info = env_client.step(action)
         except Exception as exc:  # noqa: BLE001
@@ -1888,6 +2138,27 @@ def _evaluate_single_episode(
             "termination_reason": info_dict.get("termination_reason"),
             "truncation_reason": info_dict.get("truncation_reason"),
         }
+        if risk_decision is not None:
+            record.update(
+                {
+                    "risk_decision_type": risk_decision.decision_type,
+                    "risk_decision_status": risk_decision.status,
+                    "risk_reason_codes": list(risk_decision.reason_codes),
+                    "risk_only_close_allowed": bool(risk_decision.only_close_allowed),
+                    "risk_kill_active": bool(risk_decision.kill_active),
+                    "risk_mode_after": risk_decision.risk_state_after.mode,
+                    "risk_approved_action_raw": int(risk_decision.approved_action["action_raw"]),
+                    "risk_approved_action_semantic": str(risk_decision.approved_action["action_semantic"]),
+                    "risk_approved_target_exposure": float(risk_decision.approved_target_exposure),
+                    "risk_approved_leverage": float(risk_decision.approved_leverage),
+                    "risk_state_transition": (
+                        risk_decision.state_transition["to_mode"] if risk_decision.state_transition is not None else None
+                    ),
+                    "risk_state_transition_reason": (
+                        risk_decision.state_transition["reason_code"] if risk_decision.state_transition is not None else None
+                    ),
+                }
+            )
         step_records.append(record)
 
         if position_before == 0 and position_after in {-1, 1} and trade_units > 0:
@@ -1911,6 +2182,9 @@ def _evaluate_single_episode(
             closed_trade_proxy_returns.append(net_pnl / entry_price_exec if entry_price_exec > 0.0 else math.nan)
             position_open = None
 
+        current_exposure = int(position_after)
+        current_equity = float(info_dict["portfolio_value"])
+        peak_equity = max(float(peak_equity), float(current_equity))
         step_counter += 1
         if terminated or truncated:
             break
@@ -2346,6 +2620,7 @@ def _write_core_reports(
     manifest_payload: dict[str, Any] | None,
     backtest_payload: dict[str, Any] | None,
     report_paths: ReportPaths,
+    risk_overlay_bundle: RiskOverlayReportBundle | None = None,
 ) -> None:
     """Atomically write the core JSON reports."""
 
@@ -2354,6 +2629,8 @@ def _write_core_reports(
         atomic_write_json(manifest_payload, report_paths.manifest_path)
     if backtest_payload is not None:
         atomic_write_json(backtest_payload, report_paths.backtest_report_path)
+    if risk_overlay_bundle is not None:
+        write_risk_overlay_artifacts(risk_overlay_bundle, output_dir=report_paths.backtest_report_path.parent)
 
 
 def _write_reports_with_trace(
@@ -2364,6 +2641,7 @@ def _write_reports_with_trace(
     report_paths: ReportPaths,
     step_rows: Sequence[Mapping[str, Any]],
     write_step_trace: bool,
+    risk_overlay_bundle: RiskOverlayReportBundle | None = None,
 ) -> bool:
     """Write reports and the optional parquet trace."""
 
@@ -2376,6 +2654,7 @@ def _write_reports_with_trace(
             manifest_payload=manifest_payload,
             backtest_payload=backtest_payload,
             report_paths=report_paths,
+            risk_overlay_bundle=risk_overlay_bundle,
         )
         return True
     except RuntimeError as exc:
@@ -2486,6 +2765,8 @@ def _build_validation_payload(
     state_manifest_hash: str | None,
     episode_catalog_hash: str | None,
     split_report_hash: str | None,
+    risk_overlay_enabled: bool,
+    risk_overlay_config_hash: str | None,
     validation_checks: Sequence[dict[str, Any]],
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
@@ -2508,6 +2789,8 @@ def _build_validation_payload(
         "state_manifest_hash": state_manifest_hash,
         "episode_catalog_hash": episode_catalog_hash,
         "split_report_hash": split_report_hash,
+        "risk_overlay_enabled": bool(risk_overlay_enabled),
+        "risk_overlay_config_hash": risk_overlay_config_hash,
         "validation_checks": list(validation_checks),
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
@@ -2546,6 +2829,7 @@ def _build_manifest_payload(
     split_report_hash: str | None,
     output_dir: Path,
     warnings: Sequence[ValidationIssue],
+    risk_overlay_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     """Build evaluation manifest payload."""
 
@@ -2605,6 +2889,7 @@ def _build_manifest_payload(
         "state_manifest_hash": state_manifest_hash,
         "episode_catalog_hash": episode_catalog_hash,
         "split_report_hash": split_report_hash,
+        "risk_overlay": dict(risk_overlay_metadata),
         "output_dir": str(output_dir),
         "generated_at": _generated_at(),
     }
@@ -2627,6 +2912,7 @@ def _build_backtest_payload(
     relative_metrics: dict[str, Any] | None,
     metric_status: dict[str, Any],
     trace_artifact_path: str | None,
+    risk_overlay: dict[str, Any],
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
 ) -> dict[str, Any]:
@@ -2648,6 +2934,7 @@ def _build_backtest_payload(
         "relative_metrics": relative_metrics,
         "metric_status": metric_status,
         "trace_artifact_path": trace_artifact_path,
+        "risk_overlay": dict(risk_overlay),
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
         "failure_codes": _failure_codes(errors),
