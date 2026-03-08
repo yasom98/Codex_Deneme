@@ -1,0 +1,29 @@
+{
+  "algorithm": "ppo",
+  "seed": 42,
+  "deterministic": true,
+  "device": "cpu",
+  "evaluation_mode": "episodic_eval_backtest",
+  "target_mode": "explicit_partition",
+  "target_partition": "validation",
+  "target_fold_id": null,
+  "target_episode_refs": null,
+  "benchmark_mode": "buy_and_hold",
+  "startup_policy": "fresh_only",
+  "max_eval_episodes": 3,
+  "max_eval_steps": 4096,
+  "write_step_trace": false,
+  "backtest_metrics": [
+    "total_return",
+    "annualized_return",
+    "annualized_volatility",
+    "sharpe_ratio",
+    "max_drawdown",
+    "calmar_ratio",
+    "num_steps",
+    "num_trades",
+    "win_rate",
+    "avg_trade_return",
+    "final_equity"
+  ]
+}
