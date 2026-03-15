@@ -2,6 +2,31 @@
 
 WSL + Codex ile geliştiriliyor.
 
+## Canonical GitHub + Drive + Colab Workflow
+
+Bu repo icin canonical isletim modeli sudur:
+
+- GitHub = code / config / docs / tests / spec source of truth
+- Google Drive = agir training/evaluation girdileri ve run artifact source of truth
+- Colab = disposable execution environment
+- Colab her zaman full repo clone yapar
+- Agir dosyalar GitHub'a tekrar tekrar tasinmaz
+- `tgz` ancak opsiyonel snapshot/arsiv yoludur; gunluk workflow degildir
+
+Operator-facing canonical dokumanlar:
+
+- `docs/github_drive_colab_workflow.md`
+- `docs/repo_audit_report.md`
+- `Drive_Egitim_Dosyalari/README.md`
+- `docs/operations/colab_first_real_ppo_training.md`
+
+Root seviyesindeki asagidaki agir CSV'ler canonical repo asset'i degildir:
+
+- `BTC_USDT_15m_price_data.csv`
+- `BTC_USDT_5m_price_data.csv`
+
+Bu dosyalar bu passtta silinmeyecek, ancak `legacy tracked migration debt` olarak degerlendirilmelidir. Yeni agir data/artifact dosyalari GitHub'a eklenmemelidir.
+
 ## 4.7 Training Config Examples
 
 - `configs/training_config.launch_smoke.example.json`: bounded launch validation icin kucuk smoke baslangic config'i.

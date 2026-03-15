@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import runpy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,3 +203,52 @@ def test_cli_accepts_optional_risk_overlay_config(monkeypatch: pytest.MonkeyPatc
     assert (output_dir / "risk_decision_log.jsonl").exists()
     assert (output_dir / "risk_overlay_summary.json").exists()
     assert (output_dir / "risk_state_transition_log.jsonl").exists()
+
+
+def test_cli_passes_progress_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    run_id = "evaluate_policy_cli_progress_mode"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(tmp_path, run_id)
+    output_dir = tmp_path / "cli_eval_progress_mode_out"
+    captured: dict[str, object] = {}
+
+    main = _load_main()
+
+    def _fake_execute(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(exit_code=0, reports_written=True)
+
+    monkeypatch.setitem(main.__globals__, "execute_evaluation_backtest", _fake_execute)
+    monkeypatch.setattr(
+        main.__globals__["sys"],
+        "argv",
+        [
+            "evaluate_policy.py",
+            "--run-id",
+            run_id,
+            "--model-artifact",
+            str(seeded["model_artifact_path"]),
+            "--env-config",
+            str(seeded["env_config_path"]),
+            "--eval-config",
+            str(eval_config_path),
+            "--state-manifest",
+            str(seeded["state_manifest_path"]),
+            "--env-contract-report",
+            str(seeded["env_contract_report_path"]),
+            "--readiness-report",
+            str(seeded["readiness_report_path"]),
+            "--episode-catalog",
+            str(seeded["episode_catalog_path"]),
+            "--split-report",
+            str(seeded["split_report_path"]),
+            "--output-dir",
+            str(output_dir),
+            "--progress-mode",
+            "text",
+        ],
+    )
+
+    exit_code = int(main())
+    assert exit_code == 0
+    assert captured["progress_mode"] == "text"

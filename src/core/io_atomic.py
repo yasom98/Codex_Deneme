@@ -42,3 +42,16 @@ def atomic_write_json(payload: dict[str, Any], dest: Path) -> None:
             tmp.unlink()
         raise RuntimeError(f"Failed to atomically write json: {dest}") from exc
 
+
+def atomic_write_text(payload: str, dest: Path, *, encoding: str = "utf-8") -> None:
+    """Atomically write text payload to a destination path."""
+    tmp = _tmp_path(dest)
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        tmp.write_text(payload, encoding=encoding)
+        os.replace(tmp, dest)
+    except Exception as exc:
+        if tmp.exists():
+            tmp.unlink()
+        raise RuntimeError(f"Failed to atomically write text: {dest}") from exc

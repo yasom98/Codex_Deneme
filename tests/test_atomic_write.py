@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from core.config import PipelineConfig
-from core.io_atomic import atomic_write_parquet
+from core.io_atomic import atomic_write_parquet, atomic_write_text
 from data.standardize import standardize_file
 
 
@@ -42,6 +42,24 @@ def test_atomic_write_parquet_cleans_tmp_on_failure(monkeypatch: object, tmp_pat
 
     with pytest.raises(RuntimeError, match="Failed to atomically write parquet"):
         atomic_write_parquet(df, dest)
+
+    assert not dest.exists()
+    assert not tmp_dest.exists()
+
+
+def test_atomic_write_text_cleans_tmp_on_failure(monkeypatch: object, tmp_path: Path) -> None:
+    dest = tmp_path / "broken.txt"
+    tmp_dest = dest.with_suffix(".txt.tmp")
+
+    def fake_write_text(self: Path, data: str, encoding: str = "utf-8") -> int:
+        del encoding
+        Path(self).write_bytes(data.encode("utf-8"))
+        raise OSError("simulated text failure")
+
+    monkeypatch.setattr(Path, "write_text", fake_write_text)
+
+    with pytest.raises(RuntimeError, match="Failed to atomically write text"):
+        atomic_write_text("partial", dest)
 
     assert not dest.exists()
     assert not tmp_dest.exists()

@@ -30,6 +30,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-catalog", type=Path, required=True, help="Explicit episode catalog JSON path.")
     parser.add_argument("--split-report", type=Path, required=True, help="Explicit split validation report JSON path.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Fresh output dir for canonical artifact production.")
+    parser.add_argument(
+        "--progress-mode",
+        type=str,
+        default="off",
+        choices=("off", "auto", "notebook", "text"),
+        help="Optional live progress mode. Use auto in Colab for notebook-safe tqdm behavior.",
+    )
+    parser.add_argument(
+        "--enable-amp",
+        action="store_true",
+        help="Request AMP for artifact production. The path fails closed if AMP is unsupported.",
+    )
+    parser.add_argument(
+        "--enable-torch-compile",
+        action="store_true",
+        help="Request torch.compile for artifact production. The path fails closed if compile is unsupported.",
+    )
+    parser.add_argument(
+        "--memory-log-interval-steps",
+        type=int,
+        default=0,
+        help="Optional training memory log cadence in timesteps. Zero disables periodic memory logs.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
     return parser.parse_args()
 
@@ -51,6 +74,10 @@ def main() -> int:
             episode_catalog_path=args.episode_catalog.resolve(),
             split_report_path=args.split_report.resolve(),
             output_dir=args.output_dir.resolve(),
+            progress_mode=args.progress_mode,
+            enable_amp=bool(args.enable_amp),
+            enable_torch_compile=bool(args.enable_torch_compile),
+            memory_log_interval_steps=int(args.memory_log_interval_steps),
         )
         LOGGER.info(
             "Canonical PPO artifact production summary | run_id=%s exit_code=%d reports_written=%s output_dir=%s",

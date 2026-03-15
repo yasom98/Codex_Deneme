@@ -79,11 +79,14 @@ def test_single_path_success_writes_reports_and_proxy_metric(monkeypatch: pytest
     assert result.report_paths.backtest_report_path.exists()
     assert result.report_paths.step_trace_path.exists()
 
+    validation = json.loads(result.report_paths.validation_report_path.read_text(encoding="utf-8"))
     backtest = json.loads(result.report_paths.backtest_report_path.read_text(encoding="utf-8"))
     assert backtest["evaluation_success"] is True
     assert backtest["strategy_metrics"]["num_trades"] == 1
     assert backtest["benchmark_metrics"] is not None
     assert backtest["relative_metrics"] is not None
+    assert validation["runtime"]["progress"]["active_mode"] == "disabled"
+    assert backtest["runtime"]["execution_bounds"]["max_eval_episodes"] == 1
     assert backtest["metric_status"]["strategy"]["avg_trade_return"]["detail"]["metric_policy"] == "narrow_v1_proxy"
     assert [item["phase"] for item in backtest["startup_phase_trace"]] == [
         "validation",
@@ -355,6 +358,48 @@ def test_risk_overlay_writes_minimal_artifacts_and_additive_report_surface(
     assert backtest["risk_overlay"]["enabled"] is True
     assert summary["overlay_enabled"] is True
     assert summary["decision_counts"]["ALLOW"] >= 1
+
+
+def test_text_progress_mode_records_text_tqdm_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "eval_text_progress_runtime"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(
+        tmp_path,
+        run_id,
+        overrides={
+            "evaluation_mode": "episodic_eval_backtest",
+            "target_mode": "explicit_partition",
+            "target_partition": "validation",
+            "target_episode_refs": None,
+            "max_eval_episodes": 2,
+        },
+    )
+
+    monkeypatch.setattr(
+        "rl.evaluation_backtest._load_ppo_model",
+        lambda model_artifact_path, device: FakePredictModel(actions=[1, 0, 3, 0]),
+    )
+
+    result = execute_evaluation_backtest(
+        run_id=run_id,
+        model_artifact_path=seeded["model_artifact_path"],
+        env_config_path=seeded["env_config_path"],
+        eval_config_path=eval_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "eval_text_progress_out",
+        progress_mode="text",
+    )
+
+    assert result.exit_code == 0
+    assert result.validation_payload["runtime"]["progress"]["active_mode"] == "text_tqdm"
+    assert result.backtest_payload["runtime"]["progress"]["requested_mode"] == "text"
 
 
 def test_risk_overlay_drawdown_state_machine_clamps_short_under_freeze_entries(

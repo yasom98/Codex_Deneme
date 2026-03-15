@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from data.feature_health import FeatureHealthReport, evaluate_feature_health
 from data.features import (
     AlphaTrendConfig,
     FeatureBuildConfig,
@@ -91,3 +92,55 @@ def test_body_ratio_zero_range_candle_is_zero_after_warmup() -> None:
     )
     assert float(out.loc[nearby_index, "hl_range"]) > 0.0
     assert np.isclose(float(out.loc[nearby_index, "body_ratio"]), expected_body_ratio)
+
+
+def test_alphatrend_warmup_metadata_exempts_expected_nan_window() -> None:
+    cfg = _config()
+    artifacts = build_feature_artifacts(_sample_ohlcv(rows=300), cfg)
+    report = FeatureHealthReport(input_file="sample.parquet")
+
+    evaluate_feature_health(
+        report=report,
+        feature_df=artifacts.frame,
+        raw_events=artifacts.raw_events,
+        shifted_events=artifacts.shifted_events,
+        warn_ratio=cfg.health.warn_ratio,
+        critical_warn_ratio=cfg.health.critical_warn_ratio,
+        critical_columns=cfg.health.critical_columns,
+        pivot_warmup_policy=cfg.pivot.warmup_policy,
+        pivot_first_session_fill=cfg.pivot.first_session_fill,
+        indicator_parity_status=artifacts.indicator_parity_status,
+        indicator_parity_details=artifacts.indicator_parity_details,
+        indicator_validation_status=artifacts.indicator_validation_status,
+        indicator_validation_details=artifacts.indicator_validation_details,
+        formula_fingerprints=artifacts.formula_fingerprints,
+        formula_fingerprint_bundle=artifacts.formula_fingerprint_bundle,
+        strict_parity=True,
+        continuous_feature_columns=artifacts.continuous_feature_columns,
+        flag_feature_columns=artifacts.flag_feature_columns,
+        warmup_rows_by_column=artifacts.warmup_rows_by_column,
+        raw_regime_flags=artifacts.raw_regime_flags,
+        shifted_regime_flags=artifacts.shifted_regime_flags,
+    )
+
+    assert artifacts.warmup_rows_by_column["AlphaTrend"] == 10
+    assert artifacts.warmup_rows_by_column["AlphaTrend_2"] == 12
+    assert report.nan_ratios["AlphaTrend"] > cfg.health.warn_ratio
+    assert report.nan_ratios["AlphaTrend_2"] > cfg.health.warn_ratio
+    assert report.nan_ratio_ok is True
+    assert report.status == "success"
+    assert not any(
+        error.code == "NAN_RATIO_TOO_HIGH" and error.context.get("column") in {"AlphaTrend", "AlphaTrend_2"}
+        for error in report.errors
+    )
+
+
+def test_feature_artifact_path_canonicalizes_timestamp_precision_to_ns() -> None:
+    df = _sample_ohlcv(rows=300)
+    df["timestamp"] = df["timestamp"].astype("datetime64[us, UTC]")
+
+    assert str(df["timestamp"].dtype) == "datetime64[us, UTC]"
+
+    artifacts = build_feature_artifacts(df, _config())
+
+    assert str(artifacts.frame["timestamp"].dtype) == "datetime64[ns, UTC]"

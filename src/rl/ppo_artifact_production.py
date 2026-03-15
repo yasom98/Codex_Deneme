@@ -12,6 +12,18 @@ import zipfile
 
 from core.io_atomic import atomic_write_json
 from core.logging import get_logger
+from rl.colab_staging_closure import (
+    CLOSURE_REPORT_FILENAME,
+    RUNTIME_DEPENDENCY_REPORT_FILENAME,
+    find_stage_root_for_inputs,
+    validate_existing_stage,
+)
+from rl.colab_runtime import (
+    capture_memory_snapshot,
+    collect_runtime_environment,
+    ensure_model_parameters_finite,
+    numpy_fail_fast_context,
+)
 from rl.env_adapter_gym import TradingEnvGym
 from rl.evaluation_backtest import (
     EVAL_RUN_ID_MISMATCH,
@@ -61,6 +73,7 @@ from rl.training_launcher import (
     _validate_readiness_report as _validate_readiness_report_upstream,
     _validate_state_manifest as _validate_state_manifest_upstream,
 )
+from rl.notebook_progress import build_training_progress_callback, log_progress_mode, resolve_progress_mode
 
 LOGGER = get_logger(__name__)
 
@@ -87,6 +100,12 @@ ARTIFACT_PRODUCTION_ARTIFACT_MISSING = "ARTIFACT_PRODUCTION_ARTIFACT_MISSING"
 ARTIFACT_PRODUCTION_ARTIFACT_INVALID = "ARTIFACT_PRODUCTION_ARTIFACT_INVALID"
 ARTIFACT_PRODUCTION_LOAD_BACK_FAILED = "ARTIFACT_PRODUCTION_LOAD_BACK_FAILED"
 ARTIFACT_PRODUCTION_REPORT_WRITE_FAILED = "ARTIFACT_PRODUCTION_REPORT_WRITE_FAILED"
+ARTIFACT_PRODUCTION_AMP_UNSUPPORTED = "ARTIFACT_PRODUCTION_AMP_UNSUPPORTED"
+ARTIFACT_PRODUCTION_COMPILE_UNSUPPORTED = "ARTIFACT_PRODUCTION_COMPILE_UNSUPPORTED"
+ARTIFACT_PRODUCTION_NUMERIC_INVALID = "ARTIFACT_PRODUCTION_NUMERIC_INVALID"
+ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED = "ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED"
+ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID = "ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID"
+ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED = "ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED"
 
 PRODUCTION_CONFIG_REQUIRED_FIELDS = (
     "algorithm",
@@ -154,12 +173,18 @@ def execute_ppo_artifact_production(
     episode_catalog_path: Path,
     split_report_path: Path,
     output_dir: Path,
+    progress_mode: str = "off",
+    enable_amp: bool = False,
+    enable_torch_compile: bool = False,
+    memory_log_interval_steps: int = 0,
 ) -> ArtifactProductionExecutionResult:
     """Produce one canonical, load-validated SB3 PPO artifact from explicit inputs."""
 
     normalized_run_id = run_id.strip()
     if not normalized_run_id:
         raise ValueError("run_id must be non-empty")
+    if int(memory_log_interval_steps) < 0:
+        raise ValueError("memory_log_interval_steps must be >= 0")
 
     output_dir_resolved = output_dir.resolve()
     report_paths = ReportPaths(
@@ -256,6 +281,26 @@ def execute_ppo_artifact_production(
 
     output_dir_resolved.mkdir(parents=True, exist_ok=False)
 
+    runtime_environment = collect_runtime_environment()
+    progress_resolution = resolve_progress_mode(progress_mode)
+    log_progress_mode(logger=LOGGER, resolution=progress_resolution, scope="artifact_production")
+    LOGGER.info(
+        "Artifact production start | run_id=%s output_dir=%s",
+        normalized_run_id,
+        output_dir_resolved,
+    )
+    LOGGER.info(
+        "Artifact runtime summary | run_id=%s gpu_name=%s cuda_available=%s gpu_total_memory_gib=%s system_ram_gib=%s torch_version=%s torch_compile_supported=%s",
+        normalized_run_id,
+        runtime_environment.gpu_name,
+        runtime_environment.cuda_available,
+        runtime_environment.gpu_total_memory_gib,
+        runtime_environment.system_ram_gib,
+        runtime_environment.torch_version,
+        runtime_environment.torch_compile_supported,
+    )
+    memory_snapshots: list[dict[str, Any]] = [capture_memory_snapshot(label="startup", step=0)]
+
     loaded_inputs, load_issues = _load_json_inputs(
         env_config_path=env_config_path.resolve(),
         training_config_path=training_config_path.resolve(),
@@ -276,6 +321,16 @@ def execute_ppo_artifact_production(
     readiness_hash = _semantic_hash_optional(loaded_inputs.get("readiness_report"))
     episode_catalog_hash = _semantic_hash_optional(loaded_inputs.get("episode_catalog"))
     split_report_hash = _semantic_hash_optional(loaded_inputs.get("split_report"))
+    stage_preflight = _resolve_colab_stage_preflight(
+        env_config_path=env_config_path.resolve(),
+        training_config_path=training_config_path.resolve(),
+        state_manifest_path=state_manifest_path.resolve(),
+        env_contract_report_path=env_contract_report_path.resolve(),
+        readiness_report_path=readiness_report_path.resolve(),
+        episode_catalog_path=episode_catalog_path.resolve(),
+        split_report_path=split_report_path.resolve(),
+    )
+    errors.extend(stage_preflight["issues"])
 
     config_result = _validate_artifact_production_config(loaded_inputs.get("training_config"))
     production_config = config_result["config"]
@@ -300,8 +355,31 @@ def execute_ppo_artifact_production(
         loaded_inputs.get("training_config"), "episode_selection_mode"
     )
 
+    optimization_runtime, optimization_issues = _validate_optional_optimizations(
+        enable_amp=bool(enable_amp),
+        enable_torch_compile=bool(enable_torch_compile),
+        runtime_environment=runtime_environment,
+    )
+    errors.extend(optimization_issues)
+
     resolved_device, device_issues, dependency_probe = _resolve_device(requested_device)
     errors.extend(_normalize_issues(device_issues))
+
+    def _runtime_payload(numeric_safety: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _build_runtime_payload(
+            runtime_environment=runtime_environment,
+            progress_resolution=progress_resolution,
+            requested_device=requested_device,
+            resolved_device=resolved_device,
+            enable_amp=bool(enable_amp),
+            enable_torch_compile=bool(enable_torch_compile),
+            optimization_runtime=optimization_runtime,
+            memory_log_interval_steps=int(memory_log_interval_steps),
+            memory_snapshots=memory_snapshots,
+            numeric_safety=numeric_safety,
+            n_envs=1,
+            stage_preflight=stage_preflight,
+        )
 
     env_config_result = _validate_env_config_upstream(
         env_config_payload=loaded_inputs.get("env_config"),
@@ -346,6 +424,7 @@ def execute_ppo_artifact_production(
         load_issues=load_issues,
         config_present=production_config is not None,
         errors=errors,
+        stage_preflight=stage_preflight,
     )
 
     manifest_payload = _build_manifest_payload(
@@ -413,6 +492,7 @@ def execute_ppo_artifact_production(
             ),
             production_summary={
                 "dependency_probe": dependency_probe,
+                "colab_stage_preflight": stage_preflight["validation"],
                 "selected_episode_ref": dict(selected_episode.episode_ref) if selected_episode is not None else None,
                 "selection_evidence": asdict(selected_episode) if selected_episode is not None else None,
                 "startup_seed_metadata": None,
@@ -431,6 +511,7 @@ def execute_ppo_artifact_production(
                     split_report_hash=split_report_hash,
                 ),
             },
+            runtime=_runtime_payload(),
             warnings=warnings,
             errors=errors,
         )
@@ -463,6 +544,7 @@ def execute_ppo_artifact_production(
             "selected_episode_ref": dict(selected_episode.episode_ref),
             "selection_evidence": asdict(selected_episode),
             "dependency_probe": dependency_probe,
+            "colab_stage_preflight": stage_preflight["validation"],
         },
         "env_init": {},
         "algo_init": {},
@@ -476,6 +558,7 @@ def execute_ppo_artifact_production(
     startup_seed_metadata = _set_global_seed(production_config.seed)
     env_client: Any | None = None
     model: Any | None = None
+    numeric_safety_metadata: dict[str, Any] | None = None
     save_state = {
         "save_succeeded": False,
         "artifact_exists": False,
@@ -486,18 +569,21 @@ def execute_ppo_artifact_production(
     }
 
     try:
+        LOGGER.info("Env init start | run_id=%s episode_ref=%s", normalized_run_id, dict(selected_episode.episode_ref))
         effective_env_config = _effective_env_config(
             env_config=env_config,
             seed=production_config.seed,
             episode_ref=dict(selected_episode.episode_ref),
         )
         env_client = TradingEnvGym(config=effective_env_config, validate_on_init=True)
+        memory_snapshots.append(capture_memory_snapshot(label="env_init", step=0))
         phase_status["env_init"] = "completed"
         phase_detail["env_init"] = {
             "env_class": type(env_client).__name__,
             "selected_episode_ref": dict(selected_episode.episode_ref),
             "effective_env_seed": production_config.seed,
         }
+        LOGGER.info("Env init finished | run_id=%s env_class=%s", normalized_run_id, type(env_client).__name__)
     except Exception as exc:  # noqa: BLE001
         phase_status["env_init"] = "failed"
         phase_detail["env_init"] = {"error": str(exc)}
@@ -522,6 +608,7 @@ def execute_ppo_artifact_production(
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             production_summary={
                 "dependency_probe": dependency_probe,
+                "colab_stage_preflight": stage_preflight["validation"],
                 "selected_episode_ref": dict(selected_episode.episode_ref),
                 "selection_evidence": asdict(selected_episode),
                 "startup_seed_metadata": startup_seed_metadata,
@@ -540,6 +627,7 @@ def execute_ppo_artifact_production(
                     split_report_hash=split_report_hash,
                 ),
             },
+            runtime=_runtime_payload(numeric_safety_metadata),
             warnings=warnings,
             errors=[
                 ValidationIssue(
@@ -559,6 +647,7 @@ def execute_ppo_artifact_production(
         )
 
     try:
+        LOGGER.info("Algo init start | run_id=%s policy=%s", normalized_run_id, production_config.policy)
         ppo_class = _import_ppo_class()
         model = ppo_class(
             production_config.policy,
@@ -568,12 +657,14 @@ def execute_ppo_artifact_production(
             verbose=0,
             **production_config.algo_params.to_sb3_kwargs(),
         )
+        memory_snapshots.append(capture_memory_snapshot(label="algo_init", step=0))
         phase_status["algo_init"] = "completed"
         phase_detail["algo_init"] = {
             "algo_class": getattr(ppo_class, "__name__", str(ppo_class)),
             "policy": production_config.policy,
             "device": resolved_device,
         }
+        LOGGER.info("Algo init finished | run_id=%s algo_class=%s", normalized_run_id, getattr(ppo_class, "__name__", str(ppo_class)))
     except Exception as exc:  # noqa: BLE001
         phase_status["algo_init"] = "failed"
         phase_detail["algo_init"] = {"error": str(exc)}
@@ -600,6 +691,7 @@ def execute_ppo_artifact_production(
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             production_summary={
                 "dependency_probe": dependency_probe,
+                "colab_stage_preflight": stage_preflight["validation"],
                 "selected_episode_ref": dict(selected_episode.episode_ref),
                 "selection_evidence": asdict(selected_episode),
                 "startup_seed_metadata": startup_seed_metadata,
@@ -618,6 +710,7 @@ def execute_ppo_artifact_production(
                     split_report_hash=split_report_hash,
                 ),
             },
+            runtime=_runtime_payload(numeric_safety_metadata),
             warnings=warnings,
             errors=[
                 ValidationIssue(
@@ -637,19 +730,59 @@ def execute_ppo_artifact_production(
         )
 
     try:
+        LOGGER.info(
+            "Learn start | run_id=%s total_timesteps=%d resolved_device=%s",
+            normalized_run_id,
+            int(production_config.total_timesteps),
+            resolved_device,
+        )
         phase_status["learn_start"] = "completed"
-        phase_detail["learn_start"] = {"total_timesteps": int(production_config.total_timesteps)}
+        phase_detail["learn_start"] = {
+            "total_timesteps": int(production_config.total_timesteps),
+            "progress_mode": progress_resolution.active_mode,
+        }
         assert model is not None
-        model.learn(total_timesteps=int(production_config.total_timesteps))
+        progress_callback = build_training_progress_callback(
+            resolution=progress_resolution,
+            total_timesteps=int(production_config.total_timesteps),
+            run_id=normalized_run_id,
+            resolved_device=resolved_device,
+            logger=LOGGER,
+            memory_log_interval_steps=int(memory_log_interval_steps),
+            memory_snapshots=memory_snapshots,
+        )
+        with numpy_fail_fast_context() as numeric_safety_metadata:
+            learn_kwargs: dict[str, Any] = {"total_timesteps": int(production_config.total_timesteps)}
+            if progress_callback is not None:
+                learn_kwargs["callback"] = progress_callback
+            model.learn(**learn_kwargs)
+            ensure_model_parameters_finite(model)
+        memory_snapshots.append(
+            capture_memory_snapshot(
+                label="learn_finish",
+                step=int(getattr(model, "num_timesteps", production_config.total_timesteps)),
+            )
+        )
         phase_status["learn_finish"] = "completed"
         phase_detail["learn_finish"] = {
             "num_timesteps": int(getattr(model, "num_timesteps", production_config.total_timesteps)),
         }
+        LOGGER.info(
+            "Learn finished | run_id=%s num_timesteps=%d",
+            normalized_run_id,
+            int(getattr(model, "num_timesteps", production_config.total_timesteps)),
+        )
     except Exception as exc:  # noqa: BLE001
         phase_status["learn_finish"] = "failed"
         phase_detail["learn_finish"] = {"error": str(exc)}
         if env_client is not None:
             env_client.close()
+        issue_code = ARTIFACT_PRODUCTION_NUMERIC_INVALID if _looks_like_numeric_failure(exc) else ARTIFACT_PRODUCTION_TRAIN_FAILED
+        issue_message = (
+            "Non-finite numeric state detected during canonical artifact production."
+            if issue_code == ARTIFACT_PRODUCTION_NUMERIC_INVALID
+            else "PPO learn() failed during canonical artifact production."
+        )
         report_payload = _build_report_payload(
             run_id=normalized_run_id,
             production_session_id=production_session_id,
@@ -671,6 +804,7 @@ def execute_ppo_artifact_production(
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             production_summary={
                 "dependency_probe": dependency_probe,
+                "colab_stage_preflight": stage_preflight["validation"],
                 "selected_episode_ref": dict(selected_episode.episode_ref),
                 "selection_evidence": asdict(selected_episode),
                 "startup_seed_metadata": startup_seed_metadata,
@@ -689,11 +823,12 @@ def execute_ppo_artifact_production(
                     split_report_hash=split_report_hash,
                 ),
             },
+            runtime=_runtime_payload(numeric_safety_metadata),
             warnings=warnings,
             errors=[
                 ValidationIssue(
-                    code=ARTIFACT_PRODUCTION_TRAIN_FAILED,
-                    message="PPO learn() failed during canonical artifact production.",
+                    code=issue_code,
+                    message=issue_message,
                     context={"error": str(exc)},
                 )
             ],
@@ -712,18 +847,31 @@ def execute_ppo_artifact_production(
 
     artifact_issues: list[ValidationIssue] = []
     try:
-        phase_status["artifact_save"] = "completed"
-        phase_detail["artifact_save"] = {"artifact_path": str(report_paths.artifact_path)}
+        LOGGER.info("Artifact save start | run_id=%s artifact_path=%s", normalized_run_id, report_paths.artifact_path)
         save_state = _save_and_validate_model_artifact(
             model=model,
             artifact_path=report_paths.artifact_path,
             resolved_device=resolved_device,
         )
+        memory_snapshots.append(
+            capture_memory_snapshot(
+                label="artifact_save",
+                step=int(getattr(model, "num_timesteps", production_config.total_timesteps)),
+            )
+        )
+        phase_status["artifact_save"] = "completed"
+        phase_detail["artifact_save"] = {"artifact_path": str(report_paths.artifact_path)}
         phase_status["artifact_load"] = "completed"
         phase_detail["artifact_load"] = {
             "artifact_path": str(report_paths.artifact_path),
             "load_back_model_class": save_state["load_back_model_class"],
         }
+        LOGGER.info(
+            "Artifact save finished | run_id=%s artifact_path=%s load_back_model_class=%s",
+            normalized_run_id,
+            report_paths.artifact_path,
+            save_state["load_back_model_class"],
+        )
     except ControlledArtifactProductionFailure as exc:
         artifact_issues.append(exc.issue)
         if phase_status["artifact_save"] == "completed":
@@ -800,6 +948,7 @@ def execute_ppo_artifact_production(
         startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
         production_summary={
             "dependency_probe": dependency_probe,
+            "colab_stage_preflight": stage_preflight["validation"],
             "selected_episode_ref": dict(selected_episode.episode_ref),
             "selection_evidence": asdict(selected_episode),
             "startup_seed_metadata": startup_seed_metadata,
@@ -818,6 +967,7 @@ def execute_ppo_artifact_production(
                 split_report_hash=split_report_hash,
             ),
         },
+        runtime=_runtime_payload(numeric_safety_metadata),
         warnings=warnings,
         errors=artifact_issues,
     )
@@ -853,6 +1003,7 @@ def execute_ppo_artifact_production(
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             production_summary={
                 "dependency_probe": dependency_probe,
+                "colab_stage_preflight": stage_preflight["validation"],
                 "selected_episode_ref": dict(selected_episode.episode_ref),
                 "selection_evidence": asdict(selected_episode),
                 "startup_seed_metadata": startup_seed_metadata,
@@ -871,6 +1022,7 @@ def execute_ppo_artifact_production(
                     split_report_hash=split_report_hash,
                 ),
             },
+            runtime=_runtime_payload(numeric_safety_metadata),
             warnings=warnings,
             errors=[report_issue],
         )
@@ -1281,6 +1433,7 @@ def _build_validation_checks(
     load_issues: Sequence[ValidationIssue],
     config_present: bool,
     errors: Sequence[ValidationIssue],
+    stage_preflight: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Build stable validation checks for the artifact production report."""
 
@@ -1318,6 +1471,40 @@ def _build_validation_checks(
             passed=config_present,
             reason_code=ARTIFACT_PRODUCTION_CONFIG_INVALID if not config_present else None,
             detail={},
+        )
+    )
+    stage_detected = bool(stage_preflight.get("detected", False))
+    stage_validation = stage_preflight.get("validation")
+    checks.append(
+        _validation_check(
+            check_name="colab_stage_preflight_detected",
+            passed=True,
+            reason_code=None,
+            detail={
+                "detected": stage_detected,
+                "staging_root": stage_preflight.get("staging_root"),
+                "closure_report_path": stage_preflight.get("closure_report_path"),
+                "runtime_dependency_report_path": stage_preflight.get("runtime_dependency_report_path"),
+            },
+        )
+    )
+    checks.append(
+        _validation_check(
+            check_name="colab_stage_closure_valid",
+            passed=not any(
+                issue.code in {ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED, ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID}
+                for issue in errors
+            ),
+            reason_code=_first_code(errors, {ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED, ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID}),
+            detail={"stage_validation": stage_validation},
+        )
+    )
+    checks.append(
+        _validation_check(
+            check_name="colab_runtime_dependency_valid",
+            passed=not any(issue.code == ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED for issue in errors),
+            reason_code=_first_code(errors, {ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED}),
+            detail={"stage_validation": stage_validation},
         )
     )
     checks.append(
@@ -1388,6 +1575,162 @@ def _build_validation_checks(
         )
     )
     return checks
+
+
+def _resolve_colab_stage_preflight(
+    *,
+    env_config_path: Path,
+    training_config_path: Path,
+    state_manifest_path: Path,
+    env_contract_report_path: Path,
+    readiness_report_path: Path,
+    episode_catalog_path: Path,
+    split_report_path: Path,
+) -> dict[str, Any]:
+    """Revalidate staged Colab closure/runtime reports when explicit inputs come from a staged root."""
+
+    input_paths = (
+        env_config_path,
+        training_config_path,
+        state_manifest_path,
+        env_contract_report_path,
+        readiness_report_path,
+        episode_catalog_path,
+        split_report_path,
+    )
+    staging_root = find_stage_root_for_inputs(input_paths=input_paths)
+    if staging_root is None:
+        return {
+            "detected": False,
+            "staging_root": None,
+            "closure_report_path": None,
+            "runtime_dependency_report_path": None,
+            "validation": None,
+            "issues": [],
+        }
+
+    closure_report_path = staging_root / CLOSURE_REPORT_FILENAME
+    runtime_dependency_report_path = staging_root / RUNTIME_DEPENDENCY_REPORT_FILENAME
+    try:
+        validation = validate_existing_stage(staging_root=staging_root)
+        closure_report = json.loads(closure_report_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "detected": True,
+            "staging_root": str(staging_root),
+            "closure_report_path": str(closure_report_path),
+            "runtime_dependency_report_path": str(runtime_dependency_report_path),
+            "validation": None,
+            "issues": [
+                ValidationIssue(
+                    code=ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED,
+                    message="Colab staged inputs require valid closure and runtime dependency reports before training starts.",
+                    context={
+                        "staging_root": str(staging_root),
+                        "closure_report_path": str(closure_report_path),
+                        "runtime_dependency_report_path": str(runtime_dependency_report_path),
+                        "error": str(exc),
+                    },
+                )
+            ],
+        }
+
+    issues: list[ValidationIssue] = []
+    expected_seed_paths = _seed_paths_from_closure_report(closure_report)
+    explicit_seed_paths = {
+        "env_config": str(env_config_path.resolve()),
+        "training_config": str(training_config_path.resolve()),
+        "state_manifest": str(state_manifest_path.resolve()),
+        "env_contract_report": str(env_contract_report_path.resolve()),
+        "readiness_report": str(readiness_report_path.resolve()),
+        "episode_catalog": str(episode_catalog_path.resolve()),
+        "split_report": str(split_report_path.resolve()),
+    }
+    path_mismatches = [
+        {
+            "label": label,
+            "expected_path": expected_seed_paths.get(label),
+            "explicit_path": explicit_seed_paths[label],
+        }
+        for label in sorted(explicit_seed_paths)
+        if expected_seed_paths.get(label) != explicit_seed_paths[label]
+    ]
+    if path_mismatches:
+        issues.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID,
+                message="Explicit artifact-production inputs do not match the validated staged closure seed paths.",
+                context={"path_mismatches": path_mismatches},
+            )
+        )
+
+    check_map = {
+        str(item.get("check_name")): item
+        for item in validation.get("checks", [])
+        if isinstance(item, Mapping)
+    }
+    closure_checks = (
+        "persisted_closure_report_valid",
+        "required_artifacts_present",
+        "artifact_hashes_unchanged",
+        "contract_critical_local_path_leaks_absent",
+    )
+    if not all(bool(check_map.get(name, {}).get("pass", False)) for name in closure_checks):
+        issues.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID,
+                message="Validated Colab staging closure is invalid at canonical training entrypoint start.",
+                context={"validation": validation},
+            )
+        )
+    runtime_checks = (
+        "persisted_runtime_dependency_report_valid",
+        "runtime_dependency_probe_revalidated",
+    )
+    if not all(bool(check_map.get(name, {}).get("pass", False)) for name in runtime_checks):
+        issues.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED,
+                message="Validated Colab runtime dependency preflight is invalid at canonical training entrypoint start.",
+                context={"validation": validation},
+            )
+        )
+
+    return {
+        "detected": True,
+        "staging_root": str(staging_root),
+        "closure_report_path": str(closure_report_path),
+        "runtime_dependency_report_path": str(runtime_dependency_report_path),
+        "validation": validation,
+        "issues": issues,
+    }
+
+
+def _seed_paths_from_closure_report(closure_report: Mapping[str, Any]) -> dict[str, str]:
+    """Return expected staged seed-input paths from the normalized closure report."""
+
+    dependency_spec = closure_report.get("dependency_spec")
+    if not isinstance(dependency_spec, Mapping):
+        raise ValueError("closure report dependency_spec is required")
+    seed_inputs = dependency_spec.get("seed_inputs")
+    if not isinstance(seed_inputs, list):
+        raise ValueError("closure report dependency_spec.seed_inputs must be list")
+
+    staging_root_raw = closure_report.get("staging_root")
+    if not isinstance(staging_root_raw, str) or not staging_root_raw.strip():
+        raise ValueError("closure report staging_root must be non-empty string")
+    staging_root = Path(staging_root_raw).resolve()
+
+    expected: dict[str, str] = {}
+    for item in seed_inputs:
+        if not isinstance(item, Mapping):
+            raise ValueError("closure report dependency_spec.seed_inputs entries must be objects")
+        label = item.get("label")
+        relpath = item.get("staged_relative_path")
+        if not isinstance(label, str) or not isinstance(relpath, str):
+            raise ValueError("closure report seed_inputs entries must expose label and staged_relative_path")
+        expected[label] = str((staging_root / relpath).resolve())
+    return expected
 
 
 def _build_manifest_payload(
@@ -1514,6 +1857,7 @@ def _build_report_payload(
     production_summary: dict[str, Any],
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build machine-readable artifact production report payload."""
 
@@ -1540,6 +1884,7 @@ def _build_report_payload(
         "validation_checks": list(validation_checks),
         "startup_phase_trace": list(startup_phase_trace),
         "production_summary": production_summary,
+        "runtime": dict(runtime) if runtime is not None else None,
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
         "failure_codes": _failure_codes(errors),
@@ -1662,6 +2007,115 @@ def _canonicality_checks(
     }
 
 
+def _validate_optional_optimizations(
+    *,
+    enable_amp: bool,
+    enable_torch_compile: bool,
+    runtime_environment: Any,
+) -> tuple[dict[str, Any], list[ValidationIssue]]:
+    """Validate optional performance flags without weakening canonical semantics."""
+
+    optimization_runtime = {
+        "amp": {
+            "requested": bool(enable_amp),
+            "enabled": False,
+            "runtime_supported": bool(runtime_environment.torch_available and runtime_environment.cuda_available),
+            "reason": "not_requested",
+        },
+        "torch_compile": {
+            "requested": bool(enable_torch_compile),
+            "enabled": False,
+            "runtime_supported": bool(runtime_environment.torch_compile_supported),
+            "reason": "not_requested",
+        },
+    }
+    issues: list[ValidationIssue] = []
+
+    if enable_amp:
+        optimization_runtime["amp"]["reason"] = "unsupported_on_canonical_artifact_path_v1"
+        issues.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_AMP_UNSUPPORTED,
+                message="AMP is not supported on the canonical PPO artifact-production path without broader SB3 changes.",
+                context={
+                    "requested": True,
+                    "cuda_available": bool(runtime_environment.cuda_available),
+                    "torch_available": bool(runtime_environment.torch_available),
+                    "gpu_name": runtime_environment.gpu_name,
+                },
+            )
+        )
+
+    if enable_torch_compile:
+        optimization_runtime["torch_compile"]["reason"] = "unsupported_on_canonical_artifact_path_v1"
+        issues.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_COMPILE_UNSUPPORTED,
+                message="torch.compile is not supported on the canonical PPO artifact-production path without broader SB3 changes.",
+                context={
+                    "requested": True,
+                    "torch_compile_supported": bool(runtime_environment.torch_compile_supported),
+                    "torch_version": runtime_environment.torch_version,
+                },
+            )
+        )
+
+    return optimization_runtime, issues
+
+
+def _build_runtime_payload(
+    *,
+    runtime_environment: Any,
+    progress_resolution: Any,
+    requested_device: str | None,
+    resolved_device: str | None,
+    enable_amp: bool,
+    enable_torch_compile: bool,
+    optimization_runtime: dict[str, Any],
+    memory_log_interval_steps: int,
+    memory_snapshots: Sequence[dict[str, Any]],
+    numeric_safety: dict[str, Any] | None,
+    n_envs: int,
+    stage_preflight: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build additive runtime metadata for Colab/local execution reporting."""
+
+    return {
+        "environment": asdict(runtime_environment),
+        "progress": asdict(progress_resolution),
+        "device": {
+            "requested_device": requested_device,
+            "resolved_device": resolved_device,
+        },
+        "execution_bounds": {
+            "n_envs": int(n_envs),
+            "memory_log_interval_steps": int(memory_log_interval_steps),
+        },
+        "optimizations": {
+            "amp": {
+                **dict(optimization_runtime.get("amp", {})),
+                "requested": bool(enable_amp),
+            },
+            "torch_compile": {
+                **dict(optimization_runtime.get("torch_compile", {})),
+                "requested": bool(enable_torch_compile),
+            },
+        },
+        "numeric_safety": dict(numeric_safety) if numeric_safety is not None else None,
+        "memory_snapshots": [dict(item) for item in memory_snapshots],
+        "stage_preflight": _serialize_stage_preflight(stage_preflight),
+    }
+
+
+def _looks_like_numeric_failure(exc: Exception) -> bool:
+    """Return whether an exception indicates a non-finite training failure."""
+
+    if isinstance(exc, FloatingPointError):
+        return True
+    message = str(exc).lower()
+    return "non-finite" in message or "must be finite" in message
+
+
 def _normalize_issues(issues: Sequence[Any]) -> list[ValidationIssue]:
     """Normalize imported issue types into this module's issue dataclass."""
 
@@ -1675,6 +2129,20 @@ def _normalize_issues(issues: Sequence[Any]) -> list[ValidationIssue]:
             )
         )
     return normalized
+
+
+def _serialize_stage_preflight(stage_preflight: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a JSON-serializable stage-preflight payload."""
+
+    serialized: dict[str, Any] = {}
+    for key, value in stage_preflight.items():
+        if key == "issues" and isinstance(value, Sequence):
+            serialized[key] = [asdict(item) if isinstance(item, ValidationIssue) else dict(item) for item in value]
+        elif isinstance(value, Mapping):
+            serialized[key] = dict(value)
+        else:
+            serialized[key] = value
+    return serialized
 
 
 def _first_code(issues: Sequence[ValidationIssue], candidates: set[str]) -> str | None:

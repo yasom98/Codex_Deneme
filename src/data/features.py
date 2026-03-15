@@ -281,6 +281,8 @@ def validate_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
     if out["timestamp"].isna().any():
         raise ValueError("timestamp contains invalid or NaT values.")
 
+    out["timestamp"] = out["timestamp"].astype("datetime64[ns, UTC]")
+
     if not out["timestamp"].is_monotonic_increasing:
         LOGGER.warning("timestamp not monotonic increasing; sorting ascending.")
         out = out.sort_values("timestamp", kind="mergesort")
@@ -1488,6 +1490,13 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
     )
     formula_fingerprints = compute_formula_fingerprints(cfg)
     formula_fingerprint_bundle = compute_formula_fingerprint_bundle(formula_fingerprints)
+    warmup_rows_by_column = dict(rl_output.warmup_rows_by_column)
+    warmup_rows_by_column.update(
+        {
+            "AlphaTrend": max(int(cfg.alphatrend.ap) - 1, 0),
+            "AlphaTrend_2": max(int(cfg.alphatrend.ap) + 1, 0),
+        }
+    )
 
     frame = pd.concat(
         [
@@ -1522,6 +1531,6 @@ def build_feature_artifacts(df: pd.DataFrame, cfg: FeatureBuildConfig) -> Featur
         continuous_feature_columns=continuous_feature_columns,
         flag_feature_columns=flag_feature_columns,
         placeholder_columns=feature_groups["placeholders"],
-        warmup_rows_by_column=rl_output.warmup_rows_by_column,
+        warmup_rows_by_column=warmup_rows_by_column,
         feature_groups=feature_groups,
     )

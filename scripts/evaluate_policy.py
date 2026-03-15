@@ -32,6 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-report", type=Path, required=True, help="Explicit split report JSON path.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Fresh output dir for 4.8 reports.")
     parser.add_argument(
+        "--progress-mode",
+        type=str,
+        default="off",
+        choices=("off", "auto", "notebook", "text"),
+        help="Optional live progress mode. Use auto in Colab for notebook-safe tqdm behavior.",
+    )
+    parser.add_argument(
         "--risk-overlay-config",
         type=Path,
         default=None,
@@ -59,6 +66,7 @@ def main() -> int:
             episode_catalog_path=args.episode_catalog.resolve(),
             split_report_path=args.split_report.resolve(),
             output_dir=args.output_dir.resolve(),
+            progress_mode=args.progress_mode,
             risk_overlay_config_path=args.risk_overlay_config.resolve() if args.risk_overlay_config is not None else None,
         )
         LOGGER.info(

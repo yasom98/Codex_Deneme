@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import random
 import sys
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from core.config import load_config
+from core.config import load_config, validate_config
 from core.health import summarize_reports
 from core.io_atomic import atomic_write_json
 from core.logging import get_logger, setup_logging
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Standardize crypto OHLCV CSV files to parquet.")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs" / "data.yaml", help="YAML config path.")
+    parser.add_argument("--input-root", type=Path, default=None, help="Optional raw CSV input root override.")
     parser.add_argument("--dry-run", action="store_true", help="Run validation and health checks without writing outputs.")
     parser.add_argument("--run-id", type=str, default="", help="Custom run id. Default: current UTC timestamp.")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
@@ -59,6 +61,9 @@ def main() -> int:
     setup_logging(args.log_level)
 
     cfg = load_config(args.config)
+    if args.input_root is not None:
+        cfg = replace(cfg, input_root=args.input_root.resolve())
+        validate_config(cfg)
     set_global_seed(cfg.seed)
 
     run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -84,6 +89,8 @@ def main() -> int:
     summary = summarize_reports(reports)
     summary["run_id"] = run_id
     summary["run_root"] = str(run_root)
+    summary["input_root_resolved"] = str(cfg.input_root.resolve())
+    summary["output_root_resolved"] = str(parquet_root.resolve())
 
     LOGGER.info("Summary: total=%d success=%d failed=%d", summary["total_files"], summary["succeeded_files"], summary["failed_files"])
 

@@ -1,0 +1,17 @@
+{
+  "drive_root": "MyDrive/Codex_Deneme_Assets",
+  "run_id": "<RUN_ID>",
+  "optional_assets": [
+    "raw_market_data/legacy_csv/",
+    "runs/<RUN_ID>/data_standardized/",
+    "runs/<RUN_ID>/data_tail_refresh/",
+    "runs/<RUN_ID>/training_launch/",
+    "runs/<RUN_ID>/ppo_artifact_smoke/",
+    "runs/<RUN_ID>/evaluation_smoke/",
+    "runs/<RUN_ID>/checkpoints/"
+  ],
+  "notes": [
+    "Optional assets are useful for lineage, reference, resume, or historical evidence.",
+    "Optional assets are not required for the first real training run."
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "drive_root": "MyDrive/Codex_Deneme_Assets",
+  "run_id": "<RUN_ID>",
+  "required_training_assets": [
+    "runs/<RUN_ID>/env_contract/tmp/bounded_training_preparation_env_config.json",
+    "runs/<RUN_ID>/env_contract/reports/env_contract_report.json",
+    "runs/<RUN_ID>/env_readiness/reports/training_env_readiness_report.json",
+    "runs/<RUN_ID>/env_readiness/reports/episode_catalog.json",
+    "runs/<RUN_ID>/data_features/reports/feature_manifest.json",
+    "runs/<RUN_ID>/data_features/reports/train_input_validation_report.json",
+    "runs/<RUN_ID>/data_features/reports/split_validation_report.json",
+    "runs/<RUN_ID>/data_features/parquet/",
+    "runs/<RUN_ID>/data_datasets/reports/dataset_manifest.json",
+    "runs/<RUN_ID>/data_datasets/reports/dataset_build_report.json",
+    "runs/<RUN_ID>/data_datasets/parquet/partitions/",
+    "runs/<RUN_ID>/data_states/reports/state_manifest.json",
+    "runs/<RUN_ID>/data_states/reports/state_build_report.json",
+    "runs/<RUN_ID>/data_states/parquet/partitions/"
+  ],
+  "required_evaluation_assets": [
+    "runs/<RUN_ID>/ppo_artifact/<ARTIFACT_ATTEMPT_ID>/canonical_ppo_model.zip"
+  ],
+  "repo_supplied_inputs": [
+    "configs/training_config.colab_first_real.example.json",
+    "configs/eval_config.episodic.example.json",
+    "requirements.colab.txt",
+    "scripts/stage_colab_inputs.py",
+    "scripts/produce_canonical_ppo_artifact.py",
+    "scripts/evaluate_policy.py"
+  ],
+  "generated_during_staging": [
+    "colab_input_staging_manifest.json",
+    "colab_staging_closure_report.json",
+    "colab_runtime_dependency_report.json"
+  ],
+  "generated_during_training_or_eval": [
+    "canonical_ppo_model.zip",
+    "artifact_production_manifest.json",
+    "artifact_production_report.json",
+    "evaluation_manifest.json",
+    "evaluation_validation_report.json",
+    "evaluation_backtest_report.json"
+  ]
+}

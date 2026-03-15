@@ -18,9 +18,11 @@ from core.io_atomic import atomic_write_json, atomic_write_parquet
 from core.logging import get_logger
 import numpy as np
 import pandas as pd
+from rl.colab_runtime import capture_memory_snapshot, collect_runtime_environment, validate_finite_scalar
 from rl.env_adapter_gym import TradingEnvGym
 from rl.env_contract import EnvConfig, parse_env_config
 from rl.env_core import EpisodeRef
+from rl.notebook_progress import EvaluationProgressBar, log_progress_mode, resolve_progress_mode
 from rl.risk_overlay import (
     RISK_OVERLAY_CONTRACT_VERSION,
     MarketSnapshot,
@@ -216,6 +218,7 @@ def execute_evaluation_backtest(
     episode_catalog_path: Path,
     split_report_path: Path,
     output_dir: Path,
+    progress_mode: str = "off",
     risk_overlay_config_path: Path | None = None,
 ) -> EvaluationExecutionResult:
     """Execute strict evaluation/backtest over explicit artifacts."""
@@ -326,6 +329,21 @@ def execute_evaluation_backtest(
         )
 
     output_dir_resolved.mkdir(parents=True, exist_ok=False)
+    runtime_environment = collect_runtime_environment()
+    progress_resolution = resolve_progress_mode(progress_mode)
+    log_progress_mode(logger=LOGGER, resolution=progress_resolution, scope="evaluation")
+    LOGGER.info(
+        "Evaluation runtime summary | run_id=%s gpu_name=%s cuda_available=%s gpu_total_memory_gib=%s system_ram_gib=%s torch_version=%s torch_compile_supported=%s",
+        normalized_run_id,
+        runtime_environment.gpu_name,
+        runtime_environment.cuda_available,
+        runtime_environment.gpu_total_memory_gib,
+        runtime_environment.system_ram_gib,
+        runtime_environment.torch_version,
+        runtime_environment.torch_compile_supported,
+    )
+    LOGGER.info("Evaluation start | run_id=%s output_dir=%s", normalized_run_id, output_dir_resolved)
+    memory_snapshots: list[dict[str, Any]] = [capture_memory_snapshot(label="startup", step=0)]
 
     loaded_inputs, load_issues = _load_json_inputs(
         env_config_path=env_config_path.resolve(),
@@ -385,6 +403,17 @@ def execute_evaluation_backtest(
     resolved_device, device_issues, dependency_probe = _resolve_device(requested_device)
     errors.extend(device_issues)
 
+    def _runtime_payload() -> dict[str, Any]:
+        return _build_runtime_payload(
+            runtime_environment=runtime_environment,
+            progress_resolution=progress_resolution,
+            requested_device=requested_device,
+            resolved_device=resolved_device,
+            memory_snapshots=memory_snapshots,
+            max_eval_episodes=eval_config.max_eval_episodes if eval_config is not None else _raw_int(loaded_inputs.get("eval_config"), "max_eval_episodes"),
+            max_eval_steps=eval_config.max_eval_steps if eval_config is not None else _raw_int(loaded_inputs.get("eval_config"), "max_eval_steps"),
+        )
+
     env_config_result = _validate_env_config(
         env_config_payload=loaded_inputs.get("env_config"),
         cli_run_id=normalized_run_id,
@@ -443,6 +472,7 @@ def execute_evaluation_backtest(
         risk_overlay_enabled=risk_overlay_enabled,
         risk_overlay_config_hash=risk_overlay_config_hash,
         validation_checks=validation_checks,
+        runtime=_runtime_payload(),
         warnings=warnings,
         errors=errors,
     )
@@ -514,6 +544,7 @@ def execute_evaluation_backtest(
                 report_paths=report_paths,
                 summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
             ),
+            runtime=_runtime_payload(),
             warnings=warnings,
             errors=errors,
         )
@@ -560,14 +591,17 @@ def execute_evaluation_backtest(
 
     _set_global_seed(eval_config.seed)
     try:
+        LOGGER.info("Model load start | run_id=%s model_artifact=%s", normalized_run_id, model_artifact_path.resolve())
         model = _load_ppo_model(model_artifact_path=model_artifact_path.resolve(), device=resolved_device)
         if hasattr(model, "set_random_seed"):
             model.set_random_seed(eval_config.seed)
+        memory_snapshots.append(capture_memory_snapshot(label="model_load", step=0))
         phase_status["model_load"] = "completed"
         phase_detail["model_load"] = {
             "model_class": type(model).__name__,
             "device": resolved_device,
         }
+        LOGGER.info("Model load finished | run_id=%s model_class=%s", normalized_run_id, type(model).__name__)
     except Exception as exc:  # noqa: BLE001
         model_error = ValidationIssue(
             code=EVAL_MODEL_LOAD_FAILED,
@@ -598,6 +632,7 @@ def execute_evaluation_backtest(
                 report_paths=report_paths,
                 summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
             ),
+            runtime=_runtime_payload(),
             warnings=warnings,
             errors=[model_error],
         )
@@ -619,6 +654,7 @@ def execute_evaluation_backtest(
 
     env_clients: list[TradingEnvGym] = []
     try:
+        LOGGER.info("Env init start | run_id=%s episode_count=%d", normalized_run_id, len(target_resolution.selected_episode_refs))
         for episode_ref in target_resolution.selected_episode_refs:
             effective_env_config = _effective_env_config(
                 env_config=env_config,
@@ -627,12 +663,14 @@ def execute_evaluation_backtest(
                 max_eval_steps=eval_config.max_eval_steps,
             )
             env_clients.append(TradingEnvGym(config=effective_env_config, validate_on_init=True))
+        memory_snapshots.append(capture_memory_snapshot(label="env_init", step=0))
         phase_status["env_init"] = "completed"
         phase_detail["env_init"] = {
             "env_class": "TradingEnvGym",
             "initialized_episode_count": len(env_clients),
             "selected_episode_refs": list(target_resolution.selected_episode_refs),
         }
+        LOGGER.info("Env init finished | run_id=%s initialized_episode_count=%d", normalized_run_id, len(env_clients))
     except Exception as exc:  # noqa: BLE001
         _close_envs(env_clients)
         env_issue = ValidationIssue(
@@ -664,6 +702,7 @@ def execute_evaluation_backtest(
                 report_paths=report_paths,
                 summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
             ),
+            runtime=_runtime_payload(),
             warnings=warnings,
             errors=[env_issue],
         )
@@ -685,13 +724,29 @@ def execute_evaluation_backtest(
 
     episode_runtimes: list[EpisodeRuntime] = []
     step_rows: list[dict[str, Any]] = []
+    progress_bar = EvaluationProgressBar(
+        resolution=progress_resolution,
+        total_episodes=len(env_clients),
+        max_eval_steps=int(eval_config.max_eval_steps),
+        run_id=normalized_run_id,
+        evaluation_mode=eval_config.evaluation_mode,
+        partition_label=target_resolution.resolved_partition_name or target_resolution.selected_partition,
+    )
     try:
+        LOGGER.info(
+            "Evaluation start | run_id=%s evaluation_mode=%s target_mode=%s episode_count=%d",
+            normalized_run_id,
+            eval_config.evaluation_mode,
+            eval_config.target_mode,
+            len(env_clients),
+        )
         phase_status["eval_start"] = "completed"
         phase_detail["eval_start"] = {
             "selected_episode_count": len(env_clients),
             "deterministic": eval_config.deterministic,
         }
         for episode_index, (episode_ref, env_client) in enumerate(zip(target_resolution.selected_episode_refs, env_clients, strict=True)):
+            progress_bar.on_episode_start(episode_index=episode_index, episode_ref=dict(episode_ref))
             if risk_overlay_session is not None:
                 risk_overlay_session.start_episode()
             runtime = _evaluate_single_episode(
@@ -703,15 +758,24 @@ def execute_evaluation_backtest(
                 benchmark_mode=eval_config.benchmark_mode,
                 requested_metrics=eval_config.backtest_metrics,
                 episode_index=episode_index,
+                progress_bar=progress_bar,
                 risk_overlay_session=risk_overlay_session,
             )
             episode_runtimes.append(runtime)
             step_rows.extend(runtime.step_records)
+            progress_bar.on_episode_finish(episode_index=episode_index, step_count=len(runtime.step_records))
+        memory_snapshots.append(capture_memory_snapshot(label="eval_finish", step=sum(len(item.step_records) for item in episode_runtimes)))
         phase_status["eval_finish"] = "completed"
         phase_detail["eval_finish"] = {
             "evaluated_episode_count": len(episode_runtimes),
             "step_count_total": sum(len(item.step_records) for item in episode_runtimes),
         }
+        LOGGER.info(
+            "Evaluation finished | run_id=%s evaluated_episode_count=%d step_count_total=%d",
+            normalized_run_id,
+            len(episode_runtimes),
+            sum(len(item.step_records) for item in episode_runtimes),
+        )
     except ControlledEvaluationFailure as exc:
         _close_envs(env_clients)
         phase_status["eval_finish"] = "failed"
@@ -738,6 +802,7 @@ def execute_evaluation_backtest(
                 report_paths=report_paths,
                 summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
             ),
+            runtime=_runtime_payload(),
             warnings=warnings,
             errors=[exc.issue],
         )
@@ -757,6 +822,7 @@ def execute_evaluation_backtest(
             reports_written=True,
         )
     finally:
+        progress_bar.close()
         _close_envs(env_clients)
 
     strategy_metrics, strategy_status = _aggregate_metric_values(
@@ -814,6 +880,7 @@ def execute_evaluation_backtest(
             report_paths=report_paths,
             summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
         ),
+        runtime=_runtime_payload(),
         warnings=warnings,
         errors=[],
     )
@@ -867,6 +934,7 @@ def execute_evaluation_backtest(
                 report_paths=report_paths,
                 summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
             ),
+            runtime=_runtime_payload(),
             warnings=warnings,
             errors=[report_issue],
         )
@@ -1990,6 +2058,7 @@ def _evaluate_single_episode(
     benchmark_mode: str,
     requested_metrics: Sequence[str],
     episode_index: int,
+    progress_bar: EvaluationProgressBar | None = None,
     risk_overlay_session: RiskOverlaySession | None = None,
 ) -> EpisodeRuntime:
     """Evaluate one isolated environment instance and return machine-readable evidence."""
@@ -2039,10 +2108,25 @@ def _evaluate_single_episode(
         current_index = int(episode_data.episode_valid_start_row) + int(step_counter)
         decision_timestamp = str(episode_data.timestamp_vector[current_index])
         if risk_overlay_session is not None:
-            mid_price = float(episode_data.execution_price_vector[current_index])
+            try:
+                mid_price = validate_finite_scalar(
+                    name="risk_overlay.mid_price",
+                    value=episode_data.execution_price_vector[current_index],
+                )
+            except ValueError as exc:
+                raise ControlledEvaluationFailure(
+                    ValidationIssue(
+                        code=EVAL_EXECUTION_FAILED,
+                        message="Risk overlay received a non-finite mid_price during evaluation.",
+                        context={"episode_ref": dict(episode_ref), "step_counter": step_counter, "error": str(exc)},
+                    )
+                ) from exc
             drawdown_pct = 0.0
             if peak_equity > 0.0:
-                drawdown_pct = max((peak_equity - current_equity) / peak_equity, 0.0)
+                drawdown_pct = validate_finite_scalar(
+                    name="risk_overlay.drawdown_pct",
+                    value=max((peak_equity - current_equity) / peak_equity, 0.0),
+                )
             proposal = derive_action_proposal(
                 instrument=str(episode_ref["source_rel"]),
                 timestamp_utc=decision_timestamp,
@@ -2099,6 +2183,28 @@ def _evaluate_single_episode(
             ) from exc
 
         info_dict = dict(info)
+        try:
+            reward_value = validate_finite_scalar(name="reward_total", value=reward)
+            price_exec = validate_finite_scalar(name="price_exec", value=info_dict["price_exec"])
+            next_price = validate_finite_scalar(
+                name="next_price",
+                value=episode_data.mark_to_market_price_vector[int(info_dict["step_index"]) + 1],
+            )
+            pnl_delta = validate_finite_scalar(name="pnl_delta", value=info_dict["reward_components"]["pnl_delta"])
+            fees = validate_finite_scalar(name="fees", value=info_dict["cost_components"]["fees"])
+            slippage_cost = validate_finite_scalar(
+                name="slippage_cost",
+                value=info_dict["cost_components"]["slippage_cost"],
+            )
+            portfolio_value = validate_finite_scalar(name="portfolio_value", value=info_dict["portfolio_value"])
+        except ValueError as exc:
+            raise ControlledEvaluationFailure(
+                ValidationIssue(
+                    code=EVAL_EXECUTION_FAILED,
+                    message="Non-finite evaluation scalar detected during backtest execution.",
+                    context={"episode_ref": dict(episode_ref), "step_counter": step_counter, "error": str(exc)},
+                )
+            ) from exc
         current_index = int(info_dict["step_index"])
         next_index = current_index + 1
         current_timestamp = str(episode_data.timestamp_vector[current_index])
@@ -2106,9 +2212,6 @@ def _evaluate_single_episode(
         trade_units = int(info_dict["cost_components"]["trade_units"])
         position_before = int(info_dict["position_before"])
         position_after = int(info_dict["position_after"])
-        price_exec = float(info_dict["price_exec"])
-        fees = float(info_dict["cost_components"]["fees"])
-        slippage_cost = float(info_dict["cost_components"]["slippage_cost"])
         record = {
             "evaluation_episode_index": int(episode_index),
             "episode_scope": episode_ref["scope"],
@@ -2126,13 +2229,13 @@ def _evaluate_single_episode(
             "invalid_action": bool(info_dict["invalid_action"]),
             "invalid_action_reason": info_dict.get("invalid_action_reason"),
             "price_exec": price_exec,
-            "next_price": float(episode_data.mark_to_market_price_vector[next_index]),
-            "reward_total": float(reward),
-            "pnl_delta": float(info_dict["reward_components"]["pnl_delta"]),
+            "next_price": next_price,
+            "reward_total": reward_value,
+            "pnl_delta": pnl_delta,
             "fees": fees,
             "slippage_cost": slippage_cost,
             "trade_units": trade_units,
-            "strategy_portfolio_value": float(info_dict["portfolio_value"]),
+            "strategy_portfolio_value": portfolio_value,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
             "termination_reason": info_dict.get("termination_reason"),
@@ -2160,6 +2263,8 @@ def _evaluate_single_episode(
                 }
             )
         step_records.append(record)
+        if progress_bar is not None:
+            progress_bar.on_step(episode_index=episode_index, step_ordinal=step_counter + 1)
 
         if position_before == 0 and position_after in {-1, 1} and trade_units > 0:
             position_open = {
@@ -2183,7 +2288,7 @@ def _evaluate_single_episode(
             position_open = None
 
         current_exposure = int(position_after)
-        current_equity = float(info_dict["portfolio_value"])
+        current_equity = portfolio_value
         peak_equity = max(float(peak_equity), float(current_equity))
         step_counter += 1
         if terminated or truncated:
@@ -2770,6 +2875,7 @@ def _build_validation_payload(
     validation_checks: Sequence[dict[str, Any]],
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build evaluation validation report."""
 
@@ -2792,6 +2898,7 @@ def _build_validation_payload(
         "risk_overlay_enabled": bool(risk_overlay_enabled),
         "risk_overlay_config_hash": risk_overlay_config_hash,
         "validation_checks": list(validation_checks),
+        "runtime": dict(runtime) if runtime is not None else None,
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
         "failure_codes": _failure_codes(errors),
@@ -2915,6 +3022,7 @@ def _build_backtest_payload(
     risk_overlay: dict[str, Any],
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build evaluation backtest report payload."""
 
@@ -2935,10 +3043,57 @@ def _build_backtest_payload(
         "metric_status": metric_status,
         "trace_artifact_path": trace_artifact_path,
         "risk_overlay": dict(risk_overlay),
+        "runtime": dict(runtime) if runtime is not None else None,
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
         "failure_codes": _failure_codes(errors),
         "generated_at": _generated_at(),
+    }
+
+
+def _build_runtime_payload(
+    *,
+    runtime_environment: Any,
+    progress_resolution: Any,
+    requested_device: str | None,
+    resolved_device: str | None,
+    memory_snapshots: Sequence[dict[str, Any]],
+    max_eval_episodes: int | None,
+    max_eval_steps: int | None,
+) -> dict[str, Any]:
+    """Build additive runtime metadata for evaluation reporting."""
+
+    return {
+        "environment": {
+            "colab_detected": bool(runtime_environment.colab_detected),
+            "notebook_detected": bool(runtime_environment.notebook_detected),
+            "torch_available": bool(runtime_environment.torch_available),
+            "torch_version": runtime_environment.torch_version,
+            "cuda_available": bool(runtime_environment.cuda_available),
+            "gpu_name": runtime_environment.gpu_name,
+            "gpu_total_memory_bytes": runtime_environment.gpu_total_memory_bytes,
+            "gpu_total_memory_gib": runtime_environment.gpu_total_memory_gib,
+            "system_ram_bytes": runtime_environment.system_ram_bytes,
+            "system_ram_gib": runtime_environment.system_ram_gib,
+            "process_rss_bytes": runtime_environment.process_rss_bytes,
+            "process_rss_mib": runtime_environment.process_rss_mib,
+            "torch_compile_supported": bool(runtime_environment.torch_compile_supported),
+        },
+        "progress": {
+            "requested_mode": progress_resolution.requested_mode,
+            "active_mode": progress_resolution.active_mode,
+            "colab_detected": bool(progress_resolution.colab_detected),
+            "notebook_detected": bool(progress_resolution.notebook_detected),
+        },
+        "device": {
+            "requested_device": requested_device,
+            "resolved_device": resolved_device,
+        },
+        "execution_bounds": {
+            "max_eval_episodes": max_eval_episodes,
+            "max_eval_steps": max_eval_steps,
+        },
+        "memory_snapshots": [dict(item) for item in memory_snapshots],
     }
 
 
