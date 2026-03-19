@@ -89,6 +89,7 @@ TRAINING_CONFIG_REQUIRED_FIELDS = (
     "smoke_learn_timesteps",
     "algo_params",
 )
+TRAINING_CONFIG_OPTIONAL_FIELDS = ("action_masking",)
 
 
 @dataclass
@@ -145,6 +146,7 @@ class TrainingConfig:
     smoke_mode: str
     smoke_learn_timesteps: int
     algo_params: PpoAlgoParams
+    action_masking: bool = False
 
 
 @dataclass(frozen=True)
@@ -222,13 +224,14 @@ def execute_training_launch(
             selected_episode_mode=None,
             effective_seed=None,
             requested_device=None,
-            resolved_device=None,
-            config_hash=None,
-            readiness_hash=None,
-            env_contract_hash=None,
-            state_manifest_hash=None,
-            episode_catalog_hash=None,
-            prelaunch_checks=[
+        resolved_device=None,
+        config_hash=None,
+        readiness_hash=None,
+        env_contract_hash=None,
+        state_manifest_hash=None,
+        episode_catalog_hash=None,
+        action_masking_enabled=None,
+        prelaunch_checks=[
                 _prelaunch_check(
                     check_name="startup_policy_fresh_only",
                     passed=False,
@@ -256,6 +259,7 @@ def execute_training_launch(
             effective_seed=None,
             requested_device=None,
             resolved_device=None,
+            action_masking_enabled=None,
             startup_phase_trace=_phase_trace(
                 prelaunch_status="failed",
                 env_init_status="not_started",
@@ -323,6 +327,13 @@ def execute_training_launch(
     )
     effective_seed = training_config.seed if training_config is not None else _raw_int(
         loaded_inputs.get("training_config"), "seed"
+    )
+    action_masking_enabled = (
+        training_config.action_masking
+        if training_config is not None
+        else loaded_inputs.get("training_config", {}).get("action_masking")
+        if isinstance(loaded_inputs.get("training_config"), dict)
+        else None
     )
 
     resolved_device, device_issues, dependency_probe = _resolve_device(requested_device)
@@ -395,6 +406,7 @@ def execute_training_launch(
         env_contract_hash=env_contract_hash,
         state_manifest_hash=state_manifest_hash,
         episode_catalog_hash=episode_catalog_hash,
+        action_masking_enabled=action_masking_enabled,
         prelaunch_checks=prelaunch_checks,
         warnings=warnings,
         errors=errors,
@@ -441,6 +453,7 @@ def execute_training_launch(
             effective_seed=effective_seed,
             requested_device=requested_device,
             resolved_device=resolved_device,
+            action_masking_enabled=action_masking_enabled,
             startup_phase_trace=_phase_trace(
                 prelaunch_status="failed",
                 env_init_status="not_started",
@@ -455,11 +468,13 @@ def execute_training_launch(
                 "dependency_probe": dependency_probe,
                 "output_dir": str(output_dir_resolved),
                 "selected_episode_ref": selected_episode.episode_ref if selected_episode is not None else None,
+                "action_masking_enabled": action_masking_enabled,
             },
             smoke_rollout_summary={
                 "learn_invoked": False,
                 "smoke_learn_timesteps_used": None,
                 "smoke_learn_timesteps_unused": True,
+                "action_masking_enabled": action_masking_enabled,
             },
             warnings=warnings,
             errors=errors,
@@ -490,6 +505,7 @@ def execute_training_launch(
             effective_seed=training_config.seed,
             requested_device=requested_device,
             resolved_device=resolved_device,
+            action_masking_enabled=training_config.action_masking,
             startup_phase_trace=_phase_trace(
                 prelaunch_status="completed",
                 env_init_status="skipped",
@@ -506,12 +522,14 @@ def execute_training_launch(
                 "dependency_probe": dependency_probe,
                 "smoke_learn_timesteps_unused": True,
                 "output_dir": str(output_dir_resolved),
+                "action_masking_enabled": training_config.action_masking,
             },
             smoke_rollout_summary={
                 "learn_invoked": False,
                 "smoke_learn_timesteps_requested": training_config.smoke_learn_timesteps,
                 "smoke_learn_timesteps_used": None,
                 "smoke_learn_timesteps_unused": True,
+                "action_masking_enabled": training_config.action_masking,
             },
             warnings=warnings,
             errors=[],
@@ -626,7 +644,9 @@ def _validate_training_config(payload: dict[str, Any] | None) -> dict[str, Any]:
     if payload is None:
         return {"config": None, "errors": errors}
 
-    extra_keys = sorted(set(payload.keys()) - set(TRAINING_CONFIG_REQUIRED_FIELDS))
+    extra_keys = sorted(
+        set(payload.keys()) - set(TRAINING_CONFIG_REQUIRED_FIELDS) - set(TRAINING_CONFIG_OPTIONAL_FIELDS)
+    )
     missing_keys = sorted(set(TRAINING_CONFIG_REQUIRED_FIELDS) - set(payload.keys()))
     if missing_keys or extra_keys:
         errors.append(
@@ -728,6 +748,16 @@ def _validate_training_config(payload: dict[str, Any] | None) -> dict[str, Any]:
             )
         )
 
+    action_masking_raw = payload.get("action_masking", False)
+    if not isinstance(action_masking_raw, bool):
+        errors.append(
+            ValidationIssue(
+                code=TRAIN_LAUNCH_CONFIG_INVALID,
+                message="action_masking must be a boolean when provided.",
+                context={"action_masking": action_masking_raw},
+            )
+        )
+
     algo_params_raw = payload.get("algo_params")
     algo_params, algo_param_errors = _validate_algo_params(algo_params_raw)
     errors.extend(algo_param_errors)
@@ -750,6 +780,7 @@ def _validate_training_config(payload: dict[str, Any] | None) -> dict[str, Any]:
             smoke_mode=smoke_mode,
             smoke_learn_timesteps=int(smoke_learn_timesteps_raw),
             algo_params=algo_params,
+            action_masking=bool(action_masking_raw),
         ),
         "errors": errors,
     }
@@ -1396,6 +1427,7 @@ def _run_launch_smoke(
         "smoke_learn_timesteps_requested": int(training_config.smoke_learn_timesteps),
         "smoke_learn_timesteps_used": int(training_config.smoke_learn_timesteps),
         "selected_episode_ref": dict(selected_episode.episode_ref),
+        "action_masking_enabled": training_config.action_masking,
     }
     startup_metadata = _set_global_seed(training_config.seed)
     smoke_rollout_summary["startup_seed_metadata"] = startup_metadata
@@ -1405,6 +1437,8 @@ def _run_launch_smoke(
     env_client: Any | None = None
     try:
         env_client = TradingEnvGym(config=effective_env_config, validate_on_init=True)
+        if training_config.action_masking:
+            env_client = _action_masker_wrapper(env_client)
         phase_status["env_init"] = "completed"
         phase_detail["env_init"] = {
             "env_class": type(env_client).__name__,
@@ -1431,12 +1465,14 @@ def _run_launch_smoke(
             effective_seed=training_config.seed,
             requested_device=requested_device,
             resolved_device=resolved_device,
+            action_masking_enabled=training_config.action_masking,
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             launch_guard_results={
                 "prelaunch_overall_pass": True,
                 "selected_episode_ref": selected_episode.episode_ref,
                 "selection_evidence": asdict(selected_episode),
                 "dependency_probe": dependency_probe,
+                "action_masking_enabled": training_config.action_masking,
             },
             smoke_rollout_summary=smoke_rollout_summary,
             warnings=warnings,
@@ -1444,7 +1480,7 @@ def _run_launch_smoke(
         )
 
     try:
-        ppo_class = _import_ppo_class()
+        ppo_class = _import_maskable_ppo_class() if training_config.action_masking else _import_ppo_class()
         model = ppo_class(
             "MlpPolicy",
             env_client,
@@ -1457,6 +1493,7 @@ def _run_launch_smoke(
         phase_detail["algo_init"] = {
             "algo_class": getattr(ppo_class, "__name__", str(ppo_class)),
             "device": resolved_device,
+            "action_masking_enabled": training_config.action_masking,
         }
     except Exception as exc:  # noqa: BLE001
         phase_status["algo_init"] = "failed"
@@ -1481,12 +1518,14 @@ def _run_launch_smoke(
             effective_seed=training_config.seed,
             requested_device=requested_device,
             resolved_device=resolved_device,
+            action_masking_enabled=training_config.action_masking,
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             launch_guard_results={
                 "prelaunch_overall_pass": True,
                 "selected_episode_ref": selected_episode.episode_ref,
                 "selection_evidence": asdict(selected_episode),
                 "dependency_probe": dependency_probe,
+                "action_masking_enabled": training_config.action_masking,
             },
             smoke_rollout_summary=smoke_rollout_summary,
             warnings=warnings,
@@ -1514,6 +1553,7 @@ def _run_launch_smoke(
                 "selected_episode_ref": selected_episode.episode_ref,
                 "smoke_learn_timesteps": int(training_config.smoke_learn_timesteps),
                 "resolved_device": resolved_device,
+                "action_masking_enabled": training_config.action_masking,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -1540,12 +1580,14 @@ def _run_launch_smoke(
             effective_seed=training_config.seed,
             requested_device=requested_device,
             resolved_device=resolved_device,
+            action_masking_enabled=training_config.action_masking,
             startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
             launch_guard_results={
                 "prelaunch_overall_pass": True,
                 "selected_episode_ref": selected_episode.episode_ref,
                 "selection_evidence": asdict(selected_episode),
                 "dependency_probe": dependency_probe,
+                "action_masking_enabled": training_config.action_masking,
             },
             smoke_rollout_summary=smoke_rollout_summary,
             warnings=warnings,
@@ -1566,12 +1608,14 @@ def _run_launch_smoke(
         effective_seed=training_config.seed,
         requested_device=requested_device,
         resolved_device=resolved_device,
+        action_masking_enabled=training_config.action_masking,
         startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
         launch_guard_results={
             "prelaunch_overall_pass": True,
             "selected_episode_ref": selected_episode.episode_ref,
             "selection_evidence": asdict(selected_episode),
             "dependency_probe": dependency_probe,
+            "action_masking_enabled": training_config.action_masking,
         },
         smoke_rollout_summary=smoke_rollout_summary,
         warnings=warnings,
@@ -1614,6 +1658,7 @@ def _effective_env_config(*, env_config: EnvConfig, seed: int, episode_ref: dict
             "reward_version": env_config.reward_contract.reward_version,
             "reward_formula_summary": env_config.reward_contract.reward_formula_summary,
             "included_components": list(env_config.reward_contract.included_components),
+            "invalid_close_flat_penalty": env_config.reward_contract.invalid_close_flat_penalty,
             "reward_scale": env_config.reward_contract.reward_scale,
             "reward_clip_min": env_config.reward_contract.reward_clip_min,
             "reward_clip_max": env_config.reward_contract.reward_clip_max,
@@ -1636,6 +1681,25 @@ def _import_ppo_class() -> Any:
     return ppo_class
 
 
+def _import_maskable_ppo_class() -> Any:
+    """Import MaskablePPO lazily so action masking stays opt-in."""
+
+    module = importlib.import_module("sb3_contrib")
+    ppo_class = getattr(module, "MaskablePPO", None)
+    if ppo_class is None:
+        raise ImportError("sb3_contrib.MaskablePPO is unavailable")
+    return ppo_class
+
+
+def _action_masker_wrapper(env: Any) -> Any:
+    """Wrap env with ActionMasker for MaskablePPO training."""
+    module = importlib.import_module("sb3_contrib.common.wrappers")
+    ActionMasker = getattr(module, "ActionMasker", None)
+    if ActionMasker is None:
+        raise ImportError("sb3_contrib.common.wrappers.ActionMasker is unavailable")
+    return ActionMasker(env, lambda e: e.action_masks())
+
+
 def _resolve_device(requested_device: str | None) -> tuple[str | None, list[ValidationIssue], dict[str, Any]]:
     """Resolve explicit requested device into an effective runtime device."""
 
@@ -1649,6 +1713,7 @@ def _resolve_device(requested_device: str | None) -> tuple[str | None, list[Vali
         "torch_cuda_available": cuda_available,
         "gymnasium_available": _optional_import("gymnasium")[0] is not None,
         "stable_baselines3_available": _optional_import("stable_baselines3")[0] is not None,
+        "sb3_contrib_available": _optional_import("sb3_contrib")[0] is not None,
     }
 
     if requested_device is None:
@@ -1808,6 +1873,7 @@ def _build_validation_payload(
     env_contract_hash: str | None,
     state_manifest_hash: str | None,
     episode_catalog_hash: str | None,
+    action_masking_enabled: bool | None,
     prelaunch_checks: list[dict[str, Any]],
     warnings: list[ValidationIssue],
     errors: list[ValidationIssue],
@@ -1828,6 +1894,7 @@ def _build_validation_payload(
         "env_contract_hash": env_contract_hash,
         "state_manifest_hash": state_manifest_hash,
         "episode_catalog_hash": episode_catalog_hash,
+        "action_masking_enabled": action_masking_enabled,
         "prelaunch_checks": prelaunch_checks,
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
@@ -1872,6 +1939,7 @@ def _build_manifest_payload(
         "selected_algorithm": training_config.algorithm,
         "selected_episode_mode": training_config.episode_selection_mode,
         "effective_seed": int(training_config.seed),
+        "action_masking_enabled": training_config.action_masking,
         "requested_device": requested_device,
         "resolved_device": resolved_device,
         "training_config_path": str(training_config_path),
@@ -1925,6 +1993,7 @@ def _build_smoke_payload(
     effective_seed: int | None,
     requested_device: str | None,
     resolved_device: str | None,
+    action_masking_enabled: bool | None,
     startup_phase_trace: list[dict[str, Any]],
     launch_guard_results: dict[str, Any],
     smoke_rollout_summary: dict[str, Any],
@@ -1942,6 +2011,7 @@ def _build_smoke_payload(
         "selected_algorithm": selected_algorithm,
         "selected_episode_mode": selected_episode_mode,
         "effective_seed": effective_seed,
+        "action_masking_enabled": action_masking_enabled,
         "requested_device": requested_device,
         "resolved_device": resolved_device,
         "startup_phase_trace": startup_phase_trace,

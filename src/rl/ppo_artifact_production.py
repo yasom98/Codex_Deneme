@@ -599,6 +599,8 @@ def execute_ppo_artifact_production(
             episode_ref=dict(selected_episode.episode_ref),
         )
         env_client = TradingEnvGym(config=effective_env_config, validate_on_init=True)
+        if production_config.action_masking:
+            env_client = _action_masker_wrapper(env_client)
         memory_snapshots.append(capture_memory_snapshot(label="env_init", step=0))
         phase_status["env_init"] = "completed"
         phase_detail["env_init"] = {
@@ -1459,6 +1461,16 @@ def _import_maskable_ppo_class() -> Any:
     if ppo_class is None:
         raise ImportError("sb3_contrib.MaskablePPO is unavailable")
     return ppo_class
+
+
+def _action_masker_wrapper(env: Any) -> Any:
+    """Wrap env with ActionMasker for MaskablePPO training."""
+    import importlib
+    module = importlib.import_module("sb3_contrib.common.wrappers")
+    ActionMasker = getattr(module, "ActionMasker", None)
+    if ActionMasker is None:
+        raise ImportError("sb3_contrib.common.wrappers.ActionMasker is unavailable")
+    return ActionMasker(env, lambda e: e.action_masks())
 
 
 def _load_ppo_model(*, model_artifact_path: Path, device: str | None) -> Any:
