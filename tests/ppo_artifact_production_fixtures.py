@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 import zipfile
 
+import numpy as np
 import pytest
 
 from tests.evaluation_backtest_fixtures import seed_evaluation_run
@@ -70,28 +71,52 @@ class FakeArtifactTrainingEnv:
 
 
 class FakeArtifactPpo:
-    """Minimal PPO stub with save/load behavior."""
+    """Minimal PPO stub with save/load behavior and callback support for checkpoint export."""
 
     def __init__(self, policy: str, env: Any, seed: int, device: str | None, verbose: int, **kwargs: Any) -> None:
-        self.policy = policy
+        self.policy_name = policy
         self.env = env
         self.seed = seed
         self.device = device
         self.verbose = verbose
         self.kwargs = kwargs
         self.num_timesteps = 0
+        self.logger = None
 
-    def learn(self, total_timesteps: int) -> "FakeArtifactPpo":
-        """Record learn execution."""
+    def get_env(self) -> Any:
+        """Return the attached env for SB3 callback compatibility."""
 
-        self.num_timesteps = int(total_timesteps)
+        return self.env
+
+    def learn(self, total_timesteps: int, callback: Any | None = None) -> "FakeArtifactPpo":
+        """Record learn execution with optional callback for checkpoint export."""
+
+        total_timesteps_int = int(total_timesteps)
+        if callback is not None:
+            callback.init_callback(self)
+            callback.on_training_start({}, {})
+
+        for step_index in range(total_timesteps_int):
+            self.num_timesteps = int(step_index + 1)
+            if callback is not None:
+                callback.update_locals(
+                    {
+                        "infos": [{}],
+                        "rewards": np.asarray([0.0], dtype=np.float32),
+                    }
+                )
+                if callback.on_step() is False:
+                    break
+
+        if callback is not None:
+            callback.on_training_end()
         return self
 
     def save(self, path: str) -> None:
         """Persist a small zip artifact."""
 
         payload = {
-            "policy": self.policy,
+            "policy": self.policy_name,
             "seed": self.seed,
             "device": self.device,
             "verbose": self.verbose,

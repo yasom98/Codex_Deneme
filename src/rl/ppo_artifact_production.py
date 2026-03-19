@@ -74,12 +74,13 @@ from rl.training_launcher import (
     _validate_state_manifest as _validate_state_manifest_upstream,
 )
 from rl.notebook_progress import build_training_progress_callback, log_progress_mode, resolve_progress_mode
-
 LOGGER = get_logger(__name__)
 
 TASK_NAME = "Milestone 4.8 Closure Prep — Canonical PPO Artifact Production Contract"
 CONTRACT_VERSION = "ppo_artifact_production.v1"
 CANONICAL_ARTIFACT_FILENAME = "canonical_ppo_model.zip"
+CHECKPOINT_ARTIFACTS_DIRNAME = "checkpoint_artifacts"
+CHECKPOINT_ARTIFACT_FILENAME_TEMPLATE = "ppo_model_step_{step:06d}.zip"
 MANIFEST_FILENAME = "artifact_production_manifest.json"
 REPORT_FILENAME = "artifact_production_report.json"
 
@@ -106,6 +107,7 @@ ARTIFACT_PRODUCTION_NUMERIC_INVALID = "ARTIFACT_PRODUCTION_NUMERIC_INVALID"
 ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED = "ARTIFACT_PRODUCTION_COLAB_STAGE_REPORT_REQUIRED"
 ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID = "ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID"
 ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED = "ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED"
+ARTIFACT_PRODUCTION_CHECKPOINT_EXPORT_FAILED = "ARTIFACT_PRODUCTION_CHECKPOINT_EXPORT_FAILED"
 
 PRODUCTION_CONFIG_REQUIRED_FIELDS = (
     "algorithm",
@@ -117,6 +119,7 @@ PRODUCTION_CONFIG_REQUIRED_FIELDS = (
     "startup_policy",
     "algo_params",
 )
+PRODUCTION_CONFIG_OPTIONAL_FIELDS = ("checkpoint_export_steps",)
 
 
 @dataclass
@@ -140,6 +143,7 @@ class ArtifactProductionConfig:
     episode_selection_mode: str
     startup_policy: str
     algo_params: PpoAlgoParams
+    checkpoint_export_steps: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -147,6 +151,7 @@ class ReportPaths:
     """Stable artifact production output paths."""
 
     artifact_path: Path
+    checkpoint_artifacts_dir: Path
     manifest_path: Path
     report_path: Path
 
@@ -189,6 +194,7 @@ def execute_ppo_artifact_production(
     output_dir_resolved = output_dir.resolve()
     report_paths = ReportPaths(
         artifact_path=output_dir_resolved / CANONICAL_ARTIFACT_FILENAME,
+        checkpoint_artifacts_dir=output_dir_resolved / CHECKPOINT_ARTIFACTS_DIRNAME,
         manifest_path=output_dir_resolved / MANIFEST_FILENAME,
         report_path=output_dir_resolved / REPORT_FILENAME,
     )
@@ -458,7 +464,20 @@ def execute_ppo_artifact_production(
         readiness_hash=readiness_hash,
         episode_catalog_hash=episode_catalog_hash,
         split_report_hash=split_report_hash,
+        checkpoint_export_steps=production_config.checkpoint_export_steps if production_config is not None else (),
+        checkpoint_exports=(),
+        report_paths=report_paths,
     )
+
+    checkpoint_exports: list[dict[str, Any]] = []
+    checkpoint_callback: Any | None = None
+    if production_config is not None and production_config.checkpoint_export_steps:
+        checkpoint_callback = _build_checkpoint_export_callback(
+            run_id=normalized_run_id,
+            checkpoint_export_steps=production_config.checkpoint_export_steps,
+            checkpoint_artifacts_dir=report_paths.checkpoint_artifacts_dir,
+            resolved_device=resolved_device,
+        )
 
     if errors:
         report_payload = _build_report_payload(
@@ -514,6 +533,9 @@ def execute_ppo_artifact_production(
             runtime=_runtime_payload(),
             warnings=warnings,
             errors=errors,
+            checkpoint_export_steps=production_config.checkpoint_export_steps if production_config is not None else (),
+            checkpoint_exports=checkpoint_exports,
+            report_paths=report_paths,
         )
         _write_reports(manifest_payload=manifest_payload, report_payload=report_payload, report_paths=report_paths)
         return ArtifactProductionExecutionResult(
@@ -740,6 +762,7 @@ def execute_ppo_artifact_production(
         phase_detail["learn_start"] = {
             "total_timesteps": int(production_config.total_timesteps),
             "progress_mode": progress_resolution.active_mode,
+            "checkpoint_export_steps": list(production_config.checkpoint_export_steps),
         }
         assert model is not None
         progress_callback = build_training_progress_callback(
@@ -753,8 +776,17 @@ def execute_ppo_artifact_production(
         )
         with numpy_fail_fast_context() as numeric_safety_metadata:
             learn_kwargs: dict[str, Any] = {"total_timesteps": int(production_config.total_timesteps)}
-            if progress_callback is not None:
-                learn_kwargs["callback"] = progress_callback
+            callbacks = [
+                callback
+                for callback in (progress_callback, checkpoint_callback)
+                if callback is not None
+            ]
+            if len(callbacks) == 1:
+                learn_kwargs["callback"] = callbacks[0]
+            elif len(callbacks) > 1:
+                from stable_baselines3.common.callbacks import CallbackList
+
+                learn_kwargs["callback"] = CallbackList(callbacks)
             model.learn(**learn_kwargs)
             ensure_model_parameters_finite(model)
         memory_snapshots.append(
@@ -772,16 +804,65 @@ def execute_ppo_artifact_production(
             normalized_run_id,
             int(getattr(model, "num_timesteps", production_config.total_timesteps)),
         )
+        checkpoint_exports = (
+            checkpoint_callback.build_exports_payload() if checkpoint_callback is not None else checkpoint_exports
+        )
     except Exception as exc:  # noqa: BLE001
         phase_status["learn_finish"] = "failed"
         phase_detail["learn_finish"] = {"error": str(exc)}
         if env_client is not None:
             env_client.close()
-        issue_code = ARTIFACT_PRODUCTION_NUMERIC_INVALID if _looks_like_numeric_failure(exc) else ARTIFACT_PRODUCTION_TRAIN_FAILED
-        issue_message = (
-            "Non-finite numeric state detected during canonical artifact production."
-            if issue_code == ARTIFACT_PRODUCTION_NUMERIC_INVALID
-            else "PPO learn() failed during canonical artifact production."
+        checkpoint_exports = (
+            checkpoint_callback.build_exports_payload() if checkpoint_callback is not None else checkpoint_exports
+        )
+        if isinstance(exc, ControlledArtifactProductionFailure):
+            issue = exc.issue
+        elif _looks_like_numeric_failure(exc):
+            issue = ValidationIssue(
+                code=ARTIFACT_PRODUCTION_NUMERIC_INVALID,
+                message="Non-finite numeric state detected during canonical artifact production.",
+                context={"error": str(exc)},
+            )
+        else:
+            issue = ValidationIssue(
+                code=ARTIFACT_PRODUCTION_TRAIN_FAILED,
+                message="PPO learn() failed during canonical artifact production.",
+                context={"error": str(exc)},
+            )
+        manifest_payload = _build_manifest_payload(
+            run_id=normalized_run_id,
+            production_session_id=production_session_id,
+            env_config_path=env_config_path.resolve(),
+            training_config_path=training_config_path.resolve(),
+            state_manifest_path=state_manifest_path.resolve(),
+            env_contract_report_path=env_contract_report_path.resolve(),
+            readiness_report_path=readiness_report_path.resolve(),
+            episode_catalog_path=episode_catalog_path.resolve(),
+            split_report_path=split_report_path.resolve(),
+            output_dir=output_dir_resolved,
+            selected_algorithm=production_config.algorithm,
+            policy=production_config.policy,
+            selected_episode_mode=production_config.episode_selection_mode,
+            selected_episode=selected_episode,
+            effective_seed=production_config.seed,
+            total_timesteps=production_config.total_timesteps,
+            requested_device=requested_device,
+            resolved_device=resolved_device,
+            artifact_sha256=None,
+            artifact_exists=False,
+            artifact_zip_valid=False,
+            load_back_succeeded=False,
+            load_back_model_class=None,
+            env_config_hash=env_config_hash,
+            training_config_hash=training_config_hash,
+            state_manifest_hash=state_manifest_hash,
+            env_contract_hash=env_contract_hash,
+            readiness_hash=readiness_hash,
+            episode_catalog_hash=episode_catalog_hash,
+            split_report_hash=split_report_hash,
+            checkpoint_export_steps=production_config.checkpoint_export_steps,
+            checkpoint_exports=checkpoint_exports,
+            report_paths=report_paths,
         )
         report_payload = _build_report_payload(
             run_id=normalized_run_id,
@@ -825,13 +906,10 @@ def execute_ppo_artifact_production(
             },
             runtime=_runtime_payload(numeric_safety_metadata),
             warnings=warnings,
-            errors=[
-                ValidationIssue(
-                    code=issue_code,
-                    message=issue_message,
-                    context={"error": str(exc)},
-                )
-            ],
+            errors=[issue],
+            checkpoint_export_steps=production_config.checkpoint_export_steps,
+            checkpoint_exports=checkpoint_exports,
+            report_paths=report_paths,
         )
         _write_reports(manifest_payload=manifest_payload, report_payload=report_payload, report_paths=report_paths)
         return ArtifactProductionExecutionResult(
@@ -919,6 +997,9 @@ def execute_ppo_artifact_production(
         readiness_hash=readiness_hash,
         episode_catalog_hash=episode_catalog_hash,
         split_report_hash=split_report_hash,
+        checkpoint_export_steps=production_config.checkpoint_export_steps,
+        checkpoint_exports=checkpoint_exports,
+        report_paths=report_paths,
     )
 
     phase_status["report_write"] = "completed"
@@ -967,9 +1048,12 @@ def execute_ppo_artifact_production(
                 split_report_hash=split_report_hash,
             ),
         },
+        checkpoint_export_steps=production_config.checkpoint_export_steps,
+        checkpoint_exports=checkpoint_exports,
         runtime=_runtime_payload(numeric_safety_metadata),
         warnings=warnings,
         errors=artifact_issues,
+        report_paths=report_paths,
     )
 
     try:
@@ -1025,6 +1109,7 @@ def execute_ppo_artifact_production(
             runtime=_runtime_payload(numeric_safety_metadata),
             warnings=warnings,
             errors=[report_issue],
+            report_paths=report_paths,
         )
         _best_effort_write_json(manifest_payload, report_paths.manifest_path)
         _best_effort_write_json(failed_report, report_paths.report_path)
@@ -1129,7 +1214,9 @@ def _validate_artifact_production_config(payload: dict[str, Any] | None) -> dict
     if payload is None:
         return {"config": None, "errors": errors}
 
-    extra_keys = sorted(set(payload.keys()) - set(PRODUCTION_CONFIG_REQUIRED_FIELDS))
+    extra_keys = sorted(
+        set(payload.keys()) - set(PRODUCTION_CONFIG_REQUIRED_FIELDS) - set(PRODUCTION_CONFIG_OPTIONAL_FIELDS)
+    )
     missing_keys = sorted(set(PRODUCTION_CONFIG_REQUIRED_FIELDS) - set(payload.keys()))
     if missing_keys or extra_keys:
         errors.append(
@@ -1211,6 +1298,18 @@ def _validate_artifact_production_config(payload: dict[str, Any] | None) -> dict
             )
         )
 
+    checkpoint_export_steps: tuple[int, ...] = ()
+    if "checkpoint_export_steps" in payload:
+        checkpoint_export_steps, checkpoint_errors = _validate_checkpoint_export_steps(
+            payload.get("checkpoint_export_steps"),
+            total_timesteps=(
+                int(total_timesteps_raw)
+                if isinstance(total_timesteps_raw, int) and not isinstance(total_timesteps_raw, bool)
+                else None
+            ),
+        )
+        errors.extend(checkpoint_errors)
+
     algo_params, algo_errors = _validate_algo_params(payload.get("algo_params"))
     errors.extend(_normalize_issues(algo_errors))
 
@@ -1230,6 +1329,7 @@ def _validate_artifact_production_config(payload: dict[str, Any] | None) -> dict
             episode_selection_mode=episode_selection_mode,
             startup_policy=startup_policy,
             algo_params=algo_params,
+            checkpoint_export_steps=checkpoint_export_steps,
         ),
         "errors": errors,
     }
@@ -1240,6 +1340,7 @@ def _save_and_validate_model_artifact(
     model: Any,
     artifact_path: Path,
     resolved_device: str | None,
+    artifact_role: str = "canonical",
 ) -> dict[str, Any]:
     """Save the model to a temp path, validate load-back, then atomically rename."""
 
@@ -1265,8 +1366,12 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_SAVE_FAILED,
-                message="PPO artifact save failed.",
-                context={"error": str(exc), "temp_artifact_path": str(tmp_artifact_path)},
+                message=f"{artifact_role.capitalize()} PPO artifact save failed.",
+                context={
+                    "artifact_role": artifact_role,
+                    "error": str(exc),
+                    "temp_artifact_path": str(tmp_artifact_path),
+                },
             )
         ) from exc
 
@@ -1274,8 +1379,8 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_ARTIFACT_MISSING,
-                message="Model save returned without materializing the temp artifact file.",
-                context={"temp_artifact_path": str(tmp_artifact_path)},
+                message=f"{artifact_role.capitalize()} model save returned without materializing the temp artifact file.",
+                context={"artifact_role": artifact_role, "temp_artifact_path": str(tmp_artifact_path)},
             )
         )
 
@@ -1284,8 +1389,8 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_ARTIFACT_INVALID,
-                message="Saved temp artifact is not a readable zip file.",
-                context={"temp_artifact_path": str(tmp_artifact_path)},
+                message=f"Saved temp {artifact_role} artifact is not a readable zip file.",
+                context={"artifact_role": artifact_role, "temp_artifact_path": str(tmp_artifact_path)},
             )
         )
 
@@ -1299,8 +1404,12 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_LOAD_BACK_FAILED,
-                message="PPO.load(...) failed against the saved temp artifact.",
-                context={"error": str(exc), "temp_artifact_path": str(tmp_artifact_path)},
+                message=f"PPO.load(...) failed against the saved temp {artifact_role} artifact.",
+                context={
+                    "artifact_role": artifact_role,
+                    "error": str(exc),
+                    "temp_artifact_path": str(tmp_artifact_path),
+                },
             )
         ) from exc
 
@@ -1310,8 +1419,8 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_ARTIFACT_MISSING,
-                message="Canonical artifact path does not exist after atomic rename.",
-                context={"artifact_path": str(artifact_path)},
+                message=f"{artifact_role.capitalize()} artifact path does not exist after atomic rename.",
+                context={"artifact_role": artifact_role, "artifact_path": str(artifact_path)},
             )
         )
 
@@ -1320,8 +1429,8 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_ARTIFACT_INVALID,
-                message="Canonical artifact path is not a readable zip file after rename.",
-                context={"artifact_path": str(artifact_path)},
+                message=f"{artifact_role.capitalize()} artifact path is not a readable zip file after rename.",
+                context={"artifact_role": artifact_role, "artifact_path": str(artifact_path)},
             )
         )
 
@@ -1333,8 +1442,8 @@ def _save_and_validate_model_artifact(
         raise ControlledArtifactProductionFailure(
             ValidationIssue(
                 code=ARTIFACT_PRODUCTION_ARTIFACT_MISSING,
-                message="Canonical artifact could not be hashed after rename.",
-                context={"artifact_path": str(artifact_path), "error": str(exc)},
+                message=f"{artifact_role.capitalize()} artifact could not be hashed after rename.",
+                context={"artifact_role": artifact_role, "artifact_path": str(artifact_path), "error": str(exc)},
             )
         ) from exc
     return save_state
@@ -1765,6 +1874,9 @@ def _build_manifest_payload(
     readiness_hash: str | None,
     episode_catalog_hash: str | None,
     split_report_hash: str | None,
+    checkpoint_export_steps: Sequence[int] = (),
+    checkpoint_exports: Sequence[Mapping[str, Any]] = (),
+    report_paths: ReportPaths | None = None,
 ) -> dict[str, Any]:
     """Build machine-readable artifact manifest payload."""
 
@@ -1789,6 +1901,7 @@ def _build_manifest_payload(
             "selected_episode_mode": selected_episode_mode,
             "effective_seed": effective_seed,
             "total_timesteps": total_timesteps,
+            "checkpoint_export_steps": [int(step) for step in checkpoint_export_steps],
             "requested_device": requested_device,
             "resolved_device": resolved_device,
             "startup_policy": STARTUP_POLICY_FRESH_ONLY,
@@ -1829,6 +1942,11 @@ def _build_manifest_payload(
                 "split_report": _sha256_if_file(split_report_path),
             },
         },
+        "checkpoint_artifacts": _checkpoint_artifacts_payload(
+            checkpoint_export_steps=checkpoint_export_steps,
+            checkpoint_exports=checkpoint_exports,
+            checkpoint_artifacts_dir=(report_paths.checkpoint_artifacts_dir if report_paths is not None else None),
+        ),
         "output_dir": str(output_dir),
         "produced_at_utc": _generated_at(),
     }
@@ -1858,6 +1976,9 @@ def _build_report_payload(
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
     runtime: dict[str, Any] | None = None,
+    checkpoint_export_steps: Sequence[int] = (),
+    checkpoint_exports: Sequence[Mapping[str, Any]] = (),
+    report_paths: ReportPaths | None = None,
 ) -> dict[str, Any]:
     """Build machine-readable artifact production report payload."""
 
@@ -1884,6 +2005,11 @@ def _build_report_payload(
         "validation_checks": list(validation_checks),
         "startup_phase_trace": list(startup_phase_trace),
         "production_summary": production_summary,
+        "checkpoint_artifacts": _checkpoint_artifacts_payload(
+            checkpoint_export_steps=checkpoint_export_steps,
+            checkpoint_exports=checkpoint_exports,
+            checkpoint_artifacts_dir=(report_paths.checkpoint_artifacts_dir if report_paths is not None else None),
+        ),
         "runtime": dict(runtime) if runtime is not None else None,
         "warnings": [asdict(item) for item in warnings],
         "errors": [asdict(item) for item in errors],
@@ -2007,6 +2133,26 @@ def _canonicality_checks(
     }
 
 
+def _checkpoint_artifacts_payload(
+    *,
+    checkpoint_export_steps: Sequence[int],
+    checkpoint_exports: Sequence[Mapping[str, Any]],
+    checkpoint_artifacts_dir: Path | None,
+) -> dict[str, Any]:
+    """Build additive checkpoint export metadata for manifest/report payloads."""
+
+    requested_steps = [int(step) for step in checkpoint_export_steps]
+    return {
+        "enabled": len(requested_steps) > 0,
+        "artifacts_dir": str(checkpoint_artifacts_dir) if checkpoint_artifacts_dir is not None and requested_steps else None,
+        "requested_steps": requested_steps,
+        "expected_export_count": len(requested_steps),
+        "actual_export_count": len(checkpoint_exports),
+        "all_requested_exports_succeeded": len(requested_steps) == len(checkpoint_exports),
+        "exports": [dict(item) for item in checkpoint_exports],
+    }
+
+
 def _validate_optional_optimizations(
     *,
     enable_amp: bool,
@@ -2061,6 +2207,149 @@ def _validate_optional_optimizations(
         )
 
     return optimization_runtime, issues
+
+
+def _validate_checkpoint_export_steps(
+    raw_value: Any,
+    *,
+    total_timesteps: int | None,
+) -> tuple[tuple[int, ...], list[ValidationIssue]]:
+    """Validate optional checkpoint export steps."""
+
+    if not isinstance(raw_value, list):
+        return (), [
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_CONFIG_INVALID,
+                message="checkpoint_export_steps must be an array of strictly increasing positive integers when provided.",
+                context={"checkpoint_export_steps": raw_value},
+            )
+        ]
+
+    errors: list[ValidationIssue] = []
+    parsed_steps: list[int] = []
+    for index, value in enumerate(raw_value):
+        if not isinstance(value, int) or isinstance(value, bool) or int(value) <= 0:
+            errors.append(
+                ValidationIssue(
+                    code=ARTIFACT_PRODUCTION_CONFIG_INVALID,
+                    message="checkpoint_export_steps entries must be positive integers.",
+                    context={"index": index, "value": value},
+                )
+            )
+            continue
+        parsed_steps.append(int(value))
+
+    if errors:
+        return (), errors
+
+    if parsed_steps != sorted(parsed_steps) or len(parsed_steps) != len(set(parsed_steps)):
+        errors.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_CONFIG_INVALID,
+                message="checkpoint_export_steps must be strictly increasing with no duplicates.",
+                context={"checkpoint_export_steps": parsed_steps},
+            )
+        )
+    if total_timesteps is not None and any(step > int(total_timesteps) for step in parsed_steps):
+        errors.append(
+            ValidationIssue(
+                code=ARTIFACT_PRODUCTION_CONFIG_INVALID,
+                message="checkpoint_export_steps must be <= total_timesteps.",
+                context={"checkpoint_export_steps": parsed_steps, "total_timesteps": total_timesteps},
+            )
+        )
+    return tuple(parsed_steps) if not errors else (), errors
+
+
+def _build_checkpoint_export_callback(
+    *,
+    run_id: str,
+    checkpoint_export_steps: Sequence[int],
+    checkpoint_artifacts_dir: Path,
+    resolved_device: str | None,
+) -> Any:
+    """Build an optional callback that exports load-valid checkpoint artifacts."""
+
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class _CheckpointExportCallback(BaseCallback):
+        def __init__(self) -> None:
+            super().__init__(verbose=0)
+            self._requested_steps = tuple(int(step) for step in checkpoint_export_steps)
+            self._remaining_steps = list(self._requested_steps)
+            self._exports: list[dict[str, Any]] = []
+
+        def _on_training_start(self) -> None:
+            if not self._requested_steps:
+                return
+            if checkpoint_artifacts_dir.exists():
+                raise ControlledArtifactProductionFailure(
+                    ValidationIssue(
+                        code=ARTIFACT_PRODUCTION_OUTPUT_CONFLICT,
+                        message="checkpoint_artifacts_dir already exists inside the fresh artifact output dir.",
+                        context={"checkpoint_artifacts_dir": str(checkpoint_artifacts_dir)},
+                    )
+                )
+            checkpoint_artifacts_dir.mkdir(parents=False, exist_ok=False)
+
+        def _on_step(self) -> bool:
+            current_step = int(getattr(self.model, "num_timesteps", 0))
+            while self._remaining_steps and current_step >= self._remaining_steps[0]:
+                requested_step = int(self._remaining_steps.pop(0))
+                artifact_path = checkpoint_artifacts_dir / CHECKPOINT_ARTIFACT_FILENAME_TEMPLATE.format(step=requested_step)
+                LOGGER.info(
+                    "Checkpoint export start | run_id=%s requested_step=%d artifact_path=%s",
+                    run_id,
+                    requested_step,
+                    artifact_path,
+                )
+                save_state = _save_and_validate_model_artifact(
+                    model=self.model,
+                    artifact_path=artifact_path,
+                    resolved_device=resolved_device,
+                    artifact_role="checkpoint",
+                )
+                exported_step = int(getattr(self.model, "num_timesteps", requested_step))
+                self._exports.append(
+                    {
+                        "requested_step": requested_step,
+                        "exported_num_timesteps": exported_step,
+                        "artifact_path": str(artifact_path),
+                        "filename": artifact_path.name,
+                        "artifact_sha256": save_state["artifact_sha256"],
+                        "artifact_exists": bool(save_state["artifact_exists"]),
+                        "artifact_zip_valid": bool(save_state["artifact_zip_valid"]),
+                        "load_back_succeeded": bool(save_state["load_back_succeeded"]),
+                        "load_back_model_class": save_state["load_back_model_class"],
+                    }
+                )
+                LOGGER.info(
+                    "Checkpoint export finished | run_id=%s requested_step=%d exported_num_timesteps=%d artifact_path=%s",
+                    run_id,
+                    requested_step,
+                    exported_step,
+                    artifact_path,
+                )
+            return True
+
+        def _on_training_end(self) -> None:
+            if not self._remaining_steps:
+                return
+            raise ControlledArtifactProductionFailure(
+                ValidationIssue(
+                    code=ARTIFACT_PRODUCTION_CHECKPOINT_EXPORT_FAILED,
+                    message="Training finished before all requested checkpoint artifacts were exported.",
+                    context={
+                        "remaining_requested_steps": list(self._remaining_steps),
+                        "num_timesteps_after_learn": int(getattr(self.model, "num_timesteps", 0)),
+                    },
+                )
+            )
+
+        def build_exports_payload(self) -> list[dict[str, Any]]:
+            return [dict(item) for item in self._exports]
+
+    return _CheckpointExportCallback()
 
 
 def _build_runtime_payload(

@@ -2,10 +2,11 @@
   "algorithm": "ppo",
   "policy": "MlpPolicy",
   "seed": 42,
-  "total_timesteps": 131072,
+  "total_timesteps": 100000,
   "device": "auto",
   "episode_selection_mode": "seeded_random_episode",
   "startup_policy": "fresh_only",
+  "checkpoint_export_steps": [25000, 50000, 100000],
   "algo_params": {
     "learning_rate": 0.0003,
     "n_steps": 512,

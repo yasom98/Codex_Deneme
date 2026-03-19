@@ -11,8 +11,10 @@ from rl.ppo_artifact_production import (
     ARTIFACT_PRODUCTION_COLAB_RUNTIME_DEPENDENCY_FAILED,
     ARTIFACT_PRODUCTION_COLAB_STAGE_INVALID,
     ARTIFACT_PRODUCTION_COMPILE_UNSUPPORTED,
+    ARTIFACT_PRODUCTION_CONFIG_INVALID,
     ARTIFACT_PRODUCTION_OUTPUT_CONFLICT,
     CANONICAL_ARTIFACT_FILENAME,
+    CHECKPOINT_ARTIFACTS_DIRNAME,
     MANIFEST_FILENAME,
     REPORT_FILENAME,
     execute_ppo_artifact_production,
@@ -97,6 +99,91 @@ def test_success_writes_canonical_artifact_manifest_and_report(
     assert report["runtime"]["progress"]["active_mode"] == "disabled"
     assert report["runtime"]["execution_bounds"]["n_envs"] == 1
     assert report["runtime"]["optimizations"]["amp"]["requested"] is False
+
+
+def test_checkpoint_exports_write_load_valid_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "artifact_production_checkpoint_exports"
+    seeded = seed_artifact_production_run(monkeypatch, tmp_path, run_id)
+    training_config_path = write_artifact_training_config(
+        tmp_path,
+        run_id,
+        overrides={"checkpoint_export_steps": [4, 8, 16]},
+    )
+
+    monkeypatch.setattr("rl.ppo_artifact_production.TradingEnvGym", FakeArtifactTrainingEnv)
+    monkeypatch.setattr("rl.ppo_artifact_production._import_ppo_class", lambda: FakeArtifactPpo)
+
+    result = _run_production(
+        run_id=run_id,
+        env_config_path=seeded["env_config_path"],
+        training_config_path=training_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "artifact_checkpoint_exports_out",
+    )
+
+    report = json.loads(result.report_paths.report_path.read_text(encoding="utf-8"))
+    manifest = json.loads(result.report_paths.manifest_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert result.report_paths.checkpoint_artifacts_dir.name == CHECKPOINT_ARTIFACTS_DIRNAME
+    assert result.report_paths.checkpoint_artifacts_dir.exists()
+    assert manifest["training_contract"]["checkpoint_export_steps"] == [4, 8, 16]
+    assert report["checkpoint_artifacts"]["enabled"] is True
+    assert report["checkpoint_artifacts"]["requested_steps"] == [4, 8, 16]
+    assert report["checkpoint_artifacts"]["actual_export_count"] == 3
+    assert report["checkpoint_artifacts"]["all_requested_exports_succeeded"] is True
+
+    exported_filenames = [entry["filename"] for entry in report["checkpoint_artifacts"]["exports"]]
+    assert exported_filenames == [
+        "ppo_model_step_000004.zip",
+        "ppo_model_step_000008.zip",
+        "ppo_model_step_000016.zip",
+    ]
+    for entry in report["checkpoint_artifacts"]["exports"]:
+        checkpoint_path = Path(entry["artifact_path"])
+        assert checkpoint_path.exists()
+        assert entry["artifact_exists"] is True
+        assert entry["artifact_zip_valid"] is True
+        assert entry["load_back_succeeded"] is True
+        assert entry["load_back_model_class"] == "FakeArtifactPpo"
+        assert isinstance(entry["artifact_sha256"], str) and len(entry["artifact_sha256"]) > 0
+
+
+def test_checkpoint_export_steps_must_be_strictly_increasing_and_within_total_timesteps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "artifact_production_checkpoint_config_invalid"
+    seeded = seed_artifact_production_run(monkeypatch, tmp_path, run_id)
+    training_config_path = write_artifact_training_config(
+        tmp_path,
+        run_id,
+        overrides={"checkpoint_export_steps": [8, 8, 32]},
+    )
+
+    result = _run_production(
+        run_id=run_id,
+        env_config_path=seeded["env_config_path"],
+        training_config_path=training_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "artifact_checkpoint_invalid_out",
+    )
+
+    assert result.exit_code == 2
+    report = json.loads(result.report_paths.report_path.read_text(encoding="utf-8"))
+    assert ARTIFACT_PRODUCTION_CONFIG_INVALID in report["failure_codes"]
+    assert report["checkpoint_artifacts"]["enabled"] is False
 
 
 def test_missing_split_report_fails_closed_and_writes_report(

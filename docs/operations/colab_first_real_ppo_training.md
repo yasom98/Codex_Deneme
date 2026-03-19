@@ -206,6 +206,9 @@ Basarili training artifact seti:
 - `${ARTIFACT_OUT}/canonical_ppo_model.zip`
 - `${ARTIFACT_OUT}/artifact_production_manifest.json`
 - `${ARTIFACT_OUT}/artifact_production_report.json`
+- `${ARTIFACT_OUT}/checkpoint_artifacts/ppo_model_step_00025000.zip` *(istege bagli, checkpoint_export_steps yapilandirildiginda)*
+- `${ARTIFACT_OUT}/checkpoint_artifacts/ppo_model_step_00050000.zip`
+- `${ARTIFACT_OUT}/checkpoint_artifacts/ppo_model_step_00100000.zip`
 
 # Evaluation Command
 
@@ -277,6 +280,7 @@ Success sonrasi yazilacak setler:
   - `canonical_ppo_model.zip`
   - `artifact_production_manifest.json`
   - `artifact_production_report.json`
+  - `checkpoint_artifacts/` *(istege bagli, checkpoint_export_steps yapilandirildiginda)*
 - evaluation:
   - `evaluation_validation_report.json`
   - `evaluation_manifest.json`
@@ -296,6 +300,7 @@ mkdir -p "${DRIVE_ROOT}/runs/${RUN_ID}/ppo_artifact/${ARTIFACT_ID}"
 cp "${ARTIFACT_OUT}/canonical_ppo_model.zip" "${DRIVE_ROOT}/runs/${RUN_ID}/ppo_artifact/${ARTIFACT_ID}/"
 cp "${ARTIFACT_OUT}/artifact_production_manifest.json" "${DRIVE_ROOT}/runs/${RUN_ID}/ppo_artifact/${ARTIFACT_ID}/"
 cp "${ARTIFACT_OUT}/artifact_production_report.json" "${DRIVE_ROOT}/runs/${RUN_ID}/ppo_artifact/${ARTIFACT_ID}/"
+cp -r "${ARTIFACT_OUT}/checkpoint_artifacts" "${DRIVE_ROOT}/runs/${RUN_ID}/ppo_artifact/${ARTIFACT_ID}/" 2>/dev/null || true
 
 mkdir -p "${DRIVE_ROOT}/runs/${RUN_ID}/evaluation/${EVAL_ID}"
 cp "${EVAL_OUT}/evaluation_validation_report.json" "${DRIVE_ROOT}/runs/${RUN_ID}/evaluation/${EVAL_ID}/"
