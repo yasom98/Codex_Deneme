@@ -14,15 +14,27 @@ import sys
 import zipfile
 from typing import Any, Mapping, Sequence
 
-from core.io_atomic import atomic_write_json, atomic_write_parquet
+from core.io_atomic import atomic_write_json, atomic_write_parquet, atomic_write_text
 from core.logging import get_logger
 import numpy as np
 import pandas as pd
+import torch as th
 from rl.colab_runtime import capture_memory_snapshot, collect_runtime_environment, validate_finite_scalar
 from rl.env_adapter_gym import TradingEnvGym
 from rl.env_contract import EnvConfig, parse_env_config
 from rl.env_core import EpisodeRef
 from rl.notebook_progress import EvaluationProgressBar, log_progress_mode, resolve_progress_mode
+from rl.passivity_diagnostics import (
+    DETERMINISTIC_ACTION_RANKING_TRACE_FILENAME,
+    DETERMINISTIC_HOLD_GAP_THRESHOLD,
+    PASSIVITY_DIAGNOSTICS_REPORT_FILENAME,
+    build_deterministic_action_ranking_row,
+    build_deterministic_action_ranking_summary,
+    build_deterministic_action_ranking_trace_csv,
+    build_eval_passivity_diagnostics_report,
+    extract_action_probabilities,
+    summarize_eval_policy_behavior,
+)
 from rl.risk_overlay import (
     RISK_OVERLAY_CONTRACT_VERSION,
     MarketSnapshot,
@@ -123,6 +135,7 @@ EVAL_BENCHMARK_FAILED = "EVAL_BENCHMARK_FAILED"
 EVAL_REPORT_WRITE_FAILED = "EVAL_REPORT_WRITE_FAILED"
 EVAL_RISK_OVERLAY_CONFIG_REQUIRED = "EVAL_RISK_OVERLAY_CONFIG_REQUIRED"
 EVAL_RISK_OVERLAY_CONFIG_INVALID = "EVAL_RISK_OVERLAY_CONFIG_INVALID"
+EVAL_PASSIVITY_DIAGNOSTICS_FAILED = "EVAL_PASSIVITY_DIAGNOSTICS_FAILED"
 
 
 @dataclass
@@ -153,6 +166,8 @@ class EvalConfig:
     max_eval_steps: int
     write_step_trace: bool
     backtest_metrics: tuple[str, ...]
+    action_masking: bool = False
+    passivity_diagnostics: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,6 +190,8 @@ class ReportPaths:
     manifest_path: Path
     backtest_report_path: Path
     step_trace_path: Path
+    passivity_diagnostics_report_path: Path
+    deterministic_action_ranking_trace_path: Path
     risk_decision_log_path: Path | None = None
     risk_overlay_summary_path: Path | None = None
     risk_state_transition_log_path: Path | None = None
@@ -233,6 +250,8 @@ def execute_evaluation_backtest(
         manifest_path=output_dir_resolved / "evaluation_manifest.json",
         backtest_report_path=output_dir_resolved / "evaluation_backtest_report.json",
         step_trace_path=output_dir_resolved / "evaluation_step_trace.parquet",
+        passivity_diagnostics_report_path=output_dir_resolved / PASSIVITY_DIAGNOSTICS_REPORT_FILENAME,
+        deterministic_action_ranking_trace_path=output_dir_resolved / DETERMINISTIC_ACTION_RANKING_TRACE_FILENAME,
         risk_decision_log_path=output_dir_resolved / "risk_decision_log.jsonl",
         risk_overlay_summary_path=output_dir_resolved / "risk_overlay_summary.json",
         risk_state_transition_log_path=output_dir_resolved / "risk_state_transition_log.jsonl",
@@ -267,6 +286,8 @@ def execute_evaluation_backtest(
             state_manifest_hash=None,
             episode_catalog_hash=None,
             split_report_hash=None,
+            action_masking_enabled=None,
+            passivity_diagnostics_enabled=None,
             risk_overlay_enabled=bool(risk_overlay_config_path is not None),
             risk_overlay_config_hash=None,
             validation_checks=[
@@ -292,6 +313,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=None,
             deterministic=None,
+            action_masking_enabled=None,
             effective_seed=None,
             evaluation_mode=None,
             target_mode=None,
@@ -310,6 +332,8 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            passivity_diagnostics_enabled=None,
+            report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=bool(risk_overlay_config_path is not None),
                 config_hash=None,
@@ -399,6 +423,20 @@ def execute_evaluation_backtest(
     benchmark_mode = eval_config.benchmark_mode if eval_config is not None else _raw_string(
         loaded_inputs.get("eval_config"), "benchmark_mode"
     )
+    action_masking_enabled = (
+        eval_config.action_masking
+        if eval_config is not None
+        else loaded_inputs.get("eval_config", {}).get("action_masking")
+        if isinstance(loaded_inputs.get("eval_config"), dict)
+        else None
+    )
+    passivity_diagnostics_enabled = (
+        eval_config.passivity_diagnostics
+        if eval_config is not None
+        else loaded_inputs.get("eval_config", {}).get("passivity_diagnostics")
+        if isinstance(loaded_inputs.get("eval_config"), dict)
+        else None
+    )
 
     resolved_device, device_issues, dependency_probe = _resolve_device(requested_device)
     errors.extend(device_issues)
@@ -469,6 +507,8 @@ def execute_evaluation_backtest(
         state_manifest_hash=state_manifest_hash,
         episode_catalog_hash=episode_catalog_hash,
         split_report_hash=split_report_hash,
+        action_masking_enabled=action_masking_enabled,
+        passivity_diagnostics_enabled=passivity_diagnostics_enabled,
         risk_overlay_enabled=risk_overlay_enabled,
         risk_overlay_config_hash=risk_overlay_config_hash,
         validation_checks=validation_checks,
@@ -503,8 +543,11 @@ def execute_evaluation_backtest(
         state_manifest_hash=state_manifest_hash,
         episode_catalog_hash=episode_catalog_hash,
         split_report_hash=split_report_hash,
+        action_masking_enabled=action_masking_enabled,
+        passivity_diagnostics_enabled=passivity_diagnostics_enabled,
         output_dir=output_dir_resolved,
         warnings=warnings,
+        report_paths=report_paths,
         risk_overlay_metadata=_risk_overlay_manifest_metadata(
             enabled=risk_overlay_enabled,
             config_path=risk_overlay_config_path.resolve() if risk_overlay_enabled else None,
@@ -520,6 +563,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=selected_algorithm,
             deterministic=deterministic,
+            action_masking_enabled=action_masking_enabled,
             effective_seed=effective_seed,
             evaluation_mode=evaluation_mode,
             target_mode=target_mode,
@@ -538,6 +582,8 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            passivity_diagnostics_enabled=passivity_diagnostics_enabled,
+            report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
                 config_hash=risk_overlay_config_hash,
@@ -592,7 +638,23 @@ def execute_evaluation_backtest(
     _set_global_seed(eval_config.seed)
     try:
         LOGGER.info("Model load start | run_id=%s model_artifact=%s", normalized_run_id, model_artifact_path.resolve())
-        model = _load_ppo_model(model_artifact_path=model_artifact_path.resolve(), device=resolved_device)
+        detected_maskable = _detect_maskable_from_artifact(model_artifact_path=model_artifact_path.resolve())
+        if detected_maskable is None:
+            use_maskable = eval_config.action_masking
+            detection_source = "config"
+        else:
+            use_maskable = detected_maskable
+            detection_source = "artifact"
+            if detected_maskable != eval_config.action_masking:
+                LOGGER.warning(
+                    "Model class parity detection mismatch: artifact indicates action_masking=%s but config says action_masking=%s. Using artifact-detected value for load parity.",
+                    detected_maskable,
+                    eval_config.action_masking,
+                )
+        if use_maskable:
+            model = _load_maskable_ppo_model(model_artifact_path=model_artifact_path.resolve(), device=resolved_device)
+        else:
+            model = _load_ppo_model(model_artifact_path=model_artifact_path.resolve(), device=resolved_device)
         if hasattr(model, "set_random_seed"):
             model.set_random_seed(eval_config.seed)
         memory_snapshots.append(capture_memory_snapshot(label="model_load", step=0))
@@ -600,8 +662,11 @@ def execute_evaluation_backtest(
         phase_detail["model_load"] = {
             "model_class": type(model).__name__,
             "device": resolved_device,
+            "action_masking_enabled": use_maskable,
+            "detection_source": detection_source,
+            "detected_maskable": detected_maskable,
         }
-        LOGGER.info("Model load finished | run_id=%s model_class=%s", normalized_run_id, type(model).__name__)
+        LOGGER.info("Model load finished | run_id=%s model_class=%s detection_source=%s", normalized_run_id, type(model).__name__, detection_source)
     except Exception as exc:  # noqa: BLE001
         model_error = ValidationIssue(
             code=EVAL_MODEL_LOAD_FAILED,
@@ -616,6 +681,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
+            action_masking_enabled=eval_config.action_masking,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -626,6 +692,8 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
                 config_hash=risk_overlay_config_hash,
@@ -686,6 +754,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
+            action_masking_enabled=eval_config.action_masking,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -696,6 +765,8 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
                 config_hash=risk_overlay_config_hash,
@@ -723,6 +794,11 @@ def execute_evaluation_backtest(
         )
 
     episode_runtimes: list[EpisodeRuntime] = []
+    comparison_episode_runtimes: list[EpisodeRuntime] | None = None
+    passivity_diagnostics_payload: dict[str, Any] | None = None
+    passivity_diagnostics_issue: ValidationIssue | None = None
+    deterministic_action_ranking_rows: list[dict[str, Any]] = []
+    deterministic_action_ranking_trace_csv: str | None = None
     step_rows: list[dict[str, Any]] = []
     progress_bar = EvaluationProgressBar(
         resolution=progress_resolution,
@@ -744,6 +820,7 @@ def execute_evaluation_backtest(
         phase_detail["eval_start"] = {
             "selected_episode_count": len(env_clients),
             "deterministic": eval_config.deterministic,
+            "passivity_diagnostics_enabled": eval_config.passivity_diagnostics,
         }
         for episode_index, (episode_ref, env_client) in enumerate(zip(target_resolution.selected_episode_refs, env_clients, strict=True)):
             progress_bar.on_episode_start(episode_index=episode_index, episode_ref=dict(episode_ref))
@@ -756,10 +833,15 @@ def execute_evaluation_backtest(
                 deterministic=eval_config.deterministic,
                 seed=eval_config.seed,
                 benchmark_mode=eval_config.benchmark_mode,
+                action_masking_enabled=eval_config.action_masking,
                 requested_metrics=eval_config.backtest_metrics,
                 episode_index=episode_index,
                 progress_bar=progress_bar,
                 risk_overlay_session=risk_overlay_session,
+                deterministic_action_ranking_rows=(
+                    deterministic_action_ranking_rows if eval_config.passivity_diagnostics and eval_config.deterministic else None
+                ),
+                deterministic_ranking_gap_threshold=DETERMINISTIC_HOLD_GAP_THRESHOLD,
             )
             episode_runtimes.append(runtime)
             step_rows.extend(runtime.step_records)
@@ -770,6 +852,57 @@ def execute_evaluation_backtest(
             "evaluated_episode_count": len(episode_runtimes),
             "step_count_total": sum(len(item.step_records) for item in episode_runtimes),
         }
+        if eval_config.passivity_diagnostics:
+            comparison_episode_runtimes = []
+            if hasattr(model, "set_random_seed"):
+                model.set_random_seed(eval_config.seed)
+            stochastic_overlay_session: RiskOverlaySession | None = None
+            if risk_overlay_enabled and risk_overlay_config is not None and risk_overlay_config_path is not None:
+                stochastic_overlay_session = build_risk_overlay_session(
+                    config=risk_overlay_config,
+                    config_path=risk_overlay_config_path.resolve(),
+                    config_hash=risk_overlay_config_hash,
+                )
+            try:
+                for episode_index, (episode_ref, env_client) in enumerate(
+                    zip(target_resolution.selected_episode_refs, env_clients, strict=True)
+                ):
+                    if stochastic_overlay_session is not None:
+                        stochastic_overlay_session.start_episode()
+                    comparison_runtime = _evaluate_single_episode(
+                        model=model,
+                        env_client=env_client,
+                        episode_ref=episode_ref,
+                        deterministic=not eval_config.deterministic,
+                        seed=eval_config.seed,
+                        benchmark_mode=eval_config.benchmark_mode,
+                        action_masking_enabled=eval_config.action_masking,
+                        requested_metrics=eval_config.backtest_metrics,
+                        episode_index=episode_index,
+                        progress_bar=None,
+                        risk_overlay_session=stochastic_overlay_session,
+                        deterministic_action_ranking_rows=(
+                            deterministic_action_ranking_rows
+                            if eval_config.passivity_diagnostics and not eval_config.deterministic
+                            else None
+                        ),
+                        deterministic_ranking_gap_threshold=DETERMINISTIC_HOLD_GAP_THRESHOLD,
+                    )
+                    comparison_episode_runtimes.append(comparison_runtime)
+            except ControlledEvaluationFailure as exc:
+                passivity_diagnostics_issue = ValidationIssue(
+                    code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                    message="Passivity diagnostics supplemental evaluation failed.",
+                    context={"error": str(exc), "episode_ref": exc.issue.context.get("episode_ref")},
+                )
+            except Exception as exc:  # noqa: BLE001
+                passivity_diagnostics_issue = ValidationIssue(
+                    code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                    message="Passivity diagnostics supplemental evaluation failed.",
+                    context={"error": str(exc)},
+                )
+            if comparison_episode_runtimes is not None:
+                phase_detail["eval_finish"]["passivity_diagnostics_episode_count"] = len(comparison_episode_runtimes)
         LOGGER.info(
             "Evaluation finished | run_id=%s evaluated_episode_count=%d step_count_total=%d",
             normalized_run_id,
@@ -786,6 +919,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
+            action_masking_enabled=eval_config.action_masking,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -796,6 +930,8 @@ def execute_evaluation_backtest(
             relative_metrics=None,
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
+            passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
                 config_hash=risk_overlay_config_hash,
@@ -848,6 +984,112 @@ def execute_evaluation_backtest(
             benchmark_status=benchmark_status,
         )
 
+    if eval_config.passivity_diagnostics:
+        if (
+            comparison_episode_runtimes is None
+            or passivity_diagnostics_issue is not None
+            or not deterministic_action_ranking_rows
+        ):
+            diagnostics_error = passivity_diagnostics_issue or ValidationIssue(
+                code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                message=(
+                    "Passivity diagnostics supplemental evaluation did not complete."
+                    if comparison_episode_runtimes is None
+                    else "Deterministic action ranking diagnostics did not capture any rows."
+                ),
+                context={"deterministic_ranking_row_count": len(deterministic_action_ranking_rows)},
+            )
+            phase_status["report_write"] = "completed"
+            phase_detail["report_write"] = {
+                "write_step_trace": eval_config.write_step_trace,
+                "trace_row_count": len(step_rows),
+            }
+            risk_overlay_bundle = risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None
+            failed_backtest = _build_backtest_payload(
+                run_id=normalized_run_id,
+                evaluation_session_id=evaluation_session_id,
+                evaluation_success=False,
+                selected_algorithm=eval_config.algorithm,
+                deterministic=eval_config.deterministic,
+                action_masking_enabled=eval_config.action_masking,
+                passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+                effective_seed=eval_config.seed,
+                evaluation_mode=eval_config.evaluation_mode,
+                target_mode=eval_config.target_mode,
+                benchmark_mode=eval_config.benchmark_mode,
+                startup_phase_trace=_phase_trace_from_maps(phase_status, phase_detail),
+                strategy_metrics=strategy_metrics,
+                benchmark_metrics=benchmark_metrics,
+                relative_metrics=relative_metrics,
+                metric_status={
+                    "strategy": strategy_status,
+                    "benchmark": benchmark_status,
+                    "relative": relative_status,
+                },
+                trace_artifact_path=str(report_paths.step_trace_path) if eval_config.write_step_trace else None,
+                report_paths=report_paths,
+                risk_overlay=_risk_overlay_backtest_metadata(
+                    enabled=risk_overlay_enabled,
+                    config_hash=risk_overlay_config_hash,
+                    report_paths=report_paths,
+                    summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
+                ),
+                runtime=_runtime_payload(),
+                warnings=warnings,
+                errors=[diagnostics_error],
+            )
+            write_ok = _write_reports_with_trace(
+                validation_payload=validation_payload,
+                manifest_payload=manifest_payload,
+                backtest_payload=failed_backtest,
+                report_paths=report_paths,
+                step_rows=step_rows,
+                write_step_trace=eval_config.write_step_trace,
+                deterministic_action_ranking_trace_csv=deterministic_action_ranking_trace_csv,
+                risk_overlay_bundle=risk_overlay_bundle,
+            )
+            return EvaluationExecutionResult(
+                exit_code=2 if write_ok else 3,
+                validation_payload=validation_payload,
+                manifest_payload=manifest_payload,
+                backtest_payload=failed_backtest,
+                report_paths=report_paths,
+                reports_written=bool(write_ok),
+            )
+
+        comparison_strategy_metrics, _ = _aggregate_metric_values(
+            episode_runtimes=comparison_episode_runtimes,
+            metric_names=eval_config.backtest_metrics,
+            metric_kind="strategy",
+        )
+        deterministic_episode_runtimes = episode_runtimes if eval_config.deterministic else comparison_episode_runtimes
+        stochastic_episode_runtimes = comparison_episode_runtimes if eval_config.deterministic else episode_runtimes
+        deterministic_strategy_metrics = strategy_metrics if eval_config.deterministic else comparison_strategy_metrics
+        stochastic_strategy_metrics = comparison_strategy_metrics if eval_config.deterministic else strategy_metrics
+        deterministic_summary = summarize_eval_policy_behavior(
+            episode_runtimes=deterministic_episode_runtimes,
+            strategy_metrics=deterministic_strategy_metrics,
+        )
+        deterministic_action_ranking_summary = build_deterministic_action_ranking_summary(
+            deterministic_action_ranking_rows,
+            gap_threshold=DETERMINISTIC_HOLD_GAP_THRESHOLD,
+        )
+        deterministic_action_ranking_trace_csv = build_deterministic_action_ranking_trace_csv(
+            deterministic_action_ranking_rows
+        )
+        stochastic_summary = summarize_eval_policy_behavior(
+            episode_runtimes=stochastic_episode_runtimes,
+            strategy_metrics=stochastic_strategy_metrics,
+        )
+        passivity_diagnostics_payload = build_eval_passivity_diagnostics_report(
+            run_id=normalized_run_id,
+            evaluation_session_id=evaluation_session_id,
+            action_masking_enabled=eval_config.action_masking,
+            deterministic_summary=deterministic_summary,
+            stochastic_summary=stochastic_summary,
+            deterministic_action_ranking_summary=deterministic_action_ranking_summary,
+        )
+
     phase_status["report_write"] = "completed"
     phase_detail["report_write"] = {
         "write_step_trace": eval_config.write_step_trace,
@@ -860,6 +1102,8 @@ def execute_evaluation_backtest(
         evaluation_success=True,
         selected_algorithm=eval_config.algorithm,
         deterministic=eval_config.deterministic,
+        action_masking_enabled=eval_config.action_masking,
+        passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
         effective_seed=eval_config.seed,
         evaluation_mode=eval_config.evaluation_mode,
         target_mode=eval_config.target_mode,
@@ -874,6 +1118,7 @@ def execute_evaluation_backtest(
             "relative": relative_status,
         },
         trace_artifact_path=str(report_paths.step_trace_path) if eval_config.write_step_trace else None,
+        report_paths=report_paths,
         risk_overlay=_risk_overlay_backtest_metadata(
             enabled=risk_overlay_enabled,
             config_hash=risk_overlay_config_hash,
@@ -891,6 +1136,8 @@ def execute_evaluation_backtest(
         report_paths=report_paths,
         step_rows=step_rows,
         write_step_trace=eval_config.write_step_trace,
+        passivity_diagnostics_payload=passivity_diagnostics_payload,
+        deterministic_action_ranking_trace_csv=deterministic_action_ranking_trace_csv,
         risk_overlay_bundle=risk_overlay_bundle,
     )
     if not write_ok:
@@ -905,6 +1152,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
+            action_masking_enabled=eval_config.action_masking,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -928,6 +1176,8 @@ def execute_evaluation_backtest(
                 "relative": relative_status,
             },
             trace_artifact_path=str(report_paths.step_trace_path) if eval_config.write_step_trace else None,
+            passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
                 config_hash=risk_overlay_config_hash,
@@ -1208,7 +1458,8 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
         "write_step_trace",
         "backtest_metrics",
     }
-    extra_keys = sorted(set(payload.keys()) - required_fields)
+    optional_fields = {"action_masking", "passivity_diagnostics"}
+    extra_keys = sorted(set(payload.keys()) - required_fields - optional_fields)
     missing_keys = sorted(required_fields - set(payload.keys()))
     if missing_keys or extra_keys:
         errors.append(
@@ -1401,6 +1652,25 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
             )
         )
 
+    action_masking_raw = payload.get("action_masking", False)
+    if not isinstance(action_masking_raw, bool):
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="action_masking must be a boolean when provided.",
+                context={"action_masking": action_masking_raw},
+            )
+        )
+    passivity_diagnostics_raw = payload.get("passivity_diagnostics", False)
+    if not isinstance(passivity_diagnostics_raw, bool):
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="passivity_diagnostics must be a boolean when provided.",
+                context={"passivity_diagnostics": passivity_diagnostics_raw},
+            )
+        )
+
     backtest_metrics_raw = payload.get("backtest_metrics")
     metrics: tuple[str, ...] = ()
     if not isinstance(backtest_metrics_raw, list) or not backtest_metrics_raw:
@@ -1465,6 +1735,8 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
             max_eval_steps=max_eval_steps_raw,
             write_step_trace=write_step_trace_raw,
             backtest_metrics=metrics,
+            action_masking=bool(action_masking_raw),
+            passivity_diagnostics=bool(passivity_diagnostics_raw),
         ),
         "errors": errors,
     }
@@ -2054,12 +2326,15 @@ def _evaluate_single_episode(
     env_client: TradingEnvGym,
     episode_ref: dict[str, Any],
     deterministic: bool,
+    action_masking_enabled: bool,
     seed: int,
     benchmark_mode: str,
     requested_metrics: Sequence[str],
     episode_index: int,
     progress_bar: EvaluationProgressBar | None = None,
     risk_overlay_session: RiskOverlaySession | None = None,
+    deterministic_action_ranking_rows: list[dict[str, Any]] | None = None,
+    deterministic_ranking_gap_threshold: float = DETERMINISTIC_HOLD_GAP_THRESHOLD,
 ) -> EpisodeRuntime:
     """Evaluate one isolated environment instance and return machine-readable evidence."""
 
@@ -2094,7 +2369,33 @@ def _evaluate_single_episode(
     peak_equity = current_equity
     while True:
         try:
-            raw_action = model.predict(observation, deterministic=deterministic)
+            action_masks = env_client.action_masks() if action_masking_enabled else None
+            ranking_action_probabilities: Mapping[str, float] | None = None
+            if deterministic_action_ranking_rows is not None:
+                try:
+                    ranking_action_probabilities = _extract_policy_action_probabilities(
+                        model=model,
+                        observation=observation,
+                        action_masks=action_masks,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise ControlledEvaluationFailure(
+                        ValidationIssue(
+                            code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                            message="Deterministic action ranking diagnostics failed during evaluation.",
+                            context={"episode_ref": dict(episode_ref), "step_counter": step_counter, "error": str(exc)},
+                        )
+                    ) from exc
+            if action_masking_enabled:
+                raw_action = model.predict(
+                    observation,
+                    deterministic=deterministic,
+                    action_masks=action_masks,
+                )
+            else:
+                raw_action = model.predict(observation, deterministic=deterministic)
+        except ControlledEvaluationFailure:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise ControlledEvaluationFailure(
                 ValidationIssue(
@@ -2234,6 +2535,7 @@ def _evaluate_single_episode(
             "pnl_delta": pnl_delta,
             "fees": fees,
             "slippage_cost": slippage_cost,
+            "invalid_close_flat_penalty": float(info_dict["reward_components"].get("invalid_close_flat_penalty", 0.0)),
             "trade_units": trade_units,
             "strategy_portfolio_value": portfolio_value,
             "terminated": bool(terminated),
@@ -2261,6 +2563,28 @@ def _evaluate_single_episode(
                         risk_decision.state_transition["reason_code"] if risk_decision.state_transition is not None else None
                     ),
                 }
+            )
+        if deterministic_action_ranking_rows is not None:
+            if ranking_action_probabilities is None:
+                raise ControlledEvaluationFailure(
+                    ValidationIssue(
+                        code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                        message="Deterministic ranking diagnostics did not capture policy probabilities.",
+                        context={"episode_ref": dict(episode_ref), "step_counter": step_counter},
+                    )
+                )
+            deterministic_action_ranking_rows.append(
+                build_deterministic_action_ranking_row(
+                    episode_index=episode_index,
+                    episode_ref=episode_ref,
+                    step_ordinal=step_counter,
+                    step_index=current_index,
+                    timestamp=current_timestamp,
+                    position_before=position_before,
+                    selected_action_semantic=str(info_dict["action_semantic"]),
+                    action_probabilities=ranking_action_probabilities,
+                    gap_threshold=deterministic_ranking_gap_threshold,
+                )
             )
         step_records.append(record)
         if progress_bar is not None:
@@ -2335,6 +2659,32 @@ def _evaluate_single_episode(
         closed_trade_proxy_returns=tuple(float(item) for item in closed_trade_proxy_returns if math.isfinite(item)),
         closed_trade_pnls=tuple(float(item) for item in closed_trade_pnls),
     )
+
+
+def _extract_policy_action_probabilities(
+    *,
+    model: Any,
+    observation: Any,
+    action_masks: np.ndarray | None,
+) -> dict[str, float]:
+    """Extract the exact action probabilities from the live policy used for eval."""
+
+    policy = getattr(model, "policy", None)
+    if policy is None or not hasattr(policy, "obs_to_tensor") or not hasattr(policy, "get_distribution"):
+        raise RuntimeError("model policy does not expose obs_to_tensor/get_distribution for diagnostics")
+    with th.no_grad():
+        observation_tensor, _ = policy.obs_to_tensor(observation)
+        if action_masks is not None:
+            try:
+                distribution = policy.get_distribution(observation_tensor, action_masks=action_masks)
+            except TypeError:
+                distribution = policy.get_distribution(observation_tensor)
+        else:
+            distribution = policy.get_distribution(observation_tensor)
+    action_probabilities = extract_action_probabilities(distribution)
+    if action_probabilities is None:
+        raise RuntimeError("policy distribution did not expose canonical action probabilities")
+    return action_probabilities
 
 
 def _build_buy_and_hold_trace(
@@ -2725,6 +3075,8 @@ def _write_core_reports(
     manifest_payload: dict[str, Any] | None,
     backtest_payload: dict[str, Any] | None,
     report_paths: ReportPaths,
+    passivity_diagnostics_payload: dict[str, Any] | None = None,
+    deterministic_action_ranking_trace_csv: str | None = None,
     risk_overlay_bundle: RiskOverlayReportBundle | None = None,
 ) -> None:
     """Atomically write the core JSON reports."""
@@ -2734,6 +3086,10 @@ def _write_core_reports(
         atomic_write_json(manifest_payload, report_paths.manifest_path)
     if backtest_payload is not None:
         atomic_write_json(backtest_payload, report_paths.backtest_report_path)
+    if passivity_diagnostics_payload is not None:
+        atomic_write_json(passivity_diagnostics_payload, report_paths.passivity_diagnostics_report_path)
+    if deterministic_action_ranking_trace_csv is not None:
+        atomic_write_text(deterministic_action_ranking_trace_csv, report_paths.deterministic_action_ranking_trace_path)
     if risk_overlay_bundle is not None:
         write_risk_overlay_artifacts(risk_overlay_bundle, output_dir=report_paths.backtest_report_path.parent)
 
@@ -2746,6 +3102,8 @@ def _write_reports_with_trace(
     report_paths: ReportPaths,
     step_rows: Sequence[Mapping[str, Any]],
     write_step_trace: bool,
+    passivity_diagnostics_payload: dict[str, Any] | None = None,
+    deterministic_action_ranking_trace_csv: str | None = None,
     risk_overlay_bundle: RiskOverlayReportBundle | None = None,
 ) -> bool:
     """Write reports and the optional parquet trace."""
@@ -2759,6 +3117,8 @@ def _write_reports_with_trace(
             manifest_payload=manifest_payload,
             backtest_payload=backtest_payload,
             report_paths=report_paths,
+            passivity_diagnostics_payload=passivity_diagnostics_payload,
+            deterministic_action_ranking_trace_csv=deterministic_action_ranking_trace_csv,
             risk_overlay_bundle=risk_overlay_bundle,
         )
         return True
@@ -2870,6 +3230,8 @@ def _build_validation_payload(
     state_manifest_hash: str | None,
     episode_catalog_hash: str | None,
     split_report_hash: str | None,
+    action_masking_enabled: bool | None,
+    passivity_diagnostics_enabled: bool | None,
     risk_overlay_enabled: bool,
     risk_overlay_config_hash: str | None,
     validation_checks: Sequence[dict[str, Any]],
@@ -2895,6 +3257,8 @@ def _build_validation_payload(
         "state_manifest_hash": state_manifest_hash,
         "episode_catalog_hash": episode_catalog_hash,
         "split_report_hash": split_report_hash,
+        "action_masking_enabled": action_masking_enabled,
+        "passivity_diagnostics_enabled": passivity_diagnostics_enabled,
         "risk_overlay_enabled": bool(risk_overlay_enabled),
         "risk_overlay_config_hash": risk_overlay_config_hash,
         "validation_checks": list(validation_checks),
@@ -2934,8 +3298,11 @@ def _build_manifest_payload(
     state_manifest_hash: str | None,
     episode_catalog_hash: str | None,
     split_report_hash: str | None,
+    action_masking_enabled: bool | None,
+    passivity_diagnostics_enabled: bool | None,
     output_dir: Path,
     warnings: Sequence[ValidationIssue],
+    report_paths: ReportPaths,
     risk_overlay_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     """Build evaluation manifest payload."""
@@ -2956,6 +3323,8 @@ def _build_manifest_payload(
         },
         "selected_algorithm": selected_algorithm,
         "deterministic": deterministic,
+        "action_masking_enabled": action_masking_enabled,
+        "passivity_diagnostics_enabled": passivity_diagnostics_enabled,
         "effective_seed": effective_seed,
         "requested_device": requested_device,
         "resolved_device": resolved_device,
@@ -2997,6 +3366,14 @@ def _build_manifest_payload(
         "episode_catalog_hash": episode_catalog_hash,
         "split_report_hash": split_report_hash,
         "risk_overlay": dict(risk_overlay_metadata),
+        "diagnostic_artifacts": {
+            "passivity_diagnostics_report_path": (
+                str(report_paths.passivity_diagnostics_report_path) if passivity_diagnostics_enabled else None
+            ),
+            "deterministic_action_ranking_trace_path": (
+                str(report_paths.deterministic_action_ranking_trace_path) if passivity_diagnostics_enabled else None
+            )
+        },
         "output_dir": str(output_dir),
         "generated_at": _generated_at(),
     }
@@ -3009,6 +3386,8 @@ def _build_backtest_payload(
     evaluation_success: bool,
     selected_algorithm: str | None,
     deterministic: bool | None,
+    action_masking_enabled: bool | None,
+    passivity_diagnostics_enabled: bool | None,
     effective_seed: int | None,
     evaluation_mode: str | None,
     target_mode: str | None,
@@ -3019,6 +3398,7 @@ def _build_backtest_payload(
     relative_metrics: dict[str, Any] | None,
     metric_status: dict[str, Any],
     trace_artifact_path: str | None,
+    report_paths: ReportPaths,
     risk_overlay: dict[str, Any],
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
@@ -3032,6 +3412,8 @@ def _build_backtest_payload(
         "evaluation_success": bool(evaluation_success),
         "selected_algorithm": selected_algorithm,
         "deterministic": deterministic,
+        "action_masking_enabled": action_masking_enabled,
+        "passivity_diagnostics_enabled": passivity_diagnostics_enabled,
         "effective_seed": effective_seed,
         "evaluation_mode": evaluation_mode,
         "target_mode": target_mode,
@@ -3042,6 +3424,14 @@ def _build_backtest_payload(
         "relative_metrics": relative_metrics,
         "metric_status": metric_status,
         "trace_artifact_path": trace_artifact_path,
+        "diagnostic_artifacts": {
+            "passivity_diagnostics_report_path": (
+                str(report_paths.passivity_diagnostics_report_path) if passivity_diagnostics_enabled else None
+            ),
+            "deterministic_action_ranking_trace_path": (
+                str(report_paths.deterministic_action_ranking_trace_path) if passivity_diagnostics_enabled else None
+            )
+        },
         "risk_overlay": dict(risk_overlay),
         "runtime": dict(runtime) if runtime is not None else None,
         "warnings": [asdict(item) for item in warnings],
@@ -3182,6 +3572,7 @@ def _effective_env_config(*, env_config: EnvConfig, seed: int, episode_ref: dict
             "reward_version": env_config.reward_contract.reward_version,
             "reward_formula_summary": env_config.reward_contract.reward_formula_summary,
             "included_components": list(env_config.reward_contract.included_components),
+            "invalid_close_flat_penalty": env_config.reward_contract.invalid_close_flat_penalty,
             "reward_scale": env_config.reward_contract.reward_scale,
             "reward_clip_min": env_config.reward_contract.reward_clip_min,
             "reward_clip_max": env_config.reward_contract.reward_clip_max,
@@ -3194,6 +3585,31 @@ def _effective_env_config(*, env_config: EnvConfig, seed: int, episode_ref: dict
     return parse_env_config(payload)
 
 
+def _detect_maskable_from_artifact(*, model_artifact_path: Path) -> bool | None:
+    """Detect from artifact whether model was saved as MaskablePPO or PPO.
+
+    Returns True if MaskablePPO, False if PPO, None if detection fails.
+    Inspects policy_class.__module__ inside the zip's data file.
+    """
+    try:
+        with zipfile.ZipFile(model_artifact_path, 'r') as z:
+            if 'data' not in z.namelist():
+                return None
+            with z.open('data') as f:
+                data = json.load(f)
+            policy_class = data.get('policy_class', {})
+            if not isinstance(policy_class, dict):
+                return None
+            module = policy_class.get('__module__', '')
+            if not isinstance(module, str):
+                return None
+            if 'maskable' in module.lower():
+                return True
+            return False
+    except Exception:
+        return None
+
+
 def _load_ppo_model(*, model_artifact_path: Path, device: str | None) -> Any:
     """Load the explicit SB3 PPO model artifact."""
 
@@ -3201,6 +3617,16 @@ def _load_ppo_model(*, model_artifact_path: Path, device: str | None) -> Any:
     ppo_class = getattr(module, "PPO", None)
     if ppo_class is None:
         raise ImportError("stable_baselines3.PPO is unavailable")
+    return ppo_class.load(str(model_artifact_path), device=device)
+
+
+def _load_maskable_ppo_model(*, model_artifact_path: Path, device: str | None) -> Any:
+    """Load the explicit SB3 MaskablePPO model artifact."""
+
+    module = importlib.import_module("sb3_contrib")
+    ppo_class = getattr(module, "MaskablePPO", None)
+    if ppo_class is None:
+        raise ImportError("sb3_contrib.MaskablePPO is unavailable")
     return ppo_class.load(str(model_artifact_path), device=device)
 
 
