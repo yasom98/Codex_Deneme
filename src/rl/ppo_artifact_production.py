@@ -2387,7 +2387,7 @@ def _build_checkpoint_export_callback(
         def build_exports_payload(self) -> list[dict[str, Any]]:
             return [dict(item) for item in self._exports]
 
-    return _CheckpointExportCallback()
+    return _CheckpointExportCallback(action_masking=action_masking)
 
 
 def _build_runtime_payload(
