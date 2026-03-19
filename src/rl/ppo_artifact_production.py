@@ -478,6 +478,7 @@ def execute_ppo_artifact_production(
             checkpoint_export_steps=production_config.checkpoint_export_steps,
             checkpoint_artifacts_dir=report_paths.checkpoint_artifacts_dir,
             resolved_device=resolved_device,
+            action_masking=production_config.action_masking,
         )
 
     if errors:
@@ -933,6 +934,7 @@ def execute_ppo_artifact_production(
             model=model,
             artifact_path=report_paths.artifact_path,
             resolved_device=resolved_device,
+            action_masking=production_config.action_masking,
         )
         memory_snapshots.append(
             capture_memory_snapshot(
@@ -1345,6 +1347,7 @@ def _save_and_validate_model_artifact(
     artifact_path: Path,
     resolved_device: str | None,
     artifact_role: str = "canonical",
+    action_masking: bool = False,
 ) -> dict[str, Any]:
     """Save the model to a temp path, validate load-back, then atomically rename."""
 
@@ -1400,7 +1403,11 @@ def _save_and_validate_model_artifact(
 
     save_state["artifact_zip_valid"] = True
     try:
-        loaded_model = _load_ppo_model(model_artifact_path=tmp_artifact_path, device=resolved_device)
+        loaded_model = _load_ppo_model(
+            model_artifact_path=tmp_artifact_path,
+            device=resolved_device,
+            action_masking=action_masking,
+        )
         save_state["load_back_succeeded"] = True
         save_state["load_back_model_class"] = type(loaded_model).__name__
     except Exception as exc:  # noqa: BLE001
@@ -1473,10 +1480,14 @@ def _action_masker_wrapper(env: Any) -> Any:
     return ActionMasker(env, lambda e: e.action_masks())
 
 
-def _load_ppo_model(*, model_artifact_path: Path, device: str | None) -> Any:
-    """Load a PPO model from an explicit artifact path."""
+def _get_ppo_class_for_production(*, action_masking: bool) -> Any:
+    """Return the correct PPO class based on action_masking flag for save/load parity."""
+    return _import_maskable_ppo_class() if action_masking else _import_ppo_class()
 
-    ppo_class = _import_ppo_class()
+
+def _load_ppo_model(*, model_artifact_path: Path, device: str | None, action_masking: bool = False) -> Any:
+    """Load a PPO model from an explicit artifact path."""
+    ppo_class = _get_ppo_class_for_production(action_masking=action_masking)
     return ppo_class.load(str(model_artifact_path), device=device)
 
 
@@ -2291,14 +2302,16 @@ def _build_checkpoint_export_callback(
     checkpoint_export_steps: Sequence[int],
     checkpoint_artifacts_dir: Path,
     resolved_device: str | None,
+    action_masking: bool = False,
 ) -> Any:
     """Build an optional callback that exports load-valid checkpoint artifacts."""
 
     from stable_baselines3.common.callbacks import BaseCallback
 
     class _CheckpointExportCallback(BaseCallback):
-        def __init__(self) -> None:
+        def __init__(self, action_masking: bool = False) -> None:
             super().__init__(verbose=0)
+            self.action_masking = action_masking
             self._requested_steps = tuple(int(step) for step in checkpoint_export_steps)
             self._remaining_steps = list(self._requested_steps)
             self._exports: list[dict[str, Any]] = []
@@ -2332,6 +2345,7 @@ def _build_checkpoint_export_callback(
                     artifact_path=artifact_path,
                     resolved_device=resolved_device,
                     artifact_role="checkpoint",
+                    action_masking=self.action_masking,
                 )
                 exported_step = int(getattr(self.model, "num_timesteps", requested_step))
                 self._exports.append(
