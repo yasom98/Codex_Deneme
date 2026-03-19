@@ -59,6 +59,7 @@ from rl.training_launcher import (
     _effective_env_config,
     _failure_codes,
     _hash_canonical_json,
+    _import_maskable_ppo_class,
     _import_ppo_class,
     _resolve_device,
     _resolve_selected_episode,
@@ -119,7 +120,7 @@ PRODUCTION_CONFIG_REQUIRED_FIELDS = (
     "startup_policy",
     "algo_params",
 )
-PRODUCTION_CONFIG_OPTIONAL_FIELDS = ("checkpoint_export_steps",)
+PRODUCTION_CONFIG_OPTIONAL_FIELDS = ("checkpoint_export_steps", "action_masking")
 
 
 @dataclass
@@ -144,6 +145,7 @@ class ArtifactProductionConfig:
     startup_policy: str
     algo_params: PpoAlgoParams
     checkpoint_export_steps: tuple[int, ...] = ()
+    action_masking: bool = False
 
 
 @dataclass(frozen=True)
@@ -669,8 +671,8 @@ def execute_ppo_artifact_production(
         )
 
     try:
-        LOGGER.info("Algo init start | run_id=%s policy=%s", normalized_run_id, production_config.policy)
-        ppo_class = _import_ppo_class()
+        LOGGER.info("Algo init start | run_id=%s policy=%s action_masking=%s", normalized_run_id, production_config.policy, production_config.action_masking)
+        ppo_class = _import_maskable_ppo_class() if production_config.action_masking else _import_ppo_class()
         model = ppo_class(
             production_config.policy,
             env_client,
@@ -1330,6 +1332,7 @@ def _validate_artifact_production_config(payload: dict[str, Any] | None) -> dict
             startup_policy=startup_policy,
             algo_params=algo_params,
             checkpoint_export_steps=checkpoint_export_steps,
+            action_masking=bool(payload.get("action_masking", False)),
         ),
         "errors": errors,
     }
