@@ -348,6 +348,21 @@ class ExecutionEngine:
     """Deterministic V1 action-to-position transition engine."""
 
     @staticmethod
+    def valid_action_mask(*, position_before: int) -> np.ndarray:
+        """Return the current valid-action mask under existing runtime rules."""
+
+        if position_before == 0:
+            mask = np.asarray([True, True, True, False], dtype=np.bool_)
+        elif position_before in {-1, 1}:
+            mask = np.asarray([True, False, False, True], dtype=np.bool_)
+        else:
+            raise ValueError("position_before must be one of {-1, 0, +1}")
+
+        if mask.shape != (len(ACTION_MAPPING),) or not bool(mask.any()):
+            raise ValueError("valid_action_mask must expose at least one valid action in canonical action order")
+        return mask
+
+    @staticmethod
     def apply_action(*, position_before: int, action_raw: int) -> ExecutionResult:
         """Apply one discrete action under V1 no-reversal policy."""
 
@@ -408,22 +423,27 @@ class RewardBreakdown:
     pnl_delta: float
     fees: float
     slippage_cost: float
+    invalid_close_flat_penalty: float
     reward_raw: float
     reward_total: float
 
 
 class RewardEngine:
-    """Reward decomposition contract for Milestone 4.5 v1."""
+    """Reward decomposition contract for Milestone 4.5 v1/v2."""
 
     @staticmethod
     def compute_reward(
         *,
+        action_raw: int,
+        invalid_action: bool,
+        invalid_action_reason: str | None,
         position_after: int,
         price_exec: float,
         price_next: float,
         trade_units: int,
         fee_bps: float,
         slippage_bps: float,
+        invalid_close_flat_penalty: float,
         reward_scale: float,
         reward_clip_min: float | None,
         reward_clip_max: float | None,
@@ -433,7 +453,14 @@ class RewardEngine:
         pnl_delta = float(position_after) * (float(price_next) - float(price_exec))
         fees = abs(int(trade_units)) * float(price_exec) * (float(fee_bps) / 10_000.0)
         slippage_cost = abs(int(trade_units)) * float(price_exec) * (float(slippage_bps) / 10_000.0)
-        reward_raw = pnl_delta - fees - slippage_cost
+        applied_invalid_close_flat_penalty = 0.0
+        if (
+            int(action_raw) == ACTION_CLOSE_POSITION
+            and bool(invalid_action)
+            and invalid_action_reason == "already_flat"
+        ):
+            applied_invalid_close_flat_penalty = float(invalid_close_flat_penalty)
+        reward_raw = pnl_delta - fees - slippage_cost - applied_invalid_close_flat_penalty
         reward_total = reward_raw * float(reward_scale)
         if reward_clip_min is not None or reward_clip_max is not None:
             reward_total = float(np.clip(reward_total, reward_clip_min, reward_clip_max))
@@ -442,6 +469,7 @@ class RewardEngine:
             pnl_delta=float(pnl_delta),
             fees=float(fees),
             slippage_cost=float(slippage_cost),
+            invalid_close_flat_penalty=float(applied_invalid_close_flat_penalty),
             reward_raw=float(reward_raw),
             reward_total=float(reward_total),
         )
@@ -458,6 +486,7 @@ class EpisodeRunnerConfig:
     reward_scale: float
     reward_clip_min: float | None
     reward_clip_max: float | None
+    invalid_close_flat_penalty: float
     seed: int | None
 
     def __post_init__(self) -> None:
@@ -472,6 +501,8 @@ class EpisodeRunnerConfig:
         if self.reward_clip_min is not None and self.reward_clip_max is not None:
             if float(self.reward_clip_min) > float(self.reward_clip_max):
                 raise ValueError("reward_clip_min cannot exceed reward_clip_max")
+        if float(self.invalid_close_flat_penalty) < 0.0:
+            raise ValueError("invalid_close_flat_penalty must be >= 0")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be int or null")
 
@@ -503,6 +534,11 @@ class EpisodeRunnerCore:
         """Return stable action mapping table."""
 
         return dict(ACTION_MAPPING)
+
+    def current_action_mask(self) -> np.ndarray:
+        """Return the valid discrete action mask for the current position state."""
+
+        return ExecutionEngine.valid_action_mask(position_before=self._position.exposure).copy()
 
     def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
         """Reset episode and return first observation and info payload."""
@@ -547,12 +583,16 @@ class EpisodeRunnerCore:
         price_exec = float(self._episode_data.execution_price_vector[current_index])
         price_next = float(self._episode_data.mark_to_market_price_vector[current_index + 1])
         reward = RewardEngine.compute_reward(
+            action_raw=exec_result.action_raw,
+            invalid_action=exec_result.invalid_action,
+            invalid_action_reason=exec_result.invalid_action_reason,
             position_after=exec_result.position_after,
             price_exec=price_exec,
             price_next=price_next,
             trade_units=exec_result.trade_units,
             fee_bps=self._config.fee_bps,
             slippage_bps=self._config.slippage_bps,
+            invalid_close_flat_penalty=self._config.invalid_close_flat_penalty,
             reward_scale=self._config.reward_scale,
             reward_clip_min=self._config.reward_clip_min,
             reward_clip_max=self._config.reward_clip_max,
@@ -584,6 +624,7 @@ class EpisodeRunnerCore:
             "reward_total": reward.reward_total,
             "reward_components": {
                 "pnl_delta": reward.pnl_delta,
+                "invalid_close_flat_penalty": reward.invalid_close_flat_penalty,
                 "reward_raw": reward.reward_raw,
                 "reward_scaled": reward.reward_total,
             },

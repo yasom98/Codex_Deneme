@@ -48,6 +48,7 @@ class TradingEnvGym(gym.Env if gym is not None else object):
                 reward_scale=config.reward_contract.reward_scale,
                 reward_clip_min=config.reward_contract.reward_clip_min,
                 reward_clip_max=config.reward_contract.reward_clip_max,
+                invalid_close_flat_penalty=float(config.reward_contract.invalid_close_flat_penalty or 0.0),
                 seed=config.seed,
             ),
         )
@@ -69,6 +70,11 @@ class TradingEnvGym(gym.Env if gym is not None else object):
 
         obs, reward, terminated, truncated, info = self._runner.step(int(action))
         return obs.astype(np.float32, copy=False), float(reward), bool(terminated), bool(truncated), info
+
+    def action_masks(self) -> np.ndarray:
+        """Expose valid-action masks for mask-aware PPO runtimes."""
+
+        return self._runner.current_action_mask().copy()
 
     def render(self) -> None:
         """No-op render for v1."""

@@ -126,21 +126,36 @@ class RewardContract:
     reward_version: str
     reward_formula_summary: str
     included_components: tuple[str, ...]
+    invalid_close_flat_penalty: float | None
     reward_scale: float
     reward_clip_min: float | None
     reward_clip_max: float | None
 
     def validate_supported(self) -> None:
-        """Validate v1 reward contract."""
+        """Validate supported reward contract versions."""
 
-        if self.reward_version != "reward.v1":
-            raise ValueError("reward_contract.reward_version must be reward.v1")
-        expected_formula = "pnl_delta - fees - slippage_cost"
-        if self.reward_formula_summary != expected_formula:
-            raise ValueError(f"reward_contract.reward_formula_summary must be: {expected_formula}")
-        expected_components = ("pnl_delta", "fees", "slippage_cost")
-        if self.included_components != expected_components:
-            raise ValueError("reward_contract.included_components must be [pnl_delta, fees, slippage_cost]")
+        if self.reward_version == "reward.v1":
+            expected_formula = "pnl_delta - fees - slippage_cost"
+            if self.reward_formula_summary != expected_formula:
+                raise ValueError(f"reward_contract.reward_formula_summary must be: {expected_formula}")
+            expected_components = ("pnl_delta", "fees", "slippage_cost")
+            if self.included_components != expected_components:
+                raise ValueError("reward_contract.included_components must be [pnl_delta, fees, slippage_cost]")
+            if self.invalid_close_flat_penalty not in {None, 0.0}:
+                raise ValueError("reward_contract.invalid_close_flat_penalty must be null or 0.0 for reward.v1")
+        elif self.reward_version == "reward.v2":
+            expected_formula = "pnl_delta - fees - slippage_cost - invalid_close_flat_penalty"
+            if self.reward_formula_summary != expected_formula:
+                raise ValueError(f"reward_contract.reward_formula_summary must be: {expected_formula}")
+            expected_components = ("pnl_delta", "fees", "slippage_cost", "invalid_close_flat_penalty")
+            if self.included_components != expected_components:
+                raise ValueError(
+                    "reward_contract.included_components must be [pnl_delta, fees, slippage_cost, invalid_close_flat_penalty]"
+                )
+            if self.invalid_close_flat_penalty is None or float(self.invalid_close_flat_penalty) <= 0.0:
+                raise ValueError("reward_contract.invalid_close_flat_penalty must be > 0 for reward.v2")
+        else:
+            raise ValueError("reward_contract.reward_version must be one of {reward.v1, reward.v2}")
         if float(self.reward_scale) <= 0.0:
             raise ValueError("reward_contract.reward_scale must be > 0")
         if self.reward_clip_min is not None and self.reward_clip_max is not None:
@@ -304,6 +319,7 @@ def parse_env_config(payload: Mapping[str, Any]) -> EnvConfig:
             reward_version=_require_string(reward_payload, "reward_version"),
             reward_formula_summary=_require_string(reward_payload, "reward_formula_summary"),
             included_components=tuple(_require_string_list(reward_payload, "included_components")),
+            invalid_close_flat_penalty=_require_optional_float(reward_payload, "invalid_close_flat_penalty"),
             reward_scale=_require_float(reward_payload, "reward_scale"),
             reward_clip_min=_require_optional_float(reward_payload, "reward_clip_min"),
             reward_clip_max=_require_optional_float(reward_payload, "reward_clip_max"),
@@ -1450,6 +1466,7 @@ def _runner_config_from_env(config: EnvConfig) -> EpisodeRunnerConfig:
         reward_scale=config.reward_contract.reward_scale,
         reward_clip_min=config.reward_contract.reward_clip_min,
         reward_clip_max=config.reward_contract.reward_clip_max,
+        invalid_close_flat_penalty=float(config.reward_contract.invalid_close_flat_penalty or 0.0),
         seed=config.seed,
     )
 
