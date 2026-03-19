@@ -59,7 +59,6 @@ from rl.training_launcher import (
     _effective_env_config,
     _failure_codes,
     _hash_canonical_json,
-    _import_maskable_ppo_class,
     _import_ppo_class,
     _resolve_device,
     _resolve_selected_episode,
@@ -1450,6 +1449,16 @@ def _save_and_validate_model_artifact(
             )
         ) from exc
     return save_state
+
+
+def _import_maskable_ppo_class() -> Any:
+    """Import MaskablePPO lazily so action masking stays opt-in."""
+    import importlib
+    module = importlib.import_module("sb3_contrib")
+    ppo_class = getattr(module, "MaskablePPO", None)
+    if ppo_class is None:
+        raise ImportError("sb3_contrib.MaskablePPO is unavailable")
+    return ppo_class
 
 
 def _load_ppo_model(*, model_artifact_path: Path, device: str | None) -> Any:
