@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -13,6 +14,12 @@ from rl.evaluation_backtest import (
     EVAL_MODEL_LOAD_FAILED,
     EVAL_OUTPUT_CONFLICT,
     execute_evaluation_backtest,
+)
+from rl.passivity_diagnostics import (
+    DETERMINISTIC_ACTION_RANKING_TRACE_FILENAME,
+    PASSIVITY_DIAGNOSTICS_REPORT_FILENAME,
+    build_deterministic_action_ranking_row,
+    build_deterministic_action_ranking_summary,
 )
 from tests.evaluation_backtest_fixtures import FakePredictModel, seed_evaluation_run, write_eval_config, write_risk_overlay_config
 
@@ -96,6 +103,239 @@ def test_single_path_success_writes_reports_and_proxy_metric(monkeypatch: pytest
         "eval_finish",
         "report_write",
     ]
+
+
+def test_masked_single_path_uses_action_masks_during_predict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "eval_masked_single_path_success"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(tmp_path, run_id, overrides={"write_step_trace": True, "action_masking": True})
+    model = FakePredictModel(actions=[1, 0, 3, 0])
+
+    def _plain_loader_should_not_run(model_artifact_path: Path, device: str | None) -> FakePredictModel:
+        del model_artifact_path, device
+        raise AssertionError("legacy PPO loader should not be used when action_masking=true")
+
+    monkeypatch.setattr("rl.evaluation_backtest._load_ppo_model", _plain_loader_should_not_run)
+    monkeypatch.setattr(
+        "rl.evaluation_backtest._load_maskable_ppo_model",
+        lambda model_artifact_path, device: model,
+    )
+    monkeypatch.setattr(
+        "rl.evaluation_backtest.atomic_write_parquet",
+        lambda df, dest: dest.write_text(f"rows={len(df)}", encoding="utf-8"),
+    )
+
+    result = _run_evaluation(
+        run_id=run_id,
+        model_artifact_path=seeded["model_artifact_path"],
+        env_config_path=seeded["env_config_path"],
+        eval_config_path=eval_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "eval_masked_single_out",
+    )
+
+    backtest = json.loads(result.report_paths.backtest_report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert backtest["action_masking_enabled"] is True
+    assert backtest["diagnostic_artifacts"]["deterministic_action_ranking_trace_path"] is None
+    assert model.action_masks_seen
+    assert model.action_masks_seen[0].tolist() == [True, True, True, False]
+    assert model.action_masks_seen[1].tolist() == [True, False, False, True]
+
+
+def test_passivity_diagnostics_compares_deterministic_and_stochastic_policy_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "eval_passivity_diagnostics"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(
+        tmp_path,
+        run_id,
+        overrides={"action_masking": True, "passivity_diagnostics": True},
+    )
+    model = FakePredictModel(
+        deterministic_actions=[0, 0, 0, 0],
+        stochastic_actions=[1, 3, 0, 0],
+        deterministic_action_probabilities=[
+            [0.40, 0.35, 0.05, 0.20],
+            [0.42, 0.33, 0.05, 0.20],
+            [0.39, 0.36, 0.05, 0.20],
+            [0.41, 0.34, 0.05, 0.20],
+        ],
+    )
+
+    def _plain_loader_should_not_run(model_artifact_path: Path, device: str | None) -> FakePredictModel:
+        del model_artifact_path, device
+        raise AssertionError("legacy PPO loader should not be used when action_masking=true")
+
+    monkeypatch.setattr("rl.evaluation_backtest._load_ppo_model", _plain_loader_should_not_run)
+    monkeypatch.setattr(
+        "rl.evaluation_backtest._load_maskable_ppo_model",
+        lambda model_artifact_path, device: model,
+    )
+
+    result = _run_evaluation(
+        run_id=run_id,
+        model_artifact_path=seeded["model_artifact_path"],
+        env_config_path=seeded["env_config_path"],
+        eval_config_path=eval_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "eval_passivity_diagnostics_out",
+    )
+
+    backtest = json.loads(result.report_paths.backtest_report_path.read_text(encoding="utf-8"))
+    manifest = json.loads(result.report_paths.manifest_path.read_text(encoding="utf-8"))
+    diagnostics = json.loads(result.report_paths.passivity_diagnostics_report_path.read_text(encoding="utf-8"))
+    ranking_rows = list(csv.DictReader(result.report_paths.deterministic_action_ranking_trace_path.open("r", encoding="utf-8")))
+
+    assert result.exit_code == 0
+    assert result.report_paths.passivity_diagnostics_report_path.name == PASSIVITY_DIAGNOSTICS_REPORT_FILENAME
+    assert result.report_paths.deterministic_action_ranking_trace_path.name == DETERMINISTIC_ACTION_RANKING_TRACE_FILENAME
+    assert backtest["passivity_diagnostics_enabled"] is True
+    assert manifest["passivity_diagnostics_enabled"] is True
+    assert backtest["diagnostic_artifacts"]["passivity_diagnostics_report_path"] == str(
+        result.report_paths.passivity_diagnostics_report_path
+    )
+    assert backtest["diagnostic_artifacts"]["deterministic_action_ranking_trace_path"] == str(
+        result.report_paths.deterministic_action_ranking_trace_path
+    )
+    assert diagnostics["deterministic_eval"]["action_semantic_counts"]["HOLD"] > 0
+    assert diagnostics["deterministic_eval"]["num_trades"] == 0
+    assert diagnostics["stochastic_eval"]["num_trades"] == 1
+    assert diagnostics["stochastic_eval"]["action_semantic_counts"]["OPEN_LONG"] == 1
+    assert diagnostics["deterministic_vs_stochastic"]["stochastic_more_active_than_deterministic"] is True
+    assert diagnostics["deterministic_eval"]["action_ranking_summary"]["fraction_of_steps_hold_is_top1"] == pytest.approx(1.0)
+    assert diagnostics["deterministic_eval"]["action_ranking_summary"]["hold_dominance_margin_band"] == "narrow"
+    assert diagnostics["deterministic_eval"]["action_ranking_summary"]["step_count"] == len(ranking_rows)
+    assert diagnostics["deterministic_eval"]["action_ranking_summary"]["top2_runner_up_counts"]["OPEN_LONG"] == len(
+        ranking_rows
+    )
+    assert len(ranking_rows) > 0
+    assert ranking_rows[0]["top_1_action_semantic"] == "HOLD"
+    assert ranking_rows[0]["top_2_action_semantic"] == "OPEN_LONG"
+    assert ranking_rows[0]["hold_gap_band"] == "small"
+
+
+def test_deterministic_action_ranking_summary_classifies_wide_hold_dominance() -> None:
+    rows = [
+        build_deterministic_action_ranking_row(
+            episode_index=0,
+            episode_ref={"scope": "partition", "partition": "val", "source_rel": "val_a.parquet", "fold_id": None},
+            step_ordinal=index,
+            step_index=index,
+            timestamp=f"2026-03-15T00:00:0{index}Z",
+            position_before=0,
+            selected_action_semantic="HOLD",
+            action_probabilities={
+                "HOLD": 0.72,
+                "OPEN_LONG": 0.12,
+                "OPEN_SHORT": 0.08,
+                "CLOSE_POSITION": 0.08,
+            },
+        )
+        for index in range(4)
+    ]
+
+    summary = build_deterministic_action_ranking_summary(rows)
+
+    assert summary["fraction_of_steps_hold_is_top1"] == pytest.approx(1.0)
+    assert summary["fraction_of_steps_gap_below_threshold"] == pytest.approx(0.0)
+    assert summary["hold_dominance_margin_band"] == "wide"
+
+
+def test_deterministic_action_ranking_summary_is_inconclusive_when_hold_is_not_consistently_top1() -> None:
+    rows = [
+        build_deterministic_action_ranking_row(
+            episode_index=0,
+            episode_ref={"scope": "partition", "partition": "val", "source_rel": "val_a.parquet", "fold_id": None},
+            step_ordinal=0,
+            step_index=0,
+            timestamp="2026-03-15T00:00:00Z",
+            position_before=0,
+            selected_action_semantic="HOLD",
+            action_probabilities={
+                "HOLD": 0.40,
+                "OPEN_LONG": 0.35,
+                "OPEN_SHORT": 0.05,
+                "CLOSE_POSITION": 0.20,
+            },
+        ),
+        build_deterministic_action_ranking_row(
+            episode_index=0,
+            episode_ref={"scope": "partition", "partition": "val", "source_rel": "val_a.parquet", "fold_id": None},
+            step_ordinal=1,
+            step_index=1,
+            timestamp="2026-03-15T00:00:01Z",
+            position_before=0,
+            selected_action_semantic="OPEN_LONG",
+            action_probabilities={
+                "HOLD": 0.20,
+                "OPEN_LONG": 0.50,
+                "OPEN_SHORT": 0.10,
+                "CLOSE_POSITION": 0.20,
+            },
+        ),
+    ]
+
+    summary = build_deterministic_action_ranking_summary(rows)
+
+    assert summary["fraction_of_steps_hold_is_top1"] == pytest.approx(0.5)
+    assert summary["hold_dominance_margin_band"] == "inconclusive"
+
+
+def test_passivity_diagnostics_fail_closed_when_ranking_probabilities_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_id = "eval_passivity_diagnostics_missing_probs"
+    seeded = seed_evaluation_run(monkeypatch, tmp_path, run_id)
+    eval_config_path = write_eval_config(
+        tmp_path,
+        run_id,
+        overrides={"action_masking": True, "passivity_diagnostics": True},
+    )
+    model = FakePredictModel(
+        deterministic_actions=[0, 0, 0, 0],
+        distribution_probabilities_available=False,
+    )
+
+    monkeypatch.setattr("rl.evaluation_backtest._load_ppo_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        "rl.evaluation_backtest._load_maskable_ppo_model",
+        lambda model_artifact_path, device: model,
+    )
+
+    result = _run_evaluation(
+        run_id=run_id,
+        model_artifact_path=seeded["model_artifact_path"],
+        env_config_path=seeded["env_config_path"],
+        eval_config_path=eval_config_path,
+        state_manifest_path=seeded["state_manifest_path"],
+        env_contract_report_path=seeded["env_contract_report_path"],
+        readiness_report_path=seeded["readiness_report_path"],
+        episode_catalog_path=seeded["episode_catalog_path"],
+        split_report_path=seeded["split_report_path"],
+        output_dir=tmp_path / "eval_passivity_diagnostics_missing_probs_out",
+    )
+
+    backtest = json.loads(result.report_paths.backtest_report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 2
+    assert backtest["evaluation_success"] is False
+    assert "EVAL_PASSIVITY_DIAGNOSTICS_FAILED" in backtest["failure_codes"]
 
 
 def test_explicit_partition_alias_is_reported_and_relative_metrics_use_aggregate_delta(

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 import zipfile
 
+import numpy as np
 import pytest
 
 from rl.env_contract import parse_env_config, validate_env_contract
@@ -176,25 +177,103 @@ def write_risk_overlay_config(
 class FakePredictModel:
     """Simple scripted model stub for deterministic evaluation tests."""
 
-    def __init__(self, actions: list[int] | None = None) -> None:
-        self._actions = actions or [1, 0, 3]
-        self._index = 0
+    def __init__(
+        self,
+        actions: list[int] | None = None,
+        *,
+        deterministic_actions: list[int] | None = None,
+        stochastic_actions: list[int] | None = None,
+        deterministic_action_probabilities: list[list[float]] | None = None,
+        distribution_probabilities_available: bool = True,
+    ) -> None:
+        default_actions = actions or [1, 0, 3]
+        self._deterministic_actions = deterministic_actions or default_actions
+        self._stochastic_actions = stochastic_actions or default_actions
+        self._deterministic_action_probabilities = deterministic_action_probabilities
+        self._deterministic_index = 0
+        self._stochastic_index = 0
         self.random_seed: int | None = None
+        self.action_masks_seen: list[Any] = []
+        self.distribution_action_masks_seen: list[Any] = []
+        self._distribution_probabilities_available = bool(distribution_probabilities_available)
+        self.policy = _FakePredictPolicy(owner=self)
 
     def set_random_seed(self, seed: int) -> None:
         """Record the provided seed."""
 
         self.random_seed = int(seed)
 
-    def predict(self, observation: Any, deterministic: bool = True) -> tuple[int, None]:
+    def predict(
+        self,
+        observation: Any,
+        deterministic: bool = True,
+        action_masks: Any | None = None,
+    ) -> tuple[int, None]:
         """Return the next scripted action."""
 
-        del observation, deterministic
-        if self._index < len(self._actions):
-            action = int(self._actions[self._index])
-            self._index += 1
+        del observation
+        self.action_masks_seen.append(action_masks)
+        action_sequence = self._deterministic_actions if deterministic else self._stochastic_actions
+        index_attr = "_deterministic_index" if deterministic else "_stochastic_index"
+        action_index = int(getattr(self, index_attr))
+        if action_index < len(action_sequence):
+            action = int(action_sequence[action_index])
+            setattr(self, index_attr, int(action_index + 1))
             return action, None
-        return int(self._actions[-1]), None
+        return int(action_sequence[-1]), None
+
+    def current_deterministic_action_probabilities(self) -> np.ndarray | None:
+        """Return the deterministic probability vector for the current decision index."""
+
+        if not self._distribution_probabilities_available:
+            return None
+        if self._deterministic_action_probabilities is not None:
+            if self._deterministic_index < len(self._deterministic_action_probabilities):
+                values = self._deterministic_action_probabilities[self._deterministic_index]
+            else:
+                values = self._deterministic_action_probabilities[-1]
+            return np.asarray(values, dtype=np.float32)
+        action_index = min(self._deterministic_index, len(self._deterministic_actions) - 1)
+        action = int(self._deterministic_actions[action_index])
+        probabilities = np.full(shape=(4,), fill_value=0.05, dtype=np.float32)
+        probabilities[action] = 0.85
+        return probabilities
+
+
+class _FakePredictPolicy:
+    """Minimal policy surface for deterministic ranking diagnostics."""
+
+    def __init__(self, *, owner: FakePredictModel) -> None:
+        self._owner = owner
+
+    def obs_to_tensor(self, observation: Any) -> tuple[Any, bool]:
+        """Return the observation unchanged for diagnostics tests."""
+
+        return observation, False
+
+    def get_distribution(self, observation: Any, action_masks: Any | None = None) -> Any:
+        """Return a fake distribution object exposing deterministic probabilities."""
+
+        del observation
+        self._owner.distribution_action_masks_seen.append(action_masks)
+        probabilities = self._owner.current_deterministic_action_probabilities()
+        if probabilities is None:
+            return object()
+        return _FakeDistributionWrapper(probabilities=probabilities)
+
+
+class _FakeDistributionWrapper:
+    """Wrapper that mimics the nested distribution.probs surface."""
+
+    def __init__(self, *, probabilities: np.ndarray) -> None:
+        self.distribution = _FakeDistributionTensor(probabilities=probabilities)
+
+
+class _FakeDistributionTensor:
+    """Tensor-like probability carrier for diagnostics tests."""
+
+    def __init__(self, *, probabilities: np.ndarray) -> None:
+        self.probs = np.asarray(probabilities, dtype=np.float32).reshape(1, -1)
 
 
 def _write_split_report(
