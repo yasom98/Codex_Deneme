@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from rl.env_core import (
     ACTION_MAPPING,
     ACTION_HOLD,
+    DensePositionRewardConfig,
     EpisodeCatalog,
     EpisodeData,
     EpisodeRef,
@@ -82,6 +83,7 @@ class ExecutionTimingContract:
     execution_price_policy: str
     reward_accrual_interval_policy: str
     mark_to_market_policy: str
+    close_position_transition_timing_policy: str = "flatten_before_interval"
 
     def validate_supported(self) -> None:
         """Validate supported v1 timing semantics."""
@@ -94,6 +96,14 @@ class ExecutionTimingContract:
             raise ValueError("execution_timing_contract.reward_accrual_interval_policy must be post_action_t_to_t_plus_1")
         if self.mark_to_market_policy != "next_row_close":
             raise ValueError("execution_timing_contract.mark_to_market_policy must be next_row_close")
+        if self.close_position_transition_timing_policy not in {
+            "flatten_before_interval",
+            "flatten_after_interval",
+        }:
+            raise ValueError(
+                "execution_timing_contract.close_position_transition_timing_policy must be one of "
+                "{flatten_before_interval, flatten_after_interval}"
+            )
 
 
 @dataclass(frozen=True)
@@ -130,6 +140,7 @@ class RewardContract:
     reward_scale: float
     reward_clip_min: float | None
     reward_clip_max: float | None
+    dense_pbr_config: DensePositionRewardConfig | None = None
 
     def validate_supported(self) -> None:
         """Validate supported reward contract versions."""
@@ -143,6 +154,8 @@ class RewardContract:
                 raise ValueError("reward_contract.included_components must be [pnl_delta, fees, slippage_cost]")
             if self.invalid_close_flat_penalty not in {None, 0.0}:
                 raise ValueError("reward_contract.invalid_close_flat_penalty must be null or 0.0 for reward.v1")
+            if self.dense_pbr_config is not None:
+                raise ValueError("reward_contract.dense_pbr_config is unsupported for reward.v1")
         elif self.reward_version == "reward.v2":
             expected_formula = "pnl_delta - fees - slippage_cost - invalid_close_flat_penalty"
             if self.reward_formula_summary != expected_formula:
@@ -154,8 +167,70 @@ class RewardContract:
                 )
             if self.invalid_close_flat_penalty is None or float(self.invalid_close_flat_penalty) <= 0.0:
                 raise ValueError("reward_contract.invalid_close_flat_penalty must be > 0 for reward.v2")
+            if self.dense_pbr_config is not None:
+                raise ValueError("reward_contract.dense_pbr_config is unsupported for reward.v2")
+        elif self.reward_version == "reward.v2_dense_pbr":
+            accepted_formulas = {
+                "position_mtm_contribution - fees - slippage_cost - risk_penalty - inactivity_penalty - invalid_close_flat_penalty",
+                "position_mtm_contribution - fees - slippage_cost - risk_penalty - inactivity_penalty - "
+                "invalid_close_flat_penalty + close_realized_pnl_bonus_contribution",
+                "position_mtm_contribution - fees - slippage_cost - risk_penalty - inactivity_penalty - "
+                "invalid_close_flat_penalty + benchmark_relative_contribution",
+                "position_mtm_contribution - fees - slippage_cost - risk_penalty - inactivity_penalty - "
+                "invalid_close_flat_penalty + close_realized_pnl_bonus_contribution + benchmark_relative_contribution",
+            }
+            if self.reward_formula_summary not in accepted_formulas:
+                raise ValueError(
+                    "reward_contract.reward_formula_summary must be one of the supported reward.v2_dense_pbr formulas"
+                )
+            accepted_components = {
+                (
+                    "position_mtm_contribution",
+                    "fees",
+                    "slippage_cost",
+                    "risk_penalty",
+                    "inactivity_penalty",
+                    "invalid_close_flat_penalty",
+                ),
+                (
+                    "position_mtm_contribution",
+                    "fees",
+                    "slippage_cost",
+                    "risk_penalty",
+                    "inactivity_penalty",
+                    "invalid_close_flat_penalty",
+                    "close_realized_pnl_bonus_contribution",
+                ),
+                (
+                    "position_mtm_contribution",
+                    "fees",
+                    "slippage_cost",
+                    "risk_penalty",
+                    "inactivity_penalty",
+                    "invalid_close_flat_penalty",
+                    "benchmark_relative_contribution",
+                ),
+                (
+                    "position_mtm_contribution",
+                    "fees",
+                    "slippage_cost",
+                    "risk_penalty",
+                    "inactivity_penalty",
+                    "invalid_close_flat_penalty",
+                    "close_realized_pnl_bonus_contribution",
+                    "benchmark_relative_contribution",
+                ),
+            }
+            if self.included_components not in accepted_components:
+                raise ValueError(
+                    "reward_contract.included_components must match one of the supported reward.v2_dense_pbr component sets"
+                )
+            if self.invalid_close_flat_penalty is None or float(self.invalid_close_flat_penalty) < 0.0:
+                raise ValueError("reward_contract.invalid_close_flat_penalty must be >= 0 for reward.v2_dense_pbr")
+            if self.dense_pbr_config is None:
+                raise ValueError("reward_contract.dense_pbr_config is required for reward.v2_dense_pbr")
         else:
-            raise ValueError("reward_contract.reward_version must be one of {reward.v1, reward.v2}")
+            raise ValueError("reward_contract.reward_version must be one of {reward.v1, reward.v2, reward.v2_dense_pbr}")
         if float(self.reward_scale) <= 0.0:
             raise ValueError("reward_contract.reward_scale must be > 0")
         if self.reward_clip_min is not None and self.reward_clip_max is not None:
@@ -281,6 +356,7 @@ def parse_env_config(payload: Mapping[str, Any]) -> EnvConfig:
     action_payload = _require_mapping(payload, "action_semantics_contract")
     reward_payload = _require_mapping(payload, "reward_contract")
     termination_payload = _require_mapping(payload, "termination_contract")
+    dense_pbr_payload = _require_optional_mapping(reward_payload, "dense_pbr_config")
 
     return EnvConfig(
         run_id=run_id,
@@ -307,6 +383,10 @@ def parse_env_config(payload: Mapping[str, Any]) -> EnvConfig:
             execution_price_policy=_require_string(timing_payload, "execution_price_policy"),
             reward_accrual_interval_policy=_require_string(timing_payload, "reward_accrual_interval_policy"),
             mark_to_market_policy=_require_string(timing_payload, "mark_to_market_policy"),
+            close_position_transition_timing_policy=(
+                _require_optional_string(timing_payload, "close_position_transition_timing_policy")
+                or "flatten_before_interval"
+            ),
         ),
         action_semantics_contract=ActionSemanticsContract(
             action_space_type=_require_string(action_payload, "action_space_type"),
@@ -323,6 +403,43 @@ def parse_env_config(payload: Mapping[str, Any]) -> EnvConfig:
             reward_scale=_require_float(reward_payload, "reward_scale"),
             reward_clip_min=_require_optional_float(reward_payload, "reward_clip_min"),
             reward_clip_max=_require_optional_float(reward_payload, "reward_clip_max"),
+            dense_pbr_config=(
+                DensePositionRewardConfig(
+                    position_mtm_coefficient=_require_float(dense_pbr_payload, "position_mtm_coefficient"),
+                    fee_coefficient=_require_float(dense_pbr_payload, "fee_coefficient"),
+                    slippage_coefficient=_require_float(dense_pbr_payload, "slippage_coefficient"),
+                    risk_penalty_coefficient=_require_float(dense_pbr_payload, "risk_penalty_coefficient"),
+                    inactivity_penalty=_require_float(dense_pbr_payload, "inactivity_penalty"),
+                    close_position_mtm_coefficient=(
+                        _require_optional_float(dense_pbr_payload, "close_position_mtm_coefficient") or 1.0
+                    ),
+                    close_position_mtm_holding_ramp_steps=(
+                        _require_optional_int(dense_pbr_payload, "close_position_mtm_holding_ramp_steps") or 0
+                    ),
+                    close_position_mtm_unlock_after_steps=(
+                        _require_optional_int(dense_pbr_payload, "close_position_mtm_unlock_after_steps") or 0
+                    ),
+                    close_realized_pnl_coefficient=(
+                        _require_optional_float(dense_pbr_payload, "close_realized_pnl_coefficient") or 0.0
+                    ),
+                    close_realized_pnl_bonus_unlock_after_steps=(
+                        _require_optional_int(dense_pbr_payload, "close_realized_pnl_bonus_unlock_after_steps") or 0
+                    ),
+                    min_holding_steps_for_close_bonus=(
+                        _require_optional_int(dense_pbr_payload, "min_holding_steps_for_close_bonus") or 0
+                    ),
+                    close_bonus_holding_ramp_steps=(
+                        _require_optional_int(dense_pbr_payload, "close_bonus_holding_ramp_steps") or 0
+                    ),
+                    close_bonus_pnl_cap_abs=_require_optional_float(dense_pbr_payload, "close_bonus_pnl_cap_abs"),
+                    benchmark_mode=_require_optional_string(dense_pbr_payload, "benchmark_mode") or "none",
+                    benchmark_relative_coefficient=(
+                        _require_optional_float(dense_pbr_payload, "benchmark_relative_coefficient") or 0.0
+                    ),
+                )
+                if dense_pbr_payload is not None
+                else None
+            ),
         ),
         termination_contract=TerminationContract(
             data_end_terminated=_require_bool(termination_payload, "data_end_terminated"),
@@ -1468,6 +1585,9 @@ def _runner_config_from_env(config: EnvConfig) -> EpisodeRunnerConfig:
         reward_clip_max=config.reward_contract.reward_clip_max,
         invalid_close_flat_penalty=float(config.reward_contract.invalid_close_flat_penalty or 0.0),
         seed=config.seed,
+        reward_version=config.reward_contract.reward_version,
+        dense_pbr_config=config.reward_contract.dense_pbr_config,
+        close_position_transition_timing_policy=config.execution_timing_contract.close_position_transition_timing_policy,
     )
 
 
@@ -1491,10 +1611,28 @@ def _require_string(payload: Mapping[str, Any], key: str) -> str:
     return value.strip()
 
 
+def _require_optional_string(payload: Mapping[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"ENV_CONTRACT_CONFIG_INVALID: {key} must be non-empty string or null")
+    return value.strip()
+
+
 def _require_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = payload.get(key)
     if not isinstance(value, Mapping):
         raise ValueError(f"ENV_CONTRACT_CONFIG_INVALID: {key} must be object")
+    return value
+
+
+def _require_optional_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"ENV_CONTRACT_CONFIG_INVALID: {key} must be object or null")
     return value
 
 

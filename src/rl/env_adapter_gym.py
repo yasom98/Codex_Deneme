@@ -50,6 +50,11 @@ class TradingEnvGym(gym.Env if gym is not None else object):
                 reward_clip_max=config.reward_contract.reward_clip_max,
                 invalid_close_flat_penalty=float(config.reward_contract.invalid_close_flat_penalty or 0.0),
                 seed=config.seed,
+                reward_version=config.reward_contract.reward_version,
+                dense_pbr_config=config.reward_contract.dense_pbr_config,
+                close_position_transition_timing_policy=(
+                    config.execution_timing_contract.close_position_transition_timing_policy
+                ),
             ),
         )
 

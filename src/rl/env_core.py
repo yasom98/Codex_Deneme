@@ -21,6 +21,12 @@ ACTION_MAPPING: dict[int, str] = {
     ACTION_CLOSE_POSITION: "CLOSE_POSITION",
 }
 
+POSITION_PLACEHOLDER_COLUMN = "position_placeholder"
+FLOATING_PNL_PLACEHOLDER_COLUMN = "floating_pnl_placeholder"
+DRAWDOWN_PLACEHOLDER_COLUMN = "drawdown_placeholder"
+HOLDING_AGE_IN_POSITION_COLUMN = "holding_age_in_position"
+ENTRY_RETURN_BPS_COLUMN = "entry_return_bps"
+
 
 @dataclass(frozen=True)
 class EpisodeRef:
@@ -421,11 +427,95 @@ class RewardBreakdown:
     """Reward components for deterministic accounting."""
 
     pnl_delta: float
+    position_mtm_contribution: float
+    realized_pnl_contribution: float
+    close_realized_pnl_bonus_contribution: float
+    benchmark_relative_contribution: float
     fees: float
     slippage_cost: float
+    risk_penalty: float
+    inactivity_penalty: float
     invalid_close_flat_penalty: float
     reward_raw: float
     reward_total: float
+
+
+@dataclass(frozen=True)
+class DensePositionRewardConfig:
+    """Explicit additive config for dense position-based reward shaping."""
+
+    position_mtm_coefficient: float
+    fee_coefficient: float
+    slippage_coefficient: float
+    risk_penalty_coefficient: float
+    inactivity_penalty: float
+    close_position_mtm_coefficient: float = 1.0
+    close_position_mtm_holding_ramp_steps: int = 0
+    close_position_mtm_unlock_after_steps: int = 0
+    close_realized_pnl_coefficient: float = 0.0
+    close_realized_pnl_bonus_unlock_after_steps: int = 0
+    min_holding_steps_for_close_bonus: int = 0
+    close_bonus_holding_ramp_steps: int = 0
+    close_bonus_pnl_cap_abs: float | None = None
+    benchmark_mode: str = "none"
+    benchmark_relative_coefficient: float = 0.0
+
+    def __post_init__(self) -> None:
+        if float(self.position_mtm_coefficient) <= 0.0:
+            raise ValueError("position_mtm_coefficient must be > 0")
+        if float(self.close_position_mtm_coefficient) < 0.0:
+            raise ValueError("close_position_mtm_coefficient must be >= 0")
+        if float(self.fee_coefficient) < 0.0:
+            raise ValueError("fee_coefficient must be >= 0")
+        if float(self.slippage_coefficient) < 0.0:
+            raise ValueError("slippage_coefficient must be >= 0")
+        if float(self.risk_penalty_coefficient) < 0.0:
+            raise ValueError("risk_penalty_coefficient must be >= 0")
+        if float(self.inactivity_penalty) < 0.0:
+            raise ValueError("inactivity_penalty must be >= 0")
+        if isinstance(self.close_position_mtm_holding_ramp_steps, bool) or not isinstance(
+            self.close_position_mtm_holding_ramp_steps,
+            int,
+        ):
+            raise ValueError("close_position_mtm_holding_ramp_steps must be int")
+        if int(self.close_position_mtm_holding_ramp_steps) < 0:
+            raise ValueError("close_position_mtm_holding_ramp_steps must be >= 0")
+        if isinstance(self.close_position_mtm_unlock_after_steps, bool) or not isinstance(
+            self.close_position_mtm_unlock_after_steps,
+            int,
+        ):
+            raise ValueError("close_position_mtm_unlock_after_steps must be int")
+        if int(self.close_position_mtm_unlock_after_steps) < 0:
+            raise ValueError("close_position_mtm_unlock_after_steps must be >= 0")
+        if float(self.close_realized_pnl_coefficient) < 0.0:
+            raise ValueError("close_realized_pnl_coefficient must be >= 0")
+        if isinstance(self.close_realized_pnl_bonus_unlock_after_steps, bool) or not isinstance(
+            self.close_realized_pnl_bonus_unlock_after_steps,
+            int,
+        ):
+            raise ValueError("close_realized_pnl_bonus_unlock_after_steps must be int")
+        if int(self.close_realized_pnl_bonus_unlock_after_steps) < 0:
+            raise ValueError("close_realized_pnl_bonus_unlock_after_steps must be >= 0")
+        if isinstance(self.min_holding_steps_for_close_bonus, bool) or not isinstance(
+            self.min_holding_steps_for_close_bonus,
+            int,
+        ):
+            raise ValueError("min_holding_steps_for_close_bonus must be int")
+        if int(self.min_holding_steps_for_close_bonus) < 0:
+            raise ValueError("min_holding_steps_for_close_bonus must be >= 0")
+        if isinstance(self.close_bonus_holding_ramp_steps, bool) or not isinstance(
+            self.close_bonus_holding_ramp_steps,
+            int,
+        ):
+            raise ValueError("close_bonus_holding_ramp_steps must be int")
+        if int(self.close_bonus_holding_ramp_steps) < 0:
+            raise ValueError("close_bonus_holding_ramp_steps must be >= 0")
+        if self.close_bonus_pnl_cap_abs is not None and float(self.close_bonus_pnl_cap_abs) <= 0.0:
+            raise ValueError("close_bonus_pnl_cap_abs must be > 0 when provided")
+        if self.benchmark_mode not in {"none", "buy_and_hold"}:
+            raise ValueError("benchmark_mode must be one of {none, buy_and_hold}")
+        if float(self.benchmark_relative_coefficient) < 0.0:
+            raise ValueError("benchmark_relative_coefficient must be >= 0")
 
 
 class RewardEngine:
@@ -434,6 +524,8 @@ class RewardEngine:
     @staticmethod
     def compute_reward(
         *,
+        reward_version: str,
+        position_before: int,
         action_raw: int,
         invalid_action: bool,
         invalid_action_reason: str | None,
@@ -447,12 +539,23 @@ class RewardEngine:
         reward_scale: float,
         reward_clip_min: float | None,
         reward_clip_max: float | None,
+        dense_pbr_config: DensePositionRewardConfig | None = None,
+        entry_price_exec: float | None = None,
+        entry_fees: float = 0.0,
+        entry_slippage_cost: float = 0.0,
+        holding_steps_before_close: int | None = None,
+        close_accounting_position_after: int | None = None,
     ) -> RewardBreakdown:
         """Compute deterministic reward components."""
 
-        pnl_delta = float(position_after) * (float(price_next) - float(price_exec))
         fees = abs(int(trade_units)) * float(price_exec) * (float(fee_bps) / 10_000.0)
         slippage_cost = abs(int(trade_units)) * float(price_exec) * (float(slippage_bps) / 10_000.0)
+        effective_close_accounting_position_after = (
+            int(position_after)
+            if close_accounting_position_after is None
+            else int(close_accounting_position_after)
+        )
+        realized_pnl_contribution = 0.0
         applied_invalid_close_flat_penalty = 0.0
         if (
             int(action_raw) == ACTION_CLOSE_POSITION
@@ -460,15 +563,141 @@ class RewardEngine:
             and invalid_action_reason == "already_flat"
         ):
             applied_invalid_close_flat_penalty = float(invalid_close_flat_penalty)
-        reward_raw = pnl_delta - fees - slippage_cost - applied_invalid_close_flat_penalty
+        elif (
+            int(action_raw) == ACTION_CLOSE_POSITION
+            and int(position_before) in {-1, 1}
+            and effective_close_accounting_position_after == 0
+        ):
+            if entry_price_exec is None:
+                raise ValueError("entry_price_exec is required when closing a non-flat position")
+            realized_pnl_contribution = (
+                float(position_before) * (float(price_exec) - float(entry_price_exec))
+                - float(entry_fees)
+                - float(entry_slippage_cost)
+                - float(fees)
+                - float(slippage_cost)
+            )
+
+        if reward_version == "reward.v2_dense_pbr":
+            if dense_pbr_config is None:
+                raise ValueError("dense_pbr_config is required when reward_version=reward.v2_dense_pbr")
+            effective_close_mtm_coefficient = float(dense_pbr_config.close_position_mtm_coefficient)
+            close_step_is_active = (
+                int(action_raw) == ACTION_CLOSE_POSITION
+                and int(position_before) in {-1, 1}
+                and int(position_after) == 0
+            )
+            if not close_step_is_active:
+                effective_close_mtm_coefficient = 1.0
+            else:
+                effective_holding_steps = 0 if holding_steps_before_close is None else int(holding_steps_before_close)
+                effective_holding_steps = max(
+                    effective_holding_steps - int(dense_pbr_config.close_position_mtm_unlock_after_steps),
+                    0,
+                )
+            if close_step_is_active and int(dense_pbr_config.close_position_mtm_holding_ramp_steps) > 0:
+                mtm_ramp_ratio = min(
+                    float(effective_holding_steps) / float(dense_pbr_config.close_position_mtm_holding_ramp_steps),
+                    1.0,
+                )
+                effective_close_mtm_coefficient *= max(mtm_ramp_ratio, 0.0)
+            position_mtm_contribution = (
+                float(position_before)
+                * (float(price_next) - float(price_exec))
+                * float(dense_pbr_config.position_mtm_coefficient)
+                * effective_close_mtm_coefficient
+            )
+            risk_penalty = abs(int(position_after)) * float(dense_pbr_config.risk_penalty_coefficient)
+            inactivity_penalty = (
+                float(dense_pbr_config.inactivity_penalty)
+                if int(position_before) == 0 and int(position_after) == 0
+                else 0.0
+            )
+            close_realized_pnl_bonus_contribution = 0.0
+            if (
+                int(action_raw) == ACTION_CLOSE_POSITION
+                and int(position_before) in {-1, 1}
+                and effective_close_accounting_position_after == 0
+            ):
+                close_bonus_gate_enabled = int(dense_pbr_config.min_holding_steps_for_close_bonus) > 0
+                close_bonus_is_eligible = True
+                effective_holding_steps = 0 if holding_steps_before_close is None else int(holding_steps_before_close)
+                realized_bonus_unlock_after = int(dense_pbr_config.close_realized_pnl_bonus_unlock_after_steps)
+                adjusted_bonus_holding_steps = max(effective_holding_steps - realized_bonus_unlock_after, 0)
+                if realized_bonus_unlock_after > 0 and effective_holding_steps <= realized_bonus_unlock_after:
+                    close_bonus_is_eligible = False
+                if close_bonus_gate_enabled:
+                    close_bonus_is_eligible = (
+                        close_bonus_is_eligible
+                        and
+                        float(realized_pnl_contribution) > 0.0
+                        and effective_holding_steps >= int(dense_pbr_config.min_holding_steps_for_close_bonus)
+                    )
+                if close_bonus_is_eligible:
+                    bonus_basis = float(realized_pnl_contribution)
+                    if dense_pbr_config.close_bonus_pnl_cap_abs is not None:
+                        bonus_basis = float(
+                            np.clip(
+                                bonus_basis,
+                                -float(dense_pbr_config.close_bonus_pnl_cap_abs),
+                                float(dense_pbr_config.close_bonus_pnl_cap_abs),
+                            )
+                        )
+                    if int(dense_pbr_config.close_bonus_holding_ramp_steps) > 0:
+                        ramp_ratio = min(
+                            float(adjusted_bonus_holding_steps)
+                            / float(dense_pbr_config.close_bonus_holding_ramp_steps),
+                            1.0,
+                        )
+                        bonus_basis = float(bonus_basis) * max(ramp_ratio, 0.0)
+                    close_realized_pnl_bonus_contribution = (
+                        float(bonus_basis) * float(dense_pbr_config.close_realized_pnl_coefficient)
+                    )
+            fee_penalty = fees * float(dense_pbr_config.fee_coefficient)
+            slippage_penalty = slippage_cost * float(dense_pbr_config.slippage_coefficient)
+            benchmark_relative_contribution = 0.0
+            if (
+                str(dense_pbr_config.benchmark_mode) == "buy_and_hold"
+                and float(dense_pbr_config.benchmark_relative_coefficient) > 0.0
+            ):
+                benchmark_delta = float(price_next) - float(price_exec)
+                benchmark_relative_contribution = (
+                    -float(benchmark_delta) * float(dense_pbr_config.benchmark_relative_coefficient)
+                )
+            pnl_delta = float(position_mtm_contribution)
+            reward_raw = (
+                pnl_delta
+                - fee_penalty
+                - slippage_penalty
+                - risk_penalty
+                - inactivity_penalty
+                - applied_invalid_close_flat_penalty
+                + close_realized_pnl_bonus_contribution
+                + benchmark_relative_contribution
+            )
+        else:
+            pnl_delta = float(position_after) * (float(price_next) - float(price_exec))
+            position_mtm_contribution = float(pnl_delta)
+            risk_penalty = 0.0
+            inactivity_penalty = 0.0
+            close_realized_pnl_bonus_contribution = 0.0
+            benchmark_relative_contribution = 0.0
+            reward_raw = pnl_delta - fees - slippage_cost - applied_invalid_close_flat_penalty
+
         reward_total = reward_raw * float(reward_scale)
         if reward_clip_min is not None or reward_clip_max is not None:
             reward_total = float(np.clip(reward_total, reward_clip_min, reward_clip_max))
 
         return RewardBreakdown(
             pnl_delta=float(pnl_delta),
+            position_mtm_contribution=float(position_mtm_contribution),
+            realized_pnl_contribution=float(realized_pnl_contribution),
+            close_realized_pnl_bonus_contribution=float(close_realized_pnl_bonus_contribution),
+            benchmark_relative_contribution=float(benchmark_relative_contribution),
             fees=float(fees),
             slippage_cost=float(slippage_cost),
+            risk_penalty=float(risk_penalty),
+            inactivity_penalty=float(inactivity_penalty),
             invalid_close_flat_penalty=float(applied_invalid_close_flat_penalty),
             reward_raw=float(reward_raw),
             reward_total=float(reward_total),
@@ -488,6 +717,9 @@ class EpisodeRunnerConfig:
     reward_clip_max: float | None
     invalid_close_flat_penalty: float
     seed: int | None
+    reward_version: str = "reward.v1"
+    dense_pbr_config: DensePositionRewardConfig | None = None
+    close_position_transition_timing_policy: str = "flatten_before_interval"
 
     def __post_init__(self) -> None:
         if float(self.initial_cash) <= 0.0:
@@ -503,8 +735,22 @@ class EpisodeRunnerConfig:
                 raise ValueError("reward_clip_min cannot exceed reward_clip_max")
         if float(self.invalid_close_flat_penalty) < 0.0:
             raise ValueError("invalid_close_flat_penalty must be >= 0")
+        if self.reward_version not in {"reward.v1", "reward.v2", "reward.v2_dense_pbr"}:
+            raise ValueError("reward_version must be one of {reward.v1, reward.v2, reward.v2_dense_pbr}")
+        if self.reward_version == "reward.v2_dense_pbr":
+            if self.dense_pbr_config is None:
+                raise ValueError("dense_pbr_config must be provided for reward.v2_dense_pbr")
+        elif self.dense_pbr_config is not None:
+            raise ValueError("dense_pbr_config is only supported for reward.v2_dense_pbr")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be int or null")
+        if self.close_position_transition_timing_policy not in {
+            "flatten_before_interval",
+            "flatten_after_interval",
+        }:
+            raise ValueError(
+                "close_position_transition_timing_policy must be one of {flatten_before_interval, flatten_after_interval}"
+            )
 
 
 class EpisodeRunnerCore:
@@ -519,9 +765,19 @@ class EpisodeRunnerCore:
         self._steps_taken = 0
         self._position = PositionState(exposure=0)
         self._portfolio = PortfolioState(portfolio_value=float(config.initial_cash))
+        self._open_position_entry_price_exec: float | None = None
+        self._open_position_entry_fees = 0.0
+        self._open_position_entry_slippage_cost = 0.0
+        self._open_position_entry_step_ordinal: int | None = None
+        self._peak_portfolio_value = float(config.initial_cash)
         self._seed: int | None = None
         self._terminated = False
         self._truncated = False
+        self._position_placeholder_index = self._resolve_observation_column_index(POSITION_PLACEHOLDER_COLUMN)
+        self._floating_pnl_placeholder_index = self._resolve_observation_column_index(FLOATING_PNL_PLACEHOLDER_COLUMN)
+        self._drawdown_placeholder_index = self._resolve_observation_column_index(DRAWDOWN_PLACEHOLDER_COLUMN)
+        self._holding_age_in_position_index = self._resolve_observation_column_index(HOLDING_AGE_IN_POSITION_COLUMN)
+        self._entry_return_bps_index = self._resolve_observation_column_index(ENTRY_RETURN_BPS_COLUMN)
 
     @property
     def observation_dim(self) -> int:
@@ -540,6 +796,59 @@ class EpisodeRunnerCore:
 
         return ExecutionEngine.valid_action_mask(position_before=self._position.exposure).copy()
 
+    def _resolve_observation_column_index(self, column_name: str) -> int | None:
+        try:
+            return int(self._episode_data.observation_columns.index(column_name))
+        except ValueError:
+            return None
+
+    def _current_floating_pnl(self) -> float:
+        if self._current_index is None:
+            raise RuntimeError("EpisodeRunnerCore.reset() must be called before accessing runtime observation state.")
+        if self._position.exposure == 0 or self._open_position_entry_price_exec is None:
+            return 0.0
+        current_mark_to_market = float(self._episode_data.mark_to_market_price_vector[int(self._current_index)])
+        return (
+            float(self._position.exposure) * (current_mark_to_market - float(self._open_position_entry_price_exec))
+            - float(self._open_position_entry_fees)
+            - float(self._open_position_entry_slippage_cost)
+        )
+
+    def _current_drawdown(self) -> float:
+        peak_value = max(float(self._peak_portfolio_value), 1e-12)
+        return max((peak_value - float(self._portfolio.portfolio_value)) / peak_value, 0.0)
+
+    def _current_holding_age_in_position(self) -> float:
+        if self._position.exposure == 0 or self._open_position_entry_step_ordinal is None:
+            return 0.0
+        return max(float(self._steps_taken - self._open_position_entry_step_ordinal), 0.0)
+
+    def _current_entry_return_bps(self) -> float:
+        if self._current_index is None:
+            raise RuntimeError("EpisodeRunnerCore.reset() must be called before accessing runtime observation state.")
+        if self._position.exposure == 0 or self._open_position_entry_price_exec is None:
+            return 0.0
+        entry_price = float(self._open_position_entry_price_exec)
+        current_mark_to_market = float(self._episode_data.mark_to_market_price_vector[int(self._current_index)])
+        gross_return = (current_mark_to_market - entry_price) / max(abs(entry_price), 1e-12)
+        return float(self._position.exposure) * gross_return * 10000.0
+
+    def _runtime_observation(self) -> np.ndarray:
+        if self._current_index is None:
+            raise RuntimeError("EpisodeRunnerCore.reset() must be called before accessing runtime observation state.")
+        obs = self._episode_data.observation_matrix[self._current_index].copy()
+        if self._position_placeholder_index is not None:
+            obs[self._position_placeholder_index] = np.float32(self._position.exposure)
+        if self._floating_pnl_placeholder_index is not None:
+            obs[self._floating_pnl_placeholder_index] = np.float32(self._current_floating_pnl())
+        if self._drawdown_placeholder_index is not None:
+            obs[self._drawdown_placeholder_index] = np.float32(self._current_drawdown())
+        if self._holding_age_in_position_index is not None:
+            obs[self._holding_age_in_position_index] = np.float32(self._current_holding_age_in_position())
+        if self._entry_return_bps_index is not None:
+            obs[self._entry_return_bps_index] = np.float32(self._current_entry_return_bps())
+        return obs
+
     def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
         """Reset episode and return first observation and info payload."""
 
@@ -547,11 +856,16 @@ class EpisodeRunnerCore:
         self._steps_taken = 0
         self._position = PositionState(exposure=0)
         self._portfolio = PortfolioState(portfolio_value=float(self._config.initial_cash))
+        self._open_position_entry_price_exec = None
+        self._open_position_entry_fees = 0.0
+        self._open_position_entry_slippage_cost = 0.0
+        self._open_position_entry_step_ordinal = None
+        self._peak_portfolio_value = float(self._config.initial_cash)
         self._terminated = False
         self._truncated = False
         self._seed = seed if seed is not None else self._config.seed
 
-        obs = self._episode_data.observation_matrix[self._current_index].copy()
+        obs = self._runtime_observation()
         info = {
             "seed": self._seed,
             "episode_ref": {
@@ -582,24 +896,62 @@ class EpisodeRunnerCore:
 
         price_exec = float(self._episode_data.execution_price_vector[current_index])
         price_next = float(self._episode_data.mark_to_market_price_vector[current_index + 1])
+        holding_steps_before_close: int | None = None
+        if (
+            exec_result.position_before in {-1, 1}
+            and exec_result.position_after == 0
+            and exec_result.trade_units > 0
+            and self._open_position_entry_step_ordinal is not None
+        ):
+            holding_steps_before_close = int(self._steps_taken - self._open_position_entry_step_ordinal)
+        reward_position_after = exec_result.position_after
+        reward_trade_units = exec_result.trade_units
+        delayed_close_interval_accrual = (
+            self._config.close_position_transition_timing_policy == "flatten_after_interval"
+            and exec_result.position_before in {-1, 1}
+            and exec_result.position_after == 0
+            and exec_result.trade_units > 0
+        )
+        if delayed_close_interval_accrual:
+            # Carry the existing exposure through the current accrual interval and flatten only for the next state.
+            reward_position_after = exec_result.position_before
         reward = RewardEngine.compute_reward(
+            reward_version=self._config.reward_version,
+            position_before=exec_result.position_before,
             action_raw=exec_result.action_raw,
             invalid_action=exec_result.invalid_action,
             invalid_action_reason=exec_result.invalid_action_reason,
-            position_after=exec_result.position_after,
+            position_after=reward_position_after,
             price_exec=price_exec,
             price_next=price_next,
-            trade_units=exec_result.trade_units,
+            trade_units=reward_trade_units,
             fee_bps=self._config.fee_bps,
             slippage_bps=self._config.slippage_bps,
             invalid_close_flat_penalty=self._config.invalid_close_flat_penalty,
             reward_scale=self._config.reward_scale,
             reward_clip_min=self._config.reward_clip_min,
             reward_clip_max=self._config.reward_clip_max,
+            dense_pbr_config=self._config.dense_pbr_config,
+            entry_price_exec=self._open_position_entry_price_exec,
+            entry_fees=self._open_position_entry_fees,
+            entry_slippage_cost=self._open_position_entry_slippage_cost,
+            holding_steps_before_close=holding_steps_before_close,
+            close_accounting_position_after=exec_result.position_after,
         )
 
         self._position = PositionState(exposure=exec_result.position_after)
+        if exec_result.position_before == 0 and exec_result.position_after in {-1, 1} and exec_result.trade_units > 0:
+            self._open_position_entry_price_exec = float(price_exec)
+            self._open_position_entry_fees = float(reward.fees)
+            self._open_position_entry_slippage_cost = float(reward.slippage_cost)
+            self._open_position_entry_step_ordinal = int(self._steps_taken)
+        elif exec_result.position_before in {-1, 1} and exec_result.position_after == 0 and exec_result.trade_units > 0:
+            self._open_position_entry_price_exec = None
+            self._open_position_entry_fees = 0.0
+            self._open_position_entry_slippage_cost = 0.0
+            self._open_position_entry_step_ordinal = None
         self._portfolio = PortfolioState(portfolio_value=self._portfolio.portfolio_value + reward.reward_total)
+        self._peak_portfolio_value = max(self._peak_portfolio_value, float(self._portfolio.portfolio_value))
         self._current_index = current_index + 1
         self._steps_taken += 1
 
@@ -624,6 +976,12 @@ class EpisodeRunnerCore:
             "reward_total": reward.reward_total,
             "reward_components": {
                 "pnl_delta": reward.pnl_delta,
+                "position_mtm_contribution": reward.position_mtm_contribution,
+                "realized_pnl_contribution": reward.realized_pnl_contribution,
+                "close_realized_pnl_bonus_contribution": reward.close_realized_pnl_bonus_contribution,
+                "benchmark_relative_contribution": reward.benchmark_relative_contribution,
+                "risk_penalty": reward.risk_penalty,
+                "inactivity_penalty": reward.inactivity_penalty,
                 "invalid_close_flat_penalty": reward.invalid_close_flat_penalty,
                 "reward_raw": reward.reward_raw,
                 "reward_scaled": reward.reward_total,
@@ -640,5 +998,5 @@ class EpisodeRunnerCore:
         if truncated:
             info["truncation_reason"] = "max_steps"
 
-        obs = self._episode_data.observation_matrix[self._current_index].copy()
+        obs = self._runtime_observation()
         return obs, float(reward.reward_total), terminated, truncated, info
