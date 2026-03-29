@@ -43,10 +43,8 @@ def resolve_progress_mode(requested_mode: str) -> ProgressModeResolution:
         active_mode = "disabled"
     elif normalized == "text":
         active_mode = "text_tqdm"
-    elif normalized == "notebook":
-        active_mode = "notebook_tqdm" if (colab_detected or notebook_detected) else "text_tqdm"
     else:
-        active_mode = "notebook_tqdm" if (colab_detected or notebook_detected) else "text_tqdm"
+        active_mode = "notebook_tqdm" if notebook_detected else "text_tqdm"
 
     return ProgressModeResolution(
         requested_mode=normalized,
@@ -95,6 +93,7 @@ class EvaluationProgressBar:
                 total=self._total_episodes,
                 desc=f"Eval {self._evaluation_mode}",
                 unit="episode",
+                active_mode=self._resolution.active_mode,
             )
             self._bar.set_postfix(
                 {
@@ -198,6 +197,7 @@ def build_training_progress_callback(
                     total=self._total_timesteps,
                     desc="Train PPO",
                     unit="step",
+                    active_mode=resolution.active_mode,
                 )
                 self._bar.set_postfix(
                     {
@@ -250,10 +250,10 @@ def build_training_progress_callback(
     return _TrainingProgressCallback()
 
 
-def _make_tqdm(*, total: int, desc: str, unit: str) -> Any:
-    """Return a tqdm instance via tqdm.auto for terminal/notebook compatibility."""
+def _make_tqdm(*, total: int, desc: str, unit: str, active_mode: str) -> Any:
+    """Return a tqdm instance matched to the resolved live progress mode."""
 
-    module = importlib.import_module("tqdm.auto")
+    module = importlib.import_module("tqdm.notebook" if active_mode == "notebook_tqdm" else "tqdm")
     tqdm_class = getattr(module, "tqdm")
     return tqdm_class(total=total, desc=desc, unit=unit, dynamic_ncols=True, leave=True)
 

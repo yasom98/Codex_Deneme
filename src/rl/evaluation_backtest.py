@@ -22,16 +22,28 @@ import torch as th
 from rl.colab_runtime import capture_memory_snapshot, collect_runtime_environment, validate_finite_scalar
 from rl.env_adapter_gym import TradingEnvGym
 from rl.env_contract import EnvConfig, parse_env_config
-from rl.env_core import EpisodeRef
+from rl.env_core import (
+    ACTION_CLOSE_POSITION,
+    ACTION_HOLD,
+    ACTION_MAPPING,
+    ACTION_OPEN_LONG,
+    EpisodeRef,
+    PortfolioState,
+    PositionState,
+)
 from rl.notebook_progress import EvaluationProgressBar, log_progress_mode, resolve_progress_mode
 from rl.passivity_diagnostics import (
+    COMPACT_STEP_DIAGNOSTICS_REPORT_FILENAME,
     DETERMINISTIC_ACTION_RANKING_TRACE_FILENAME,
     DETERMINISTIC_HOLD_GAP_THRESHOLD,
     PASSIVITY_DIAGNOSTICS_REPORT_FILENAME,
+    build_action_ranking_snapshot,
+    build_compact_step_diagnostics_report,
     build_deterministic_action_ranking_row,
     build_deterministic_action_ranking_summary,
     build_deterministic_action_ranking_trace_csv,
     build_eval_passivity_diagnostics_report,
+    build_position_conditional_action_ranking_summary,
     extract_action_probabilities,
     summarize_eval_policy_behavior,
 )
@@ -76,6 +88,11 @@ PARTITION_ALIAS_RULE = {
 
 BENCHMARK_MODE_NONE = "none"
 BENCHMARK_MODE_BUY_AND_HOLD = "buy_and_hold"
+BENCHMARK_MODE_ALWAYS_FLAT = "always_flat"
+
+EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX = "deterministic_argmax"
+EVALUATION_POLICY_MODE_STOCHASTIC_SAMPLE = "stochastic_sample"
+EVALUATION_POLICY_MODE_TEMPERATURE_SAMPLE = "temperature_sample"
 
 STARTUP_POLICY_FRESH_ONLY = "fresh_only"
 
@@ -136,6 +153,12 @@ EVAL_REPORT_WRITE_FAILED = "EVAL_REPORT_WRITE_FAILED"
 EVAL_RISK_OVERLAY_CONFIG_REQUIRED = "EVAL_RISK_OVERLAY_CONFIG_REQUIRED"
 EVAL_RISK_OVERLAY_CONFIG_INVALID = "EVAL_RISK_OVERLAY_CONFIG_INVALID"
 EVAL_PASSIVITY_DIAGNOSTICS_FAILED = "EVAL_PASSIVITY_DIAGNOSTICS_FAILED"
+EVAL_UNREALIZED_OPEN_POSITION_RETURN = "EVAL_UNREALIZED_OPEN_POSITION_RETURN"
+EVAL_MAX_DRAWDOWN_GT_ONE = "EVAL_MAX_DRAWDOWN_GT_ONE"
+REPRESENTATIVE_LONG_STATE_COUNTERFACTUAL_AUDIT_FILENAME = "representative_long_state_counterfactual_audit.json"
+REPRESENTATIVE_LONG_STATE_COUNTERFACTUAL_AUDIT_CONTRACT_VERSION = "representative_long_state_counterfactual_audit.v2"
+REPRESENTATIVE_LONG_STATE_COUNTERFACTUAL_LIMIT = 8
+REPRESENTATIVE_LONG_STATE_ZEROISH_EDGE_EPSILON = 1e-6
 
 
 @dataclass
@@ -154,6 +177,8 @@ class EvalConfig:
     algorithm: str
     seed: int
     deterministic: bool
+    evaluation_policy_mode: str
+    evaluation_temperature: float | None
     device: str
     evaluation_mode: str
     target_mode: str
@@ -168,6 +193,8 @@ class EvalConfig:
     backtest_metrics: tuple[str, ...]
     action_masking: bool = False
     passivity_diagnostics: bool = False
+    compact_step_diagnostics: bool = False
+    representative_long_state_counterfactual_audit: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +219,8 @@ class ReportPaths:
     step_trace_path: Path
     passivity_diagnostics_report_path: Path
     deterministic_action_ranking_trace_path: Path
+    compact_step_diagnostics_report_path: Path
+    representative_long_state_counterfactual_audit_path: Path
     risk_decision_log_path: Path | None = None
     risk_overlay_summary_path: Path | None = None
     risk_state_transition_log_path: Path | None = None
@@ -221,6 +250,9 @@ class EpisodeRuntime:
     benchmark_metric_status: dict[str, dict[str, Any]] | None
     closed_trade_proxy_returns: tuple[float, ...]
     closed_trade_pnls: tuple[float, ...]
+    ended_with_open_position: bool
+    horizon_seconds: float | None
+    median_step_seconds: float | None
 
 
 def execute_evaluation_backtest(
@@ -252,6 +284,10 @@ def execute_evaluation_backtest(
         step_trace_path=output_dir_resolved / "evaluation_step_trace.parquet",
         passivity_diagnostics_report_path=output_dir_resolved / PASSIVITY_DIAGNOSTICS_REPORT_FILENAME,
         deterministic_action_ranking_trace_path=output_dir_resolved / DETERMINISTIC_ACTION_RANKING_TRACE_FILENAME,
+        compact_step_diagnostics_report_path=output_dir_resolved / COMPACT_STEP_DIAGNOSTICS_REPORT_FILENAME,
+        representative_long_state_counterfactual_audit_path=(
+            output_dir_resolved / REPRESENTATIVE_LONG_STATE_COUNTERFACTUAL_AUDIT_FILENAME
+        ),
         risk_decision_log_path=output_dir_resolved / "risk_decision_log.jsonl",
         risk_overlay_summary_path=output_dir_resolved / "risk_overlay_summary.json",
         risk_state_transition_log_path=output_dir_resolved / "risk_state_transition_log.jsonl",
@@ -414,6 +450,16 @@ def execute_evaluation_backtest(
 
     selected_algorithm = eval_config.algorithm if eval_config is not None else _raw_string(loaded_inputs.get("eval_config"), "algorithm")
     deterministic = eval_config.deterministic if eval_config is not None else _raw_bool(loaded_inputs.get("eval_config"), "deterministic")
+    evaluation_policy_mode = (
+        eval_config.evaluation_policy_mode
+        if eval_config is not None
+        else _raw_string(loaded_inputs.get("eval_config"), "evaluation_policy_mode")
+    )
+    evaluation_temperature = (
+        eval_config.evaluation_temperature
+        if eval_config is not None
+        else _raw_float(loaded_inputs.get("eval_config"), "evaluation_temperature")
+    )
     requested_device = eval_config.device if eval_config is not None else _raw_string(loaded_inputs.get("eval_config"), "device")
     effective_seed = eval_config.seed if eval_config is not None else _raw_int(loaded_inputs.get("eval_config"), "seed")
     evaluation_mode = eval_config.evaluation_mode if eval_config is not None else _raw_string(
@@ -434,6 +480,13 @@ def execute_evaluation_backtest(
         eval_config.passivity_diagnostics
         if eval_config is not None
         else loaded_inputs.get("eval_config", {}).get("passivity_diagnostics")
+        if isinstance(loaded_inputs.get("eval_config"), dict)
+        else None
+    )
+    compact_step_diagnostics_enabled = (
+        eval_config.compact_step_diagnostics
+        if eval_config is not None
+        else loaded_inputs.get("eval_config", {}).get("compact_step_diagnostics")
         if isinstance(loaded_inputs.get("eval_config"), dict)
         else None
     )
@@ -515,6 +568,12 @@ def execute_evaluation_backtest(
         runtime=_runtime_payload(),
         warnings=warnings,
         errors=errors,
+        compact_step_diagnostics_enabled=compact_step_diagnostics_enabled,
+        representative_long_state_counterfactual_audit_enabled=bool(
+            loaded_inputs.get("eval_config", {}).get("representative_long_state_counterfactual_audit", False)
+        ),
+        evaluation_policy_mode=evaluation_policy_mode,
+        evaluation_temperature=evaluation_temperature,
     )
     manifest_payload = _build_manifest_payload(
         run_id=normalized_run_id,
@@ -554,6 +613,12 @@ def execute_evaluation_backtest(
             config_hash=risk_overlay_config_hash,
             report_paths=report_paths,
         ),
+        compact_step_diagnostics_enabled=compact_step_diagnostics_enabled,
+        representative_long_state_counterfactual_audit_enabled=bool(
+            loaded_inputs.get("eval_config", {}).get("representative_long_state_counterfactual_audit", False)
+        ),
+        evaluation_policy_mode=evaluation_policy_mode,
+        evaluation_temperature=evaluation_temperature,
     )
 
     if errors:
@@ -564,6 +629,8 @@ def execute_evaluation_backtest(
             selected_algorithm=selected_algorithm,
             deterministic=deterministic,
             action_masking_enabled=action_masking_enabled,
+            evaluation_policy_mode=evaluation_policy_mode,
+            evaluation_temperature=evaluation_temperature,
             effective_seed=effective_seed,
             evaluation_mode=evaluation_mode,
             target_mode=target_mode,
@@ -583,6 +650,10 @@ def execute_evaluation_backtest(
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
             passivity_diagnostics_enabled=passivity_diagnostics_enabled,
+            compact_step_diagnostics_enabled=compact_step_diagnostics_enabled,
+            representative_long_state_counterfactual_audit_enabled=bool(
+                loaded_inputs.get("eval_config", {}).get("representative_long_state_counterfactual_audit", False)
+            ),
             report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
@@ -682,6 +753,8 @@ def execute_evaluation_backtest(
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
             action_masking_enabled=eval_config.action_masking,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
+            evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -693,6 +766,10 @@ def execute_evaluation_backtest(
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
             passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
+            representative_long_state_counterfactual_audit_enabled=(
+                eval_config.representative_long_state_counterfactual_audit
+            ),
             report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
@@ -755,6 +832,8 @@ def execute_evaluation_backtest(
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
             action_masking_enabled=eval_config.action_masking,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
+            evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -766,6 +845,10 @@ def execute_evaluation_backtest(
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
             passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
+            representative_long_state_counterfactual_audit_enabled=(
+                eval_config.representative_long_state_counterfactual_audit
+            ),
             report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
@@ -797,7 +880,11 @@ def execute_evaluation_backtest(
     comparison_episode_runtimes: list[EpisodeRuntime] | None = None
     passivity_diagnostics_payload: dict[str, Any] | None = None
     passivity_diagnostics_issue: ValidationIssue | None = None
+    compact_step_diagnostics_payload: dict[str, Any] | None = None
+    representative_long_state_counterfactual_payload: dict[str, Any] | None = None
+    compact_step_rows: list[dict[str, Any]] = []
     deterministic_action_ranking_rows: list[dict[str, Any]] = []
+    representative_long_state_counterfactual_rows: list[dict[str, Any]] = []
     deterministic_action_ranking_trace_csv: str | None = None
     step_rows: list[dict[str, Any]] = []
     progress_bar = EvaluationProgressBar(
@@ -820,7 +907,10 @@ def execute_evaluation_backtest(
         phase_detail["eval_start"] = {
             "selected_episode_count": len(env_clients),
             "deterministic": eval_config.deterministic,
+            "evaluation_policy_mode": eval_config.evaluation_policy_mode,
+            "evaluation_temperature": eval_config.evaluation_temperature,
             "passivity_diagnostics_enabled": eval_config.passivity_diagnostics,
+            "compact_step_diagnostics_enabled": eval_config.compact_step_diagnostics,
         }
         for episode_index, (episode_ref, env_client) in enumerate(zip(target_resolution.selected_episode_refs, env_clients, strict=True)):
             progress_bar.on_episode_start(episode_index=episode_index, episode_ref=dict(episode_ref))
@@ -831,6 +921,8 @@ def execute_evaluation_backtest(
                 env_client=env_client,
                 episode_ref=episode_ref,
                 deterministic=eval_config.deterministic,
+                evaluation_policy_mode=eval_config.evaluation_policy_mode,
+                evaluation_temperature=eval_config.evaluation_temperature,
                 seed=eval_config.seed,
                 benchmark_mode=eval_config.benchmark_mode,
                 action_masking_enabled=eval_config.action_masking,
@@ -840,6 +932,12 @@ def execute_evaluation_backtest(
                 risk_overlay_session=risk_overlay_session,
                 deterministic_action_ranking_rows=(
                     deterministic_action_ranking_rows if eval_config.passivity_diagnostics and eval_config.deterministic else None
+                ),
+                compact_step_rows=compact_step_rows if eval_config.compact_step_diagnostics else None,
+                representative_long_state_counterfactual_rows=(
+                    representative_long_state_counterfactual_rows
+                    if eval_config.representative_long_state_counterfactual_audit and eval_config.deterministic
+                    else None
                 ),
                 deterministic_ranking_gap_threshold=DETERMINISTIC_HOLD_GAP_THRESHOLD,
             )
@@ -874,6 +972,12 @@ def execute_evaluation_backtest(
                         env_client=env_client,
                         episode_ref=episode_ref,
                         deterministic=not eval_config.deterministic,
+                        evaluation_policy_mode=(
+                            EVALUATION_POLICY_MODE_STOCHASTIC_SAMPLE
+                            if eval_config.deterministic
+                            else EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX
+                        ),
+                        evaluation_temperature=eval_config.evaluation_temperature,
                         seed=eval_config.seed,
                         benchmark_mode=eval_config.benchmark_mode,
                         action_masking_enabled=eval_config.action_masking,
@@ -886,6 +990,8 @@ def execute_evaluation_backtest(
                             if eval_config.passivity_diagnostics and not eval_config.deterministic
                             else None
                         ),
+                        compact_step_rows=None,
+                        representative_long_state_counterfactual_rows=None,
                         deterministic_ranking_gap_threshold=DETERMINISTIC_HOLD_GAP_THRESHOLD,
                     )
                     comparison_episode_runtimes.append(comparison_runtime)
@@ -920,6 +1026,8 @@ def execute_evaluation_backtest(
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
             action_masking_enabled=eval_config.action_masking,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
+            evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -931,6 +1039,7 @@ def execute_evaluation_backtest(
             metric_status={"strategy": None, "benchmark": None, "relative": None},
             trace_artifact_path=None,
             passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
             report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
@@ -971,7 +1080,7 @@ def execute_evaluation_backtest(
     relative_metrics: dict[str, Any] | None = None
     relative_status: dict[str, Any] | None = None
 
-    if eval_config.benchmark_mode == BENCHMARK_MODE_BUY_AND_HOLD:
+    if eval_config.benchmark_mode != BENCHMARK_MODE_NONE:
         benchmark_metrics, benchmark_status = _aggregate_metric_values(
             episode_runtimes=episode_runtimes,
             metric_names=eval_config.backtest_metrics,
@@ -983,6 +1092,19 @@ def execute_evaluation_backtest(
             benchmark_metrics=benchmark_metrics,
             benchmark_status=benchmark_status,
         )
+
+    accounting_context = _build_accounting_context(
+        env_config=env_config,
+        benchmark_mode=eval_config.benchmark_mode,
+        episode_runtimes=episode_runtimes,
+    )
+    backtest_warnings = list(warnings)
+    backtest_warnings.extend(
+        _build_metric_interpretation_warnings(
+            strategy_metrics=strategy_metrics,
+            accounting_context=accounting_context,
+        )
+    )
 
     if eval_config.passivity_diagnostics:
         if (
@@ -1013,6 +1135,10 @@ def execute_evaluation_backtest(
                 deterministic=eval_config.deterministic,
                 action_masking_enabled=eval_config.action_masking,
                 passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+                compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
+                representative_long_state_counterfactual_audit_enabled=(
+                    eval_config.representative_long_state_counterfactual_audit
+                ),
                 effective_seed=eval_config.seed,
                 evaluation_mode=eval_config.evaluation_mode,
                 target_mode=eval_config.target_mode,
@@ -1035,8 +1161,11 @@ def execute_evaluation_backtest(
                     summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
                 ),
                 runtime=_runtime_payload(),
-                warnings=warnings,
+                warnings=backtest_warnings,
                 errors=[diagnostics_error],
+                evaluation_policy_mode=eval_config.evaluation_policy_mode,
+                evaluation_temperature=eval_config.evaluation_temperature,
+                accounting_context=accounting_context,
             )
             write_ok = _write_reports_with_trace(
                 validation_payload=validation_payload,
@@ -1046,6 +1175,7 @@ def execute_evaluation_backtest(
                 step_rows=step_rows,
                 write_step_trace=eval_config.write_step_trace,
                 deterministic_action_ranking_trace_csv=deterministic_action_ranking_trace_csv,
+                compact_step_diagnostics_payload=compact_step_diagnostics_payload,
                 risk_overlay_bundle=risk_overlay_bundle,
             )
             return EvaluationExecutionResult(
@@ -1074,6 +1204,9 @@ def execute_evaluation_backtest(
             deterministic_action_ranking_rows,
             gap_threshold=DETERMINISTIC_HOLD_GAP_THRESHOLD,
         )
+        deterministic_position_conditional_summary = build_position_conditional_action_ranking_summary(
+            deterministic_action_ranking_rows
+        )
         deterministic_action_ranking_trace_csv = build_deterministic_action_ranking_trace_csv(
             deterministic_action_ranking_rows
         )
@@ -1085,15 +1218,35 @@ def execute_evaluation_backtest(
             run_id=normalized_run_id,
             evaluation_session_id=evaluation_session_id,
             action_masking_enabled=eval_config.action_masking,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
             deterministic_summary=deterministic_summary,
             stochastic_summary=stochastic_summary,
             deterministic_action_ranking_summary=deterministic_action_ranking_summary,
+            deterministic_position_conditional_summary=deterministic_position_conditional_summary,
+        )
+    if eval_config.compact_step_diagnostics:
+        compact_step_diagnostics_payload = build_compact_step_diagnostics_report(
+            run_id=normalized_run_id,
+            evaluation_session_id=evaluation_session_id,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
+            action_masking_enabled=eval_config.action_masking,
+            compact_step_rows=compact_step_rows,
+        )
+    if eval_config.representative_long_state_counterfactual_audit:
+        representative_long_state_counterfactual_payload = _build_representative_long_state_counterfactual_payload(
+            run_id=normalized_run_id,
+            evaluation_session_id=evaluation_session_id,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
+            action_masking_enabled=eval_config.action_masking,
+            records=representative_long_state_counterfactual_rows,
         )
 
     phase_status["report_write"] = "completed"
     phase_detail["report_write"] = {
         "write_step_trace": eval_config.write_step_trace,
         "trace_row_count": len(step_rows),
+        "compact_step_diagnostics_enabled": eval_config.compact_step_diagnostics,
+        "compact_step_diagnostics_row_count": len(compact_step_rows),
     }
     risk_overlay_bundle = risk_overlay_session.build_report_bundle() if risk_overlay_session is not None else None
     backtest_payload = _build_backtest_payload(
@@ -1104,6 +1257,8 @@ def execute_evaluation_backtest(
         deterministic=eval_config.deterministic,
         action_masking_enabled=eval_config.action_masking,
         passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+        compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
+        representative_long_state_counterfactual_audit_enabled=eval_config.representative_long_state_counterfactual_audit,
         effective_seed=eval_config.seed,
         evaluation_mode=eval_config.evaluation_mode,
         target_mode=eval_config.target_mode,
@@ -1126,8 +1281,11 @@ def execute_evaluation_backtest(
             summary_payload=risk_overlay_bundle.summary_payload if risk_overlay_bundle is not None else None,
         ),
         runtime=_runtime_payload(),
-        warnings=warnings,
+        warnings=backtest_warnings,
         errors=[],
+        evaluation_policy_mode=eval_config.evaluation_policy_mode,
+        evaluation_temperature=eval_config.evaluation_temperature,
+        accounting_context=accounting_context,
     )
     write_ok = _write_reports_with_trace(
         validation_payload=validation_payload,
@@ -1138,6 +1296,8 @@ def execute_evaluation_backtest(
         write_step_trace=eval_config.write_step_trace,
         passivity_diagnostics_payload=passivity_diagnostics_payload,
         deterministic_action_ranking_trace_csv=deterministic_action_ranking_trace_csv,
+        compact_step_diagnostics_payload=compact_step_diagnostics_payload,
+        representative_long_state_counterfactual_payload=representative_long_state_counterfactual_payload,
         risk_overlay_bundle=risk_overlay_bundle,
     )
     if not write_ok:
@@ -1153,6 +1313,8 @@ def execute_evaluation_backtest(
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
             action_masking_enabled=eval_config.action_masking,
+            evaluation_policy_mode=eval_config.evaluation_policy_mode,
+            evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
             evaluation_mode=eval_config.evaluation_mode,
             target_mode=eval_config.target_mode,
@@ -1177,6 +1339,10 @@ def execute_evaluation_backtest(
             },
             trace_artifact_path=str(report_paths.step_trace_path) if eval_config.write_step_trace else None,
             passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
+            compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
+            representative_long_state_counterfactual_audit_enabled=(
+                eval_config.representative_long_state_counterfactual_audit
+            ),
             report_paths=report_paths,
             risk_overlay=_risk_overlay_backtest_metadata(
                 enabled=risk_overlay_enabled,
@@ -1458,7 +1624,14 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
         "write_step_trace",
         "backtest_metrics",
     }
-    optional_fields = {"action_masking", "passivity_diagnostics"}
+    optional_fields = {
+        "action_masking",
+        "passivity_diagnostics",
+        "compact_step_diagnostics",
+        "representative_long_state_counterfactual_audit",
+        "evaluation_policy_mode",
+        "evaluation_temperature",
+    }
     extra_keys = sorted(set(payload.keys()) - required_fields - optional_fields)
     missing_keys = sorted(required_fields - set(payload.keys()))
     if missing_keys or extra_keys:
@@ -1500,6 +1673,97 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
                 context={"deterministic": deterministic_raw},
             )
         )
+
+    evaluation_policy_mode_raw = payload.get("evaluation_policy_mode")
+    evaluation_policy_mode: str | None
+    if evaluation_policy_mode_raw is None:
+        if isinstance(deterministic_raw, bool):
+            evaluation_policy_mode = (
+                EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX
+                if deterministic_raw
+                else EVALUATION_POLICY_MODE_STOCHASTIC_SAMPLE
+            )
+        else:
+            evaluation_policy_mode = None
+    elif not isinstance(evaluation_policy_mode_raw, str) or not evaluation_policy_mode_raw.strip():
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="evaluation_policy_mode must be a non-empty string when provided.",
+                context={"evaluation_policy_mode": evaluation_policy_mode_raw},
+            )
+        )
+        evaluation_policy_mode = None
+    else:
+        evaluation_policy_mode = evaluation_policy_mode_raw.strip()
+        if evaluation_policy_mode not in {
+            EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX,
+            EVALUATION_POLICY_MODE_STOCHASTIC_SAMPLE,
+            EVALUATION_POLICY_MODE_TEMPERATURE_SAMPLE,
+        }:
+            errors.append(
+                ValidationIssue(
+                    code=EVAL_CONFIG_INVALID,
+                    message="evaluation_policy_mode is unsupported.",
+                    context={"evaluation_policy_mode": evaluation_policy_mode},
+                )
+            )
+
+    evaluation_temperature_raw = payload.get("evaluation_temperature")
+    evaluation_temperature: float | None = None
+    if evaluation_temperature_raw is not None:
+        if isinstance(evaluation_temperature_raw, bool) or not isinstance(evaluation_temperature_raw, (int, float)):
+            errors.append(
+                ValidationIssue(
+                    code=EVAL_CONFIG_INVALID,
+                    message="evaluation_temperature must be a positive finite number when provided.",
+                    context={"evaluation_temperature": evaluation_temperature_raw},
+                )
+            )
+        else:
+            evaluation_temperature = float(evaluation_temperature_raw)
+            if not math.isfinite(evaluation_temperature) or evaluation_temperature <= 0.0:
+                errors.append(
+                    ValidationIssue(
+                        code=EVAL_CONFIG_INVALID,
+                        message="evaluation_temperature must be a positive finite number when provided.",
+                        context={"evaluation_temperature": evaluation_temperature_raw},
+                    )
+                )
+
+    if evaluation_policy_mode == EVALUATION_POLICY_MODE_TEMPERATURE_SAMPLE and evaluation_temperature is None:
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="evaluation_temperature is required when evaluation_policy_mode=temperature_sample.",
+                context={"evaluation_policy_mode": evaluation_policy_mode},
+            )
+        )
+    if (
+        evaluation_policy_mode is not None
+        and evaluation_policy_mode != EVALUATION_POLICY_MODE_TEMPERATURE_SAMPLE
+        and evaluation_temperature is not None
+    ):
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="evaluation_temperature must be null unless evaluation_policy_mode=temperature_sample.",
+                context={
+                    "evaluation_policy_mode": evaluation_policy_mode,
+                    "evaluation_temperature": evaluation_temperature_raw,
+                },
+            )
+        )
+    if evaluation_policy_mode is not None and isinstance(deterministic_raw, bool):
+        expected_deterministic = evaluation_policy_mode == EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX
+        if deterministic_raw != expected_deterministic:
+            errors.append(
+                ValidationIssue(
+                    code=EVAL_CONFIG_INVALID,
+                    message="deterministic must remain consistent with evaluation_policy_mode.",
+                    context={"deterministic": deterministic_raw, "evaluation_policy_mode": evaluation_policy_mode},
+                )
+            )
 
     device = _raw_string(payload, "device")
     if device not in {DEVICE_CPU, DEVICE_CUDA, DEVICE_AUTO}:
@@ -1595,7 +1859,7 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
         )
 
     benchmark_mode = _raw_string(payload, "benchmark_mode")
-    if benchmark_mode not in {BENCHMARK_MODE_NONE, BENCHMARK_MODE_BUY_AND_HOLD}:
+    if benchmark_mode not in {BENCHMARK_MODE_NONE, BENCHMARK_MODE_BUY_AND_HOLD, BENCHMARK_MODE_ALWAYS_FLAT}:
         errors.append(
             ValidationIssue(
                 code=EVAL_BENCHMARK_MODE_INVALID,
@@ -1670,6 +1934,40 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
                 context={"passivity_diagnostics": passivity_diagnostics_raw},
             )
         )
+    compact_step_diagnostics_raw = payload.get("compact_step_diagnostics", False)
+    if not isinstance(compact_step_diagnostics_raw, bool):
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="compact_step_diagnostics must be a boolean when provided.",
+                context={"compact_step_diagnostics": compact_step_diagnostics_raw},
+            )
+        )
+    representative_long_state_counterfactual_audit_raw = payload.get(
+        "representative_long_state_counterfactual_audit",
+        False,
+    )
+    if not isinstance(representative_long_state_counterfactual_audit_raw, bool):
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="representative_long_state_counterfactual_audit must be a boolean when provided.",
+                context={
+                    "representative_long_state_counterfactual_audit": representative_long_state_counterfactual_audit_raw
+                },
+            )
+        )
+    elif bool(representative_long_state_counterfactual_audit_raw) and not bool(passivity_diagnostics_raw):
+        errors.append(
+            ValidationIssue(
+                code=EVAL_CONFIG_INVALID,
+                message="representative_long_state_counterfactual_audit requires passivity_diagnostics=true.",
+                context={
+                    "representative_long_state_counterfactual_audit": representative_long_state_counterfactual_audit_raw,
+                    "passivity_diagnostics": passivity_diagnostics_raw,
+                },
+            )
+        )
 
     backtest_metrics_raw = payload.get("backtest_metrics")
     metrics: tuple[str, ...] = ()
@@ -1723,6 +2021,16 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
             algorithm=algorithm,
             seed=seed_raw,
             deterministic=deterministic_raw,
+            evaluation_policy_mode=(
+                evaluation_policy_mode
+                if evaluation_policy_mode is not None
+                else (
+                    EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX
+                    if deterministic_raw
+                    else EVALUATION_POLICY_MODE_STOCHASTIC_SAMPLE
+                )
+            ),
+            evaluation_temperature=evaluation_temperature,
             device=device,
             evaluation_mode=evaluation_mode,
             target_mode=target_mode,
@@ -1737,6 +2045,10 @@ def _validate_eval_config(payload: dict[str, Any] | None) -> dict[str, Any]:
             backtest_metrics=metrics,
             action_masking=bool(action_masking_raw),
             passivity_diagnostics=bool(passivity_diagnostics_raw),
+            compact_step_diagnostics=bool(compact_step_diagnostics_raw),
+            representative_long_state_counterfactual_audit=bool(
+                representative_long_state_counterfactual_audit_raw
+            ),
         ),
         "errors": errors,
     }
@@ -2326,6 +2638,8 @@ def _evaluate_single_episode(
     env_client: TradingEnvGym,
     episode_ref: dict[str, Any],
     deterministic: bool,
+    evaluation_policy_mode: str,
+    evaluation_temperature: float | None,
     action_masking_enabled: bool,
     seed: int,
     benchmark_mode: str,
@@ -2334,6 +2648,8 @@ def _evaluate_single_episode(
     progress_bar: EvaluationProgressBar | None = None,
     risk_overlay_session: RiskOverlaySession | None = None,
     deterministic_action_ranking_rows: list[dict[str, Any]] | None = None,
+    compact_step_rows: list[dict[str, Any]] | None = None,
+    representative_long_state_counterfactual_rows: list[dict[str, Any]] | None = None,
     deterministic_ranking_gap_threshold: float = DETERMINISTIC_HOLD_GAP_THRESHOLD,
 ) -> EpisodeRuntime:
     """Evaluate one isolated environment instance and return machine-readable evidence."""
@@ -2365,35 +2681,91 @@ def _evaluate_single_episode(
     closed_trade_pnls: list[float] = []
     step_counter = 0
     current_exposure = 0
+    current_position_age = 0
     current_equity = float(env_client._config.initial_cash)  # type: ignore[attr-defined]
     peak_equity = current_equity
+    sampling_rng = np.random.default_rng(int(seed) + (int(episode_index) + 1) * 1_000_003)
     while True:
         try:
             action_masks = env_client.action_masks() if action_masking_enabled else None
             ranking_action_probabilities: Mapping[str, float] | None = None
-            if deterministic_action_ranking_rows is not None:
+            ranking_snapshot: Mapping[str, Any] | None = None
+            probabilities_required = (
+                deterministic_action_ranking_rows is not None
+                or compact_step_rows is not None
+                or representative_long_state_counterfactual_rows is not None
+                or evaluation_policy_mode == EVALUATION_POLICY_MODE_TEMPERATURE_SAMPLE
+            )
+            if probabilities_required:
                 try:
                     ranking_action_probabilities = _extract_policy_action_probabilities(
                         model=model,
                         observation=observation,
                         action_masks=action_masks,
                     )
+                    ranking_snapshot = build_action_ranking_snapshot(
+                        position_before=current_exposure,
+                        action_probabilities=ranking_action_probabilities,
+                        valid_action_mask=action_masks,
+                        gap_threshold=deterministic_ranking_gap_threshold,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     raise ControlledEvaluationFailure(
                         ValidationIssue(
                             code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
-                            message="Deterministic action ranking diagnostics failed during evaluation.",
-                            context={"episode_ref": dict(episode_ref), "step_counter": step_counter, "error": str(exc)},
+                            message="Policy ranking diagnostics failed during evaluation.",
+                            context={
+                                "episode_ref": dict(episode_ref),
+                                "step_counter": step_counter,
+                                "evaluation_policy_mode": evaluation_policy_mode,
+                                "error": str(exc),
+                            },
                         )
                     ) from exc
-            if action_masking_enabled:
-                raw_action = model.predict(
-                    observation,
-                    deterministic=deterministic,
-                    action_masks=action_masks,
+            if evaluation_policy_mode == EVALUATION_POLICY_MODE_DETERMINISTIC_ARGMAX:
+                if action_masking_enabled:
+                    raw_action = model.predict(
+                        observation,
+                        deterministic=True,
+                        action_masks=action_masks,
+                    )
+                else:
+                    raw_action = model.predict(observation, deterministic=True)
+            elif evaluation_policy_mode == EVALUATION_POLICY_MODE_STOCHASTIC_SAMPLE:
+                if action_masking_enabled:
+                    raw_action = model.predict(
+                        observation,
+                        deterministic=False,
+                        action_masks=action_masks,
+                    )
+                else:
+                    raw_action = model.predict(observation, deterministic=False)
+            elif evaluation_policy_mode == EVALUATION_POLICY_MODE_TEMPERATURE_SAMPLE:
+                if ranking_action_probabilities is None:
+                    raise ControlledEvaluationFailure(
+                        ValidationIssue(
+                            code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                            message="Temperature sampling requires action probabilities during evaluation.",
+                            context={"episode_ref": dict(episode_ref), "step_counter": step_counter},
+                        )
+                    )
+                raw_action = (
+                    _sample_temperature_action(
+                        action_probabilities=ranking_action_probabilities,
+                        action_masks=action_masks,
+                        temperature=evaluation_temperature,
+                        rng=sampling_rng,
+                    ),
+                    None,
                 )
             else:
-                raw_action = model.predict(observation, deterministic=deterministic)
+                raise ControlledEvaluationFailure(
+                    ValidationIssue(
+                        code=EVAL_CONFIG_INVALID,
+                        message="evaluation_policy_mode is unsupported during execution.",
+                        context={"evaluation_policy_mode": evaluation_policy_mode},
+                    )
+                )
         except ControlledEvaluationFailure:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -2472,6 +2844,37 @@ def _evaluate_single_episode(
                 },
             )
             action = int(risk_decision.approved_action["action_raw"])
+        position_age_before = int(current_position_age)
+        if (
+            representative_long_state_counterfactual_rows is not None
+            and current_exposure == 1
+            and position_age_before >= 2
+            and len(representative_long_state_counterfactual_rows) < REPRESENTATIVE_LONG_STATE_COUNTERFACTUAL_LIMIT
+        ):
+            try:
+                representative_long_state_counterfactual_rows.append(
+                    _build_representative_long_state_counterfactual_row(
+                        model=model,
+                        env_client=env_client,
+                        observation=observation,
+                        action_masks=action_masks,
+                        episode_ref=episode_ref,
+                        episode_index=episode_index,
+                        step_ordinal=step_counter,
+                        step_index=current_index,
+                        timestamp=decision_timestamp,
+                        position_age_before=position_age_before,
+                        action_probabilities=ranking_action_probabilities,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise ControlledEvaluationFailure(
+                    ValidationIssue(
+                        code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                        message="Representative long-state counterfactual audit failed during evaluation.",
+                        context={"episode_ref": dict(episode_ref), "step_counter": step_counter, "error": str(exc)},
+                    )
+                ) from exc
         try:
             observation, reward, terminated, truncated, info = env_client.step(action)
         except Exception as exc:  # noqa: BLE001
@@ -2492,10 +2895,42 @@ def _evaluate_single_episode(
                 value=episode_data.mark_to_market_price_vector[int(info_dict["step_index"]) + 1],
             )
             pnl_delta = validate_finite_scalar(name="pnl_delta", value=info_dict["reward_components"]["pnl_delta"])
+            position_mtm_contribution = validate_finite_scalar(
+                name="position_mtm_contribution",
+                value=info_dict["reward_components"].get("position_mtm_contribution", pnl_delta),
+            )
             fees = validate_finite_scalar(name="fees", value=info_dict["cost_components"]["fees"])
             slippage_cost = validate_finite_scalar(
                 name="slippage_cost",
                 value=info_dict["cost_components"]["slippage_cost"],
+            )
+            invalid_close_flat_penalty = validate_finite_scalar(
+                name="invalid_close_flat_penalty",
+                value=info_dict["reward_components"].get("invalid_close_flat_penalty", 0.0),
+            )
+            risk_penalty = validate_finite_scalar(
+                name="risk_penalty",
+                value=info_dict["reward_components"].get("risk_penalty", 0.0),
+            )
+            inactivity_penalty = validate_finite_scalar(
+                name="inactivity_penalty",
+                value=info_dict["reward_components"].get("inactivity_penalty", 0.0),
+            )
+            benchmark_relative_contribution = validate_finite_scalar(
+                name="benchmark_relative_contribution",
+                value=info_dict["reward_components"].get("benchmark_relative_contribution", 0.0),
+            )
+            close_realized_pnl_bonus_contribution = validate_finite_scalar(
+                name="close_realized_pnl_bonus_contribution",
+                value=info_dict["reward_components"].get("close_realized_pnl_bonus_contribution", 0.0),
+            )
+            realized_pnl_contribution = validate_finite_scalar(
+                name="realized_pnl_contribution",
+                value=info_dict["reward_components"].get("realized_pnl_contribution", 0.0),
+            )
+            reward_raw = validate_finite_scalar(
+                name="reward_raw",
+                value=info_dict["reward_components"].get("reward_raw", reward_value),
             )
             portfolio_value = validate_finite_scalar(name="portfolio_value", value=info_dict["portfolio_value"])
         except ValueError as exc:
@@ -2532,11 +2967,19 @@ def _evaluate_single_episode(
             "price_exec": price_exec,
             "next_price": next_price,
             "reward_total": reward_value,
+            "reward_raw": reward_raw,
             "pnl_delta": pnl_delta,
+            "position_mtm_contribution": position_mtm_contribution,
             "fees": fees,
             "slippage_cost": slippage_cost,
-            "invalid_close_flat_penalty": float(info_dict["reward_components"].get("invalid_close_flat_penalty", 0.0)),
+            "invalid_close_flat_penalty": invalid_close_flat_penalty,
+            "risk_penalty": risk_penalty,
+            "inactivity_penalty": inactivity_penalty,
+            "benchmark_relative_contribution": benchmark_relative_contribution,
+            "close_realized_pnl_bonus_contribution": close_realized_pnl_bonus_contribution,
             "trade_units": trade_units,
+            "realized_pnl_contribution": realized_pnl_contribution,
+            "holding_duration_after_entry_steps": None,
             "strategy_portfolio_value": portfolio_value,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
@@ -2583,9 +3026,66 @@ def _evaluate_single_episode(
                     position_before=position_before,
                     selected_action_semantic=str(info_dict["action_semantic"]),
                     action_probabilities=ranking_action_probabilities,
+                    valid_action_mask=action_masks,
                     gap_threshold=deterministic_ranking_gap_threshold,
                 )
             )
+        compact_row_index: int | None = None
+        if compact_step_rows is not None:
+            if ranking_snapshot is None or ranking_action_probabilities is None:
+                raise ControlledEvaluationFailure(
+                    ValidationIssue(
+                        code=EVAL_PASSIVITY_DIAGNOSTICS_FAILED,
+                        message="Compact step diagnostics require policy ranking telemetry.",
+                        context={"episode_ref": dict(episode_ref), "step_counter": step_counter},
+                    )
+                )
+            top_ranked_semantics = ranking_snapshot["top_ranked_semantics"]
+            top_ranked_probabilities = ranking_snapshot["top_ranked_probabilities"]
+            compact_step_rows.append(
+                {
+                    "evaluation_episode_index": int(episode_index),
+                    "episode_scope": episode_ref["scope"],
+                    "episode_partition": episode_ref["partition"],
+                    "episode_source_rel": episode_ref["source_rel"],
+                    "episode_fold_id": episode_ref["fold_id"],
+                    "step_ordinal": int(step_counter),
+                    "step_index": current_index,
+                    "timestamp": current_timestamp,
+                    "position_before": position_before,
+                    "position_after": position_after,
+                    "action_semantic": str(info_dict["action_semantic"]),
+                    "selected_action_probability": float(
+                        ranking_action_probabilities[str(info_dict["action_semantic"])]
+                    ),
+                    "top_1_semantic": top_ranked_semantics[0],
+                    "top_1_probability": top_ranked_probabilities[0],
+                    "top_2_semantic": top_ranked_semantics[1],
+                    "top_2_probability": top_ranked_probabilities[1],
+                    "top_3_semantic": top_ranked_semantics[2],
+                    "top_3_probability": top_ranked_probabilities[2],
+                    "hold_gap_vs_next_best_valid_action": ranking_snapshot["hold_gap_vs_next_best_valid_action"],
+                    "hold_next_best_valid_action_semantic": ranking_snapshot["hold_next_best_valid_action_semantic"],
+                    "hold_next_best_valid_action_probability": ranking_snapshot[
+                        "hold_next_best_valid_action_probability"
+                    ],
+                    "reward_total": reward_value,
+                    "reward_raw": reward_raw,
+                    "pnl_delta": pnl_delta,
+                    "position_mtm_contribution": position_mtm_contribution,
+                    "realized_pnl_contribution": realized_pnl_contribution,
+                    "fees": fees,
+                    "slippage_cost": slippage_cost,
+                    "risk_penalty": risk_penalty,
+                    "inactivity_penalty": inactivity_penalty,
+                    "benchmark_relative_contribution": benchmark_relative_contribution,
+                    "close_realized_pnl_bonus_contribution": close_realized_pnl_bonus_contribution,
+                    "invalid_close_flat_penalty": invalid_close_flat_penalty,
+                    "valid_action_count": ranking_snapshot["valid_action_count"],
+                    "valid_action_semantics": list(ranking_snapshot["valid_action_semantics"]),
+                }
+            )
+            compact_row_index = len(compact_step_rows) - 1
         step_records.append(record)
         if progress_bar is not None:
             progress_bar.on_step(episode_index=episode_index, step_ordinal=step_counter + 1)
@@ -2596,6 +3096,9 @@ def _evaluate_single_episode(
                 "entry_price_exec": price_exec,
                 "entry_fees": fees,
                 "entry_slippage_cost": slippage_cost,
+                "entry_step_ordinal": int(step_counter),
+                "entry_record_index": int(len(step_records) - 1),
+                "entry_compact_row_index": compact_row_index,
             }
         elif position_before in {-1, 1} and position_after == 0 and trade_units > 0 and position_open is not None:
             entry_price_exec = float(position_open["entry_price_exec"])
@@ -2607,11 +3110,27 @@ def _evaluate_single_episode(
                 - fees
                 - slippage_cost
             )
+            holding_duration_steps = int(step_counter - int(position_open["entry_step_ordinal"]))
             closed_trade_pnls.append(net_pnl)
             closed_trade_proxy_returns.append(net_pnl / entry_price_exec if entry_price_exec > 0.0 else math.nan)
+            record["realized_pnl_contribution"] = float(net_pnl)
+            if compact_row_index is not None and compact_step_rows is not None:
+                compact_step_rows[compact_row_index]["realized_pnl_contribution"] = float(net_pnl)
+            entry_record_index = int(position_open["entry_record_index"])
+            step_records[entry_record_index]["holding_duration_after_entry_steps"] = holding_duration_steps
+            entry_compact_row_index = position_open.get("entry_compact_row_index")
+            if compact_step_rows is not None and isinstance(entry_compact_row_index, int):
+                compact_step_rows[entry_compact_row_index]["holding_duration_after_entry_steps"] = holding_duration_steps
             position_open = None
 
         current_exposure = int(position_after)
+        current_position_age = _advance_position_age_for_eval(
+            position_before=position_before,
+            position_after=position_after,
+            age_before=position_age_before,
+            terminated=bool(terminated),
+            truncated=bool(truncated),
+        )
         current_equity = portfolio_value
         peak_equity = max(float(peak_equity), float(current_equity))
         step_counter += 1
@@ -2648,6 +3167,26 @@ def _evaluate_single_episode(
         )
         for record, benchmark_record in zip(step_records, benchmark_trace["step_records"], strict=True):
             record["benchmark_equity"] = float(benchmark_record["strategy_portfolio_value"])
+    elif benchmark_mode == BENCHMARK_MODE_ALWAYS_FLAT:
+        benchmark_trace = _build_always_flat_trace(
+            step_records=step_records,
+            initial_cash=float(env_client._config.initial_cash),  # type: ignore[attr-defined]
+        )
+        if benchmark_trace["error"] is not None:
+            raise ControlledEvaluationFailure(benchmark_trace["error"])
+        benchmark_values, benchmark_status = _compute_metric_values(
+            step_records=benchmark_trace["step_records"],
+            initial_cash=float(env_client._config.initial_cash),  # type: ignore[attr-defined]
+            requested_metrics=requested_metrics,
+            proxy_trade_returns=[],
+            closed_trade_pnls=[],
+            metric_kind="benchmark",
+        )
+        for record, benchmark_record in zip(step_records, benchmark_trace["step_records"], strict=True):
+            record["benchmark_equity"] = float(benchmark_record["strategy_portfolio_value"])
+
+    timestamps = [str(step_records[0]["timestamp"])] + [str(item["next_timestamp"]) for item in step_records]
+    horizon_seconds, median_step_seconds = _resolve_horizon_seconds(timestamps)
 
     return EpisodeRuntime(
         episode_ref=dict(episode_ref),
@@ -2658,6 +3197,9 @@ def _evaluate_single_episode(
         benchmark_metric_status=benchmark_status,
         closed_trade_proxy_returns=tuple(float(item) for item in closed_trade_proxy_returns if math.isfinite(item)),
         closed_trade_pnls=tuple(float(item) for item in closed_trade_pnls),
+        ended_with_open_position=position_open is not None,
+        horizon_seconds=horizon_seconds,
+        median_step_seconds=median_step_seconds,
     )
 
 
@@ -2687,6 +3229,346 @@ def _extract_policy_action_probabilities(
     return action_probabilities
 
 
+def _extract_policy_value_estimate(*, model: Any, observation: Any) -> float:
+    """Extract one scalar state-value estimate from the live evaluation policy."""
+
+    policy = getattr(model, "policy", None)
+    if policy is None or not hasattr(policy, "obs_to_tensor") or not hasattr(policy, "predict_values"):
+        raise RuntimeError("model policy does not expose obs_to_tensor/predict_values for diagnostics")
+    with th.no_grad():
+        observation_tensor, _ = policy.obs_to_tensor(observation)
+        value_output = policy.predict_values(observation_tensor)
+    value_array = (
+        value_output.detach().cpu().numpy() if hasattr(value_output, "detach") else np.asarray(value_output)
+    )
+    flattened = np.asarray(value_array, dtype=np.float64).reshape(-1)
+    if flattened.size == 0 or not np.isfinite(flattened).all():
+        raise RuntimeError("policy value diagnostics observed an invalid value estimate")
+    return float(flattened[0])
+
+
+def _snapshot_runner_state(env_client: TradingEnvGym) -> dict[str, Any]:
+    """Capture mutable env-core state required for read-only counterfactual replay."""
+
+    runner = env_client._runner  # type: ignore[attr-defined]
+    return {
+        "current_index": runner._current_index,
+        "steps_taken": int(runner._steps_taken),
+        "position_exposure": int(runner._position.exposure),
+        "portfolio_value": float(runner._portfolio.portfolio_value),
+        "open_position_entry_price_exec": (
+            None if runner._open_position_entry_price_exec is None else float(runner._open_position_entry_price_exec)
+        ),
+        "open_position_entry_fees": float(runner._open_position_entry_fees),
+        "open_position_entry_slippage_cost": float(runner._open_position_entry_slippage_cost),
+        "open_position_entry_step_ordinal": (
+            None if runner._open_position_entry_step_ordinal is None else int(runner._open_position_entry_step_ordinal)
+        ),
+        "peak_portfolio_value": float(runner._peak_portfolio_value),
+        "seed": None if runner._seed is None else int(runner._seed),
+        "terminated": bool(runner._terminated),
+        "truncated": bool(runner._truncated),
+    }
+
+
+def _restore_runner_state(*, env_client: TradingEnvGym, snapshot: Mapping[str, Any]) -> None:
+    """Restore a previously snapshotted env-core state after counterfactual replay."""
+
+    runner = env_client._runner  # type: ignore[attr-defined]
+    runner._current_index = snapshot["current_index"]
+    runner._steps_taken = int(snapshot["steps_taken"])
+    runner._position = PositionState(exposure=int(snapshot["position_exposure"]))
+    runner._portfolio = PortfolioState(portfolio_value=float(snapshot["portfolio_value"]))
+    runner._open_position_entry_price_exec = snapshot["open_position_entry_price_exec"]
+    runner._open_position_entry_fees = float(snapshot["open_position_entry_fees"])
+    runner._open_position_entry_slippage_cost = float(snapshot["open_position_entry_slippage_cost"])
+    runner._open_position_entry_step_ordinal = snapshot["open_position_entry_step_ordinal"]
+    runner._peak_portfolio_value = float(snapshot["peak_portfolio_value"])
+    runner._seed = snapshot["seed"]
+    runner._terminated = bool(snapshot["terminated"])
+    runner._truncated = bool(snapshot["truncated"])
+
+
+def _simulate_counterfactual_transition(
+    *,
+    model: Any,
+    env_client: TradingEnvGym,
+    action_raw: int,
+) -> dict[str, Any]:
+    """Replay one candidate action on the live runner, then restore state."""
+
+    snapshot = _snapshot_runner_state(env_client)
+    try:
+        next_observation, reward, terminated, truncated, info = env_client._runner.step(int(action_raw))  # type: ignore[attr-defined]
+        reward_components = dict(info["reward_components"])
+        next_value_estimate = _extract_policy_value_estimate(model=model, observation=next_observation)
+        return {
+            "action_raw": int(action_raw),
+            "action_semantic": str(info["action_semantic"]),
+            "position_after": int(info["position_after"]),
+            "reward_total": float(reward),
+            "reward_raw": float(reward_components.get("reward_raw", reward)),
+            "position_mtm_contribution": float(reward_components.get("position_mtm_contribution", 0.0)),
+            "realized_pnl_contribution": float(reward_components.get("realized_pnl_contribution", 0.0)),
+            "benchmark_relative_contribution": float(
+                reward_components.get("benchmark_relative_contribution", 0.0)
+            ),
+            "close_realized_pnl_bonus_contribution": float(
+                reward_components.get("close_realized_pnl_bonus_contribution", 0.0)
+            ),
+            "risk_penalty": float(reward_components.get("risk_penalty", 0.0)),
+            "inactivity_penalty": float(reward_components.get("inactivity_penalty", 0.0)),
+            "invalid_close_flat_penalty": float(reward_components.get("invalid_close_flat_penalty", 0.0)),
+            "portfolio_value_after_step": float(info["portfolio_value"]),
+            "next_value_estimate": float(next_value_estimate),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+        }
+    finally:
+        _restore_runner_state(env_client=env_client, snapshot=snapshot)
+
+
+def _build_representative_long_state_counterfactual_row(
+    *,
+    model: Any,
+    env_client: TradingEnvGym,
+    observation: Any,
+    action_masks: np.ndarray | None,
+    episode_ref: Mapping[str, Any],
+    episode_index: int,
+    step_ordinal: int,
+    step_index: int,
+    timestamp: str,
+    position_age_before: int,
+    action_probabilities: Mapping[str, float] | None,
+) -> dict[str, Any]:
+    """Capture one representative age2+ long-state HOLD vs CLOSE counterfactual comparison."""
+
+    probabilities = (
+        dict(action_probabilities)
+        if action_probabilities is not None
+        else _extract_policy_action_probabilities(model=model, observation=observation, action_masks=action_masks)
+    )
+    current_value_estimate = _extract_policy_value_estimate(model=model, observation=observation)
+    hold_counterfactual = _simulate_counterfactual_transition(
+        model=model,
+        env_client=env_client,
+        action_raw=ACTION_HOLD,
+    )
+    close_counterfactual = _simulate_counterfactual_transition(
+        model=model,
+        env_client=env_client,
+        action_raw=ACTION_CLOSE_POSITION,
+    )
+    return {
+        "evaluation_episode_index": int(episode_index),
+        "episode_scope": str(episode_ref["scope"]),
+        "episode_partition": str(episode_ref["partition"]),
+        "episode_source_rel": str(episode_ref["source_rel"]),
+        "episode_fold_id": episode_ref["fold_id"],
+        "step_ordinal": int(step_ordinal),
+        "step_index": int(step_index),
+        "timestamp": str(timestamp),
+        "position_before": 1,
+        "position_age_before_step": int(position_age_before),
+        "current_hold_probability": float(probabilities["HOLD"]),
+        "current_close_position_probability": float(probabilities["CLOSE_POSITION"]),
+        "current_hold_minus_close_gap": float(probabilities["HOLD"] - probabilities["CLOSE_POSITION"]),
+        "current_value_estimate": float(current_value_estimate),
+        "hold_counterfactual": hold_counterfactual,
+        "close_counterfactual": close_counterfactual,
+        "close_minus_hold_reward_total": float(
+            close_counterfactual["reward_total"] - hold_counterfactual["reward_total"]
+        ),
+        "close_minus_hold_next_value_estimate": float(
+            close_counterfactual["next_value_estimate"] - hold_counterfactual["next_value_estimate"]
+        ),
+    }
+
+
+def _build_representative_long_state_counterfactual_payload(
+    *,
+    run_id: str,
+    evaluation_session_id: str,
+    evaluation_policy_mode: str,
+    action_masking_enabled: bool,
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the machine-readable representative age2+ long-state counterfactual artifact."""
+
+    return {
+        "contract_version": REPRESENTATIVE_LONG_STATE_COUNTERFACTUAL_AUDIT_CONTRACT_VERSION,
+        "run_id": run_id,
+        "evaluation_session_id": evaluation_session_id,
+        "evaluation_policy_mode": evaluation_policy_mode,
+        "action_masking_enabled": bool(action_masking_enabled),
+        "representative_state_count": int(len(records)),
+        "summary": _build_representative_long_state_counterfactual_summary(records),
+        "records": [dict(record) for record in records],
+        "generated_at_utc": _generated_at(),
+    }
+
+
+def _build_representative_long_state_counterfactual_summary(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize representative long-state policy/value dispersion and close-edge prevalence."""
+
+    hold_probabilities = [_coerce_optional_float(record.get("current_hold_probability")) for record in records]
+    close_probabilities = [_coerce_optional_float(record.get("current_close_position_probability")) for record in records]
+    hold_close_gaps = [_coerce_optional_float(record.get("current_hold_minus_close_gap")) for record in records]
+    value_estimates = [_coerce_optional_float(record.get("current_value_estimate")) for record in records]
+    close_minus_hold_rewards = [_coerce_optional_float(record.get("close_minus_hold_reward_total")) for record in records]
+    close_minus_hold_next_values = [
+        _coerce_optional_float(record.get("close_minus_hold_next_value_estimate")) for record in records
+    ]
+    finite_close_edges = [float(value) for value in close_minus_hold_rewards if value is not None]
+    positive_close_edge_count = int(sum(1 for value in finite_close_edges if value > REPRESENTATIVE_LONG_STATE_ZEROISH_EDGE_EPSILON))
+    negative_close_edge_count = int(sum(1 for value in finite_close_edges if value < -REPRESENTATIVE_LONG_STATE_ZEROISH_EDGE_EPSILON))
+    zeroish_close_edge_count = int(
+        sum(1 for value in finite_close_edges if abs(value) <= REPRESENTATIVE_LONG_STATE_ZEROISH_EDGE_EPSILON)
+    )
+    aligned_close_edge_and_gap = [
+        (
+            float(record["close_minus_hold_reward_total"]),
+            float(record["current_hold_minus_close_gap"]),
+        )
+        for record in records
+        if record.get("close_minus_hold_reward_total") is not None and record.get("current_hold_minus_close_gap") is not None
+    ]
+    return {
+        "current_hold_probability_summary": _build_scalar_summary(hold_probabilities),
+        "current_close_position_probability_summary": _build_scalar_summary(close_probabilities),
+        "current_hold_minus_close_gap_summary": _build_scalar_summary(hold_close_gaps),
+        "current_value_estimate_summary": _build_scalar_summary(value_estimates),
+        "close_minus_hold_reward_total_summary": _build_scalar_summary(close_minus_hold_rewards),
+        "close_minus_hold_next_value_estimate_summary": _build_scalar_summary(close_minus_hold_next_values),
+        "positive_close_edge_count": positive_close_edge_count,
+        "negative_close_edge_count": negative_close_edge_count,
+        "zeroish_close_edge_count": zeroish_close_edge_count,
+        "close_edge_and_hold_gap_correlation": _optional_correlation(
+            left=[left for left, _ in aligned_close_edge_and_gap],
+            right=[right for _, right in aligned_close_edge_and_gap],
+        ),
+    }
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    """Return a finite float for audit summaries, or ``None`` when unavailable."""
+
+    if value is None:
+        return None
+    coerced = float(value)
+    return coerced if math.isfinite(coerced) else None
+
+
+def _build_scalar_summary(values: Sequence[float | None]) -> dict[str, Any]:
+    """Build one stable scalar summary for audit-only counterfactual diagnostics."""
+
+    finite_values = [float(value) for value in values if value is not None]
+    if not finite_values:
+        return {
+            "count": 0,
+            "min": None,
+            "mean": None,
+            "max": None,
+            "std": None,
+            "range": None,
+            "unique_rounded_count": 0,
+        }
+    array = np.asarray(finite_values, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "min": float(array.min()),
+        "mean": float(array.mean()),
+        "max": float(array.max()),
+        "std": float(array.std(ddof=0)),
+        "range": float(array.max() - array.min()),
+        "unique_rounded_count": int(len({round(float(value), 6) for value in finite_values})),
+    }
+
+
+def _optional_correlation(*, left: Sequence[float], right: Sequence[float]) -> float | None:
+    """Return a finite Pearson correlation when both scalar sequences vary."""
+
+    if len(left) != len(right) or len(left) < 2:
+        return None
+    left_array = np.asarray(left, dtype=np.float64)
+    right_array = np.asarray(right, dtype=np.float64)
+    if not np.isfinite(left_array).all() or not np.isfinite(right_array).all():
+        return None
+    if float(left_array.std(ddof=0)) <= 0.0 or float(right_array.std(ddof=0)) <= 0.0:
+        return None
+    correlation_matrix = np.corrcoef(left_array, right_array)
+    correlation_value = float(correlation_matrix[0, 1])
+    return correlation_value if math.isfinite(correlation_value) else None
+
+
+def _advance_position_age_for_eval(
+    *,
+    position_before: int,
+    position_after: int,
+    age_before: int,
+    terminated: bool,
+    truncated: bool,
+) -> int:
+    """Advance long/short position age for the next evaluation decision step."""
+
+    if terminated or truncated or position_after == 0:
+        return 0
+    if position_before == 0 and position_after in {-1, 1}:
+        return 1
+    if position_before in {-1, 1} and position_after == position_before:
+        return max(int(age_before), 1) + 1
+    if position_after in {-1, 1}:
+        return 1
+    return 0
+
+
+def _sample_temperature_action(
+    *,
+    action_probabilities: Mapping[str, float],
+    action_masks: np.ndarray | None,
+    temperature: float | None,
+    rng: np.random.Generator,
+) -> int:
+    """Sample one action from temperature-adjusted policy probabilities."""
+
+    if temperature is None or not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise RuntimeError("temperature sampling requires a positive finite evaluation_temperature")
+
+    probabilities = np.asarray(
+        [float(action_probabilities[ACTION_MAPPING[action_id]]) for action_id in range(len(ACTION_MAPPING))],
+        dtype=np.float64,
+    )
+    if probabilities.shape != (len(ACTION_MAPPING),):
+        raise RuntimeError("temperature sampling requires canonical action probabilities")
+    if not np.isfinite(probabilities).all():
+        raise RuntimeError("temperature sampling observed non-finite action probabilities")
+
+    if action_masks is not None:
+        mask = np.asarray(action_masks, dtype=np.bool_).reshape(-1)
+        if mask.shape != probabilities.shape:
+            raise RuntimeError("temperature sampling action mask shape mismatch")
+        probabilities = np.where(mask, probabilities, 0.0)
+
+    probability_sum = float(probabilities.sum())
+    if probability_sum <= 0.0:
+        raise RuntimeError("temperature sampling requires at least one positive-probability action")
+    probabilities = probabilities / probability_sum
+
+    temperature_value = float(temperature)
+    adjusted = np.exp(np.log(np.clip(probabilities, 1e-12, 1.0)) / temperature_value)
+    adjusted_sum = float(adjusted.sum())
+    if not math.isfinite(adjusted_sum) or adjusted_sum <= 0.0:
+        raise RuntimeError("temperature sampling produced an invalid probability mass")
+    adjusted = adjusted / adjusted_sum
+    sampled_action = int(rng.choice(np.arange(len(ACTION_MAPPING), dtype=np.int64), p=adjusted))
+    if sampled_action not in ACTION_MAPPING:
+        raise RuntimeError(f"temperature sampling produced unsupported action id: {sampled_action}")
+    return sampled_action
+
+
 def _build_buy_and_hold_trace(
     *,
     step_records: Sequence[Mapping[str, Any]],
@@ -2694,7 +3576,7 @@ def _build_buy_and_hold_trace(
     fee_bps: float,
     slippage_bps: float,
 ) -> dict[str, Any]:
-    """Build a capital-normalized buy-and-hold benchmark trace."""
+    """Build a one-unit long-only benchmark trace on the strategy equity basis."""
 
     if not step_records:
         return {
@@ -2716,41 +3598,89 @@ def _build_buy_and_hold_trace(
             ),
         }
 
-    entry_cost_multiplier = 1.0 + float(fee_bps) / 10_000.0 + float(slippage_bps) / 10_000.0
-    if entry_cost_multiplier <= 0.0:
-        return {
-            "step_records": [],
-            "error": ValidationIssue(
-                code=EVAL_BENCHMARK_FAILED,
-                message="Benchmark entry cost multiplier must be positive.",
-                context={"entry_cost_multiplier": entry_cost_multiplier},
-            ),
-        }
-    units = float(initial_cash) / (entry_price * entry_cost_multiplier)
+    entry_fees = float(entry_price) * (float(fee_bps) / 10_000.0)
+    entry_slippage_cost = float(entry_price) * (float(slippage_bps) / 10_000.0)
     benchmark_records: list[dict[str, Any]] = []
     for index, record in enumerate(step_records):
         next_price = float(record["next_price"])
-        benchmark_equity = units * next_price
+        benchmark_equity = float(initial_cash) + (next_price - entry_price) - entry_fees - entry_slippage_cost
         benchmark_records.append(
             {
                 **dict(record),
                 "strategy_portfolio_value": benchmark_equity,
-                "reward_total": benchmark_equity if index == 0 else benchmark_equity - benchmark_records[index - 1]["strategy_portfolio_value"],
-                "position_before": 1,
+                "reward_total": (
+                    benchmark_equity - float(initial_cash)
+                    if index == 0
+                    else benchmark_equity - benchmark_records[index - 1]["strategy_portfolio_value"]
+                ),
+                "position_before": 0 if index == 0 else 1,
                 "position_after": 1,
-                "action_raw": 1 if index == 0 else 0,
+                "action_raw": ACTION_OPEN_LONG if index == 0 else ACTION_HOLD,
                 "action_semantic": "BUY_AND_HOLD",
+                "invalid_action": False,
+                "invalid_action_reason": None,
+                "trade_units": 1 if index == 0 else 0,
+                "fees": entry_fees if index == 0 else 0.0,
+                "slippage_cost": entry_slippage_cost if index == 0 else 0.0,
+                "benchmark_units": 1.0,
+                "benchmark_entry_price": entry_price,
+                "benchmark_metric_policy": "single_position_unit_buy_and_hold_v1",
+            }
+        )
+    return {"step_records": benchmark_records, "error": None}
+
+
+def _build_always_flat_trace(
+    *,
+    step_records: Sequence[Mapping[str, Any]],
+    initial_cash: float,
+) -> dict[str, Any]:
+    """Build a zero-exposure benchmark trace using the same backtest pipeline."""
+
+    if not step_records:
+        return {
+            "step_records": [],
+            "error": ValidationIssue(
+                code=EVAL_BENCHMARK_FAILED,
+                message="Benchmark cannot be computed from an empty step trace.",
+                context={},
+            ),
+        }
+
+    benchmark_records: list[dict[str, Any]] = []
+    for record in step_records:
+        benchmark_records.append(
+            {
+                **dict(record),
+                "strategy_portfolio_value": float(initial_cash),
+                "reward_total": 0.0,
+                "position_before": 0,
+                "position_after": 0,
+                "action_raw": ACTION_HOLD,
+                "action_semantic": "ALWAYS_FLAT",
                 "invalid_action": False,
                 "invalid_action_reason": None,
                 "trade_units": 0,
                 "fees": 0.0,
                 "slippage_cost": 0.0,
-                "benchmark_units": units,
-                "benchmark_entry_price": entry_price,
-                "benchmark_metric_policy": "capital_normalized_buy_and_hold_v1",
+                "position_mtm_contribution": 0.0,
+                "realized_pnl_contribution": 0.0,
+                "benchmark_metric_policy": "always_flat_v1",
             }
         )
     return {"step_records": benchmark_records, "error": None}
+
+
+def _benchmark_policy_name(benchmark_mode: str | None) -> str | None:
+    """Return the stable benchmark policy identifier for reports."""
+
+    if benchmark_mode == BENCHMARK_MODE_BUY_AND_HOLD:
+        return "single_position_unit_buy_and_hold_v1"
+    if benchmark_mode == BENCHMARK_MODE_ALWAYS_FLAT:
+        return "always_flat_v1"
+    if benchmark_mode in {None, BENCHMARK_MODE_NONE}:
+        return None
+    return str(benchmark_mode)
 
 
 def _compute_metric_values(
@@ -3069,6 +3999,89 @@ def _compute_relative_metrics(
     return metric_values, metric_status
 
 
+def _build_accounting_context(
+    *,
+    env_config: EnvConfig,
+    benchmark_mode: str,
+    episode_runtimes: Sequence[EpisodeRuntime],
+) -> dict[str, Any]:
+    """Build additive operator-facing accounting context for evaluation metrics."""
+
+    horizon_seconds = [float(item.horizon_seconds) for item in episode_runtimes if item.horizon_seconds is not None]
+    median_step_seconds = [
+        float(item.median_step_seconds) for item in episode_runtimes if item.median_step_seconds is not None
+    ]
+    ended_with_open_position_count = int(sum(1 for item in episode_runtimes if item.ended_with_open_position))
+    benchmark_policy = _benchmark_policy_name(benchmark_mode)
+    if benchmark_policy == "single_position_unit_buy_and_hold_v1":
+        benchmark_equity_basis = "initial_cash_plus_single_position_unit_buy_and_hold_mark_to_market_pnl"
+    elif benchmark_policy == "always_flat_v1":
+        benchmark_equity_basis = "constant_initial_cash"
+    else:
+        benchmark_equity_basis = None
+
+    return {
+        "initial_cash": float(env_config.initial_cash),
+        "position_model": env_config.action_semantics_contract.position_model,
+        "trade_count_policy": "closed_round_trip_count",
+        "strategy_equity_basis": "initial_cash_plus_single_position_unit_mark_to_market_pnl",
+        "benchmark_policy": benchmark_policy,
+        "benchmark_equity_basis": benchmark_equity_basis,
+        "annualization_policy": "episode_level_final_equity_over_path_horizon_seconds_then_mean_aggregated",
+        "episodes_evaluated": int(len(episode_runtimes)),
+        "episodes_ending_with_open_position_count": ended_with_open_position_count,
+        "episodes_ending_flat_count": int(len(episode_runtimes) - ended_with_open_position_count),
+        "episode_horizon_seconds_summary": _summary_stats(horizon_seconds),
+        "median_step_seconds_summary": _summary_stats(median_step_seconds),
+    }
+
+
+def _build_metric_interpretation_warnings(
+    *,
+    strategy_metrics: Mapping[str, float | int | None],
+    accounting_context: Mapping[str, Any],
+) -> list[ValidationIssue]:
+    """Build bounded operator-facing warnings for misleading-but-valid metric combinations."""
+
+    warnings: list[ValidationIssue] = []
+    total_return = strategy_metrics.get("total_return")
+    num_trades = strategy_metrics.get("num_trades")
+    max_drawdown = strategy_metrics.get("max_drawdown")
+    ended_open_count = accounting_context.get("episodes_ending_with_open_position_count")
+
+    if (
+        isinstance(num_trades, (int, float))
+        and int(num_trades) == 0
+        and isinstance(ended_open_count, int)
+        and ended_open_count > 0
+        and isinstance(total_return, (int, float))
+        and not math.isclose(float(total_return), 0.0, abs_tol=1e-12)
+    ):
+        warnings.append(
+            ValidationIssue(
+                code=EVAL_UNREALIZED_OPEN_POSITION_RETURN,
+                message="Strategy return is mark-to-market on open end-of-episode exposure; num_trades counts only closed round trips.",
+                context={
+                    "num_trades": int(num_trades),
+                    "total_return": float(total_return),
+                    "episodes_ending_with_open_position_count": ended_open_count,
+                    "trade_count_policy": accounting_context.get("trade_count_policy"),
+                },
+            )
+        )
+
+    if isinstance(max_drawdown, (int, float)) and float(max_drawdown) > 1.0:
+        warnings.append(
+            ValidationIssue(
+                code=EVAL_MAX_DRAWDOWN_GT_ONE,
+                message="Max drawdown exceeds 1.0 because the equity curve fell below zero after a prior peak.",
+                context={"max_drawdown": float(max_drawdown)},
+            )
+        )
+
+    return warnings
+
+
 def _write_core_reports(
     *,
     validation_payload: dict[str, Any],
@@ -3077,6 +4090,8 @@ def _write_core_reports(
     report_paths: ReportPaths,
     passivity_diagnostics_payload: dict[str, Any] | None = None,
     deterministic_action_ranking_trace_csv: str | None = None,
+    compact_step_diagnostics_payload: dict[str, Any] | None = None,
+    representative_long_state_counterfactual_payload: dict[str, Any] | None = None,
     risk_overlay_bundle: RiskOverlayReportBundle | None = None,
 ) -> None:
     """Atomically write the core JSON reports."""
@@ -3090,6 +4105,13 @@ def _write_core_reports(
         atomic_write_json(passivity_diagnostics_payload, report_paths.passivity_diagnostics_report_path)
     if deterministic_action_ranking_trace_csv is not None:
         atomic_write_text(deterministic_action_ranking_trace_csv, report_paths.deterministic_action_ranking_trace_path)
+    if compact_step_diagnostics_payload is not None:
+        atomic_write_json(compact_step_diagnostics_payload, report_paths.compact_step_diagnostics_report_path)
+    if representative_long_state_counterfactual_payload is not None:
+        atomic_write_json(
+            representative_long_state_counterfactual_payload,
+            report_paths.representative_long_state_counterfactual_audit_path,
+        )
     if risk_overlay_bundle is not None:
         write_risk_overlay_artifacts(risk_overlay_bundle, output_dir=report_paths.backtest_report_path.parent)
 
@@ -3104,6 +4126,8 @@ def _write_reports_with_trace(
     write_step_trace: bool,
     passivity_diagnostics_payload: dict[str, Any] | None = None,
     deterministic_action_ranking_trace_csv: str | None = None,
+    compact_step_diagnostics_payload: dict[str, Any] | None = None,
+    representative_long_state_counterfactual_payload: dict[str, Any] | None = None,
     risk_overlay_bundle: RiskOverlayReportBundle | None = None,
 ) -> bool:
     """Write reports and the optional parquet trace."""
@@ -3119,6 +4143,8 @@ def _write_reports_with_trace(
             report_paths=report_paths,
             passivity_diagnostics_payload=passivity_diagnostics_payload,
             deterministic_action_ranking_trace_csv=deterministic_action_ranking_trace_csv,
+            compact_step_diagnostics_payload=compact_step_diagnostics_payload,
+            representative_long_state_counterfactual_payload=representative_long_state_counterfactual_payload,
             risk_overlay_bundle=risk_overlay_bundle,
         )
         return True
@@ -3238,6 +4264,10 @@ def _build_validation_payload(
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
     runtime: dict[str, Any] | None = None,
+    compact_step_diagnostics_enabled: bool | None = None,
+    representative_long_state_counterfactual_audit_enabled: bool | None = None,
+    evaluation_policy_mode: str | None = None,
+    evaluation_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Build evaluation validation report."""
 
@@ -3259,6 +4289,10 @@ def _build_validation_payload(
         "split_report_hash": split_report_hash,
         "action_masking_enabled": action_masking_enabled,
         "passivity_diagnostics_enabled": passivity_diagnostics_enabled,
+        "compact_step_diagnostics_enabled": compact_step_diagnostics_enabled,
+        "representative_long_state_counterfactual_audit_enabled": representative_long_state_counterfactual_audit_enabled,
+        "evaluation_policy_mode": evaluation_policy_mode,
+        "evaluation_temperature": evaluation_temperature,
         "risk_overlay_enabled": bool(risk_overlay_enabled),
         "risk_overlay_config_hash": risk_overlay_config_hash,
         "validation_checks": list(validation_checks),
@@ -3304,6 +4338,10 @@ def _build_manifest_payload(
     warnings: Sequence[ValidationIssue],
     report_paths: ReportPaths,
     risk_overlay_metadata: dict[str, Any],
+    compact_step_diagnostics_enabled: bool | None = None,
+    representative_long_state_counterfactual_audit_enabled: bool | None = None,
+    evaluation_policy_mode: str | None = None,
+    evaluation_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Build evaluation manifest payload."""
 
@@ -3323,8 +4361,12 @@ def _build_manifest_payload(
         },
         "selected_algorithm": selected_algorithm,
         "deterministic": deterministic,
+        "evaluation_policy_mode": evaluation_policy_mode,
+        "evaluation_temperature": evaluation_temperature,
         "action_masking_enabled": action_masking_enabled,
         "passivity_diagnostics_enabled": passivity_diagnostics_enabled,
+        "compact_step_diagnostics_enabled": compact_step_diagnostics_enabled,
+        "representative_long_state_counterfactual_audit_enabled": representative_long_state_counterfactual_audit_enabled,
         "effective_seed": effective_seed,
         "requested_device": requested_device,
         "resolved_device": resolved_device,
@@ -3349,7 +4391,7 @@ def _build_manifest_payload(
                     "metric_policy": "narrow_v1_proxy",
                     "formula": "mean(closed_trade_net_pnl / entry_price_exec)",
                 },
-                "benchmark_policy": "capital_normalized_buy_and_hold_v1",
+                "benchmark_policy": _benchmark_policy_name(benchmark_mode),
                 "aggregation_policy": {
                     "episode_metric_aggregation": "mean_for_non_count_metrics",
                     "count_metric_aggregation": "sum",
@@ -3372,7 +4414,15 @@ def _build_manifest_payload(
             ),
             "deterministic_action_ranking_trace_path": (
                 str(report_paths.deterministic_action_ranking_trace_path) if passivity_diagnostics_enabled else None
-            )
+            ),
+            "compact_step_diagnostics_report_path": (
+                str(report_paths.compact_step_diagnostics_report_path) if compact_step_diagnostics_enabled else None
+            ),
+            "representative_long_state_counterfactual_audit_path": (
+                str(report_paths.representative_long_state_counterfactual_audit_path)
+                if representative_long_state_counterfactual_audit_enabled
+                else None
+            ),
         },
         "output_dir": str(output_dir),
         "generated_at": _generated_at(),
@@ -3403,6 +4453,11 @@ def _build_backtest_payload(
     warnings: Sequence[ValidationIssue],
     errors: Sequence[ValidationIssue],
     runtime: dict[str, Any] | None = None,
+    evaluation_policy_mode: str | None = None,
+    evaluation_temperature: float | None = None,
+    compact_step_diagnostics_enabled: bool | None = None,
+    representative_long_state_counterfactual_audit_enabled: bool | None = None,
+    accounting_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build evaluation backtest report payload."""
 
@@ -3412,8 +4467,12 @@ def _build_backtest_payload(
         "evaluation_success": bool(evaluation_success),
         "selected_algorithm": selected_algorithm,
         "deterministic": deterministic,
+        "evaluation_policy_mode": evaluation_policy_mode,
+        "evaluation_temperature": evaluation_temperature,
         "action_masking_enabled": action_masking_enabled,
         "passivity_diagnostics_enabled": passivity_diagnostics_enabled,
+        "compact_step_diagnostics_enabled": compact_step_diagnostics_enabled,
+        "representative_long_state_counterfactual_audit_enabled": representative_long_state_counterfactual_audit_enabled,
         "effective_seed": effective_seed,
         "evaluation_mode": evaluation_mode,
         "target_mode": target_mode,
@@ -3423,6 +4482,7 @@ def _build_backtest_payload(
         "benchmark_metrics": benchmark_metrics,
         "relative_metrics": relative_metrics,
         "metric_status": metric_status,
+        "accounting_context": dict(accounting_context) if accounting_context is not None else None,
         "trace_artifact_path": trace_artifact_path,
         "diagnostic_artifacts": {
             "passivity_diagnostics_report_path": (
@@ -3430,7 +4490,15 @@ def _build_backtest_payload(
             ),
             "deterministic_action_ranking_trace_path": (
                 str(report_paths.deterministic_action_ranking_trace_path) if passivity_diagnostics_enabled else None
-            )
+            ),
+            "compact_step_diagnostics_report_path": (
+                str(report_paths.compact_step_diagnostics_report_path) if compact_step_diagnostics_enabled else None
+            ),
+            "representative_long_state_counterfactual_audit_path": (
+                str(report_paths.representative_long_state_counterfactual_audit_path)
+                if representative_long_state_counterfactual_audit_enabled
+                else None
+            ),
         },
         "risk_overlay": dict(risk_overlay),
         "runtime": dict(runtime) if runtime is not None else None,
@@ -3484,6 +4552,21 @@ def _build_runtime_payload(
             "max_eval_steps": max_eval_steps,
         },
         "memory_snapshots": [dict(item) for item in memory_snapshots],
+    }
+
+
+def _summary_stats(values: Sequence[float]) -> dict[str, float | int] | None:
+    """Summarize one finite numeric sequence for reporting."""
+
+    finite_values = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite_values:
+        return None
+    array = np.asarray(finite_values, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "min": float(array.min()),
+        "max": float(array.max()),
+        "mean": float(array.mean()),
     }
 
 
@@ -3576,6 +4659,9 @@ def _effective_env_config(*, env_config: EnvConfig, seed: int, episode_ref: dict
             "reward_scale": env_config.reward_contract.reward_scale,
             "reward_clip_min": env_config.reward_contract.reward_clip_min,
             "reward_clip_max": env_config.reward_contract.reward_clip_max,
+            "dense_pbr_config": asdict(env_config.reward_contract.dense_pbr_config)
+            if env_config.reward_contract.dense_pbr_config is not None
+            else None,
         },
         "termination_contract": {
             "data_end_terminated": env_config.termination_contract.data_end_terminated,
@@ -4039,3 +5125,15 @@ def _raw_bool(payload: dict[str, Any] | None, key: str) -> bool | None:
         return None
     value = payload.get(key)
     return value if isinstance(value, bool) else None
+
+
+def _raw_float(payload: dict[str, Any] | None, key: str) -> float | None:
+    """Best-effort float extraction for partially invalid payloads."""
+
+    if payload is None:
+        return None
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value_float = float(value)
+    return value_float if math.isfinite(value_float) else None

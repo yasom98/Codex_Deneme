@@ -7,6 +7,9 @@ set -Eeuo pipefail
 export RUN_ID="${RUN_ID:-20260314Tbinance_perp_hist_full_003}"
 export REPO_ROOT="${REPO_ROOT:-/content/Codex_Deneme}"
 export DRIVE_ROOT="/content/drive/MyDrive/Codex_Deneme/Codex_Deneme_Assets"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_CMD=("${PYTHON_BIN}" "-u")
 
 if [[ ! -d "${REPO_ROOT}" ]]; then
   echo "BLOCK: REPO_ROOT missing: ${REPO_ROOT}" >&2
@@ -61,7 +64,7 @@ done
 
 cd "${REPO_ROOT}"
 
-python scripts/stage_colab_inputs.py \
+"${PYTHON_CMD[@]}" scripts/stage_colab_inputs.py \
   --staging-root "${STAGE_ROOT}" \
   --env-config "${DRIVE_ROOT}/runs/${RUN_ID}/env_contract/tmp/bounded_training_preparation_env_config.json" \
   --training-config "${REPO_ROOT}/configs/training_config.colab_first_real.example.json" \
@@ -73,7 +76,7 @@ python scripts/stage_colab_inputs.py \
   --eval-config "${REPO_ROOT}/configs/eval_config.episodic.example.json" \
   --log-level INFO
 
-python - <<'PY'
+"${PYTHON_CMD[@]}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -94,14 +97,14 @@ if runtime.get("runtime_dependency_overall") is not True:
     raise SystemExit("BLOCK: runtime_dependency_overall != true")
 PY
 
-python - <<'PY'
+"${PYTHON_CMD[@]}" - <<'PY'
 import torch
 
 if not torch.cuda.is_available():
     raise SystemExit("BLOCK: CUDA is not available; aborting before artifact production.")
 PY
 
-python scripts/produce_canonical_ppo_artifact.py \
+"${PYTHON_CMD[@]}" scripts/produce_canonical_ppo_artifact.py \
   --run-id "${RUN_ID}" \
   --env-config "${STAGE_ROOT}/env_contract/tmp/bounded_training_preparation_env_config.json" \
   --training-config "${STAGE_ROOT}/configs/training_config.json" \
@@ -111,11 +114,11 @@ python scripts/produce_canonical_ppo_artifact.py \
   --episode-catalog "${STAGE_ROOT}/env_readiness/reports/episode_catalog.json" \
   --split-report "${STAGE_ROOT}/data_features/reports/split_validation_report.json" \
   --output-dir "${ARTIFACT_OUT}" \
-  --progress-mode auto \
+  --progress-mode text \
   --memory-log-interval-steps 2048 \
   --log-level INFO
 
-python - <<'PY'
+"${PYTHON_CMD[@]}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -133,7 +136,7 @@ if report.get("canonical_artifact_ready") is not True:
     raise SystemExit("BLOCK: artifact_production_report canonical_artifact_ready != true")
 PY
 
-python scripts/evaluate_policy.py \
+"${PYTHON_CMD[@]}" scripts/evaluate_policy.py \
   --run-id "${RUN_ID}" \
   --model-artifact "${ARTIFACT_OUT}/canonical_ppo_model.zip" \
   --env-config "${STAGE_ROOT}/env_contract/tmp/bounded_training_preparation_env_config.json" \
@@ -144,10 +147,10 @@ python scripts/evaluate_policy.py \
   --episode-catalog "${STAGE_ROOT}/env_readiness/reports/episode_catalog.json" \
   --split-report "${STAGE_ROOT}/data_features/reports/split_validation_report.json" \
   --output-dir "${EVAL_OUT}" \
-  --progress-mode auto \
+  --progress-mode text \
   --log-level INFO
 
-python - <<'PY'
+"${PYTHON_CMD[@]}" - <<'PY'
 import json
 import os
 from pathlib import Path
