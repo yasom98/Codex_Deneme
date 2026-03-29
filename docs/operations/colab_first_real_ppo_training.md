@@ -46,15 +46,32 @@ Canonical path degiskenleri:
 
 ```bash
 export REPO_ROOT=/content/Codex_Deneme
-export DRIVE_ROOT=/content/drive/MyDrive/Codex_Deneme_Assets
+export DRIVE_ROOT=/content/drive/MyDrive/Codex_Deneme/Codex_Deneme_Assets
 export RUN_ID=20260314Tbinance_perp_hist_full_003
 export STAGE_ID=stage_$(date -u +%Y%m%dT%H%M%SZ)
 export ARTIFACT_ID=artifact_$(date -u +%Y%m%dT%H%M%SZ)
 export EVAL_ID=eval_$(date -u +%Y%m%dT%H%M%SZ)
-export STAGE_ROOT=/content/codex_stage/${RUN_ID}_${STAGE_ID}
-export ARTIFACT_OUT=/content/codex_runs/${RUN_ID}/${ARTIFACT_ID}
-export EVAL_OUT=/content/codex_runs/${RUN_ID}/${EVAL_ID}
+export STAGE_ROOT=/content/codex_stage/${RUN_ID}/${STAGE_ID}
+export ARTIFACT_OUT=/content/codex_runs/${RUN_ID}/ppo_artifact/${ARTIFACT_ID}
+export EVAL_OUT=/content/codex_runs/${RUN_ID}/evaluation/${EVAL_ID}
 ```
+
+# Canonical Main-Run Package
+
+Main training icin tek canonical operator paketi (repo clone/pull ve dependency kurulumu tamamlandiktan sonra):
+
+```bash
+bash "${REPO_ROOT}/scripts/run_colab_main_training_package.sh"
+```
+
+Bu paket:
+
+- fixed DRIVE_ROOT kullanir: `/content/drive/MyDrive/Codex_Deneme/Codex_Deneme_Assets`
+- stage closure + runtime dependency gate'lerini fail-closed kontrol eder
+- explicit CUDA gate'i artifact production oncesi fail-closed uygular
+- final compact JSON summary'de canonical metrikleri okur:
+  - `strategy_total_return`
+  - `benchmark_total_return`
 
 Repo'yu GitHub'dan clone veya pull et:
 

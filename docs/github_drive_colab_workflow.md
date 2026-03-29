@@ -43,12 +43,19 @@ Kararlar:
 
 1. Colab GPU runtime sec.
 2. Drive'i `/content/drive` altina mount et.
-3. Repo'yu GitHub'dan `/content/Codex_Deneme` altina clone veya pull et.
-4. `python -m pip install -r requirements.colab.txt` calistir.
-5. `torch` ve staging runtime dependency gate'i gecmeden training baslatma.
-6. Drive'daki required run assetlerini `scripts/stage_colab_inputs.py` ile local stage root'a tas.
-7. Training/evaluation local stage root'tan calissin.
-8. Final report/artifact setini Drive'da unique attempt klasorlerine sync et.
+3. Canonical asset root'u fixed kullan:
+   - `/content/drive/MyDrive/Codex_Deneme/Codex_Deneme_Assets`
+4. Asset root altinda required run dosyalari yoksa fail-closed dur.
+5. Repo'yu GitHub'dan `/content/Codex_Deneme` altina clone veya pull et.
+6. `python -m pip install -r requirements.colab.txt` calistir.
+7. `torch` ve staging runtime dependency gate'i gecmeden training baslatma.
+8. Drive'daki required run assetlerini `scripts/stage_colab_inputs.py` ile local stage root'a tas.
+9. Training/evaluation local stage root'tan calissin.
+10. Final report/artifact setini Drive'da unique attempt klasorlerine sync et.
+
+Canonical operator package:
+
+- `bash /content/Codex_Deneme/scripts/run_colab_main_training_package.sh`
 
 ## Fail-Closed Runtime Gate
 
