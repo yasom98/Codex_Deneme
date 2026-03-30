@@ -706,6 +706,7 @@ def execute_evaluation_backtest(
         "report_write": {},
     }
 
+    runtime_action_masking_enabled = bool(eval_config.action_masking)
     _set_global_seed(eval_config.seed)
     try:
         LOGGER.info("Model load start | run_id=%s model_artifact=%s", normalized_run_id, model_artifact_path.resolve())
@@ -722,6 +723,7 @@ def execute_evaluation_backtest(
                     detected_maskable,
                     eval_config.action_masking,
                 )
+        runtime_action_masking_enabled = bool(use_maskable)
         if use_maskable:
             model = _load_maskable_ppo_model(model_artifact_path=model_artifact_path.resolve(), device=resolved_device)
         else:
@@ -752,7 +754,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
             evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
@@ -831,7 +833,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
             evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
@@ -925,7 +927,7 @@ def execute_evaluation_backtest(
                 evaluation_temperature=eval_config.evaluation_temperature,
                 seed=eval_config.seed,
                 benchmark_mode=eval_config.benchmark_mode,
-                action_masking_enabled=eval_config.action_masking,
+                action_masking_enabled=runtime_action_masking_enabled,
                 requested_metrics=eval_config.backtest_metrics,
                 episode_index=episode_index,
                 progress_bar=progress_bar,
@@ -980,7 +982,7 @@ def execute_evaluation_backtest(
                         evaluation_temperature=eval_config.evaluation_temperature,
                         seed=eval_config.seed,
                         benchmark_mode=eval_config.benchmark_mode,
-                        action_masking_enabled=eval_config.action_masking,
+                        action_masking_enabled=runtime_action_masking_enabled,
                         requested_metrics=eval_config.backtest_metrics,
                         episode_index=episode_index,
                         progress_bar=None,
@@ -1025,7 +1027,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
             evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
@@ -1133,7 +1135,7 @@ def execute_evaluation_backtest(
                 evaluation_success=False,
                 selected_algorithm=eval_config.algorithm,
                 deterministic=eval_config.deterministic,
-                action_masking_enabled=eval_config.action_masking,
+                action_masking_enabled=runtime_action_masking_enabled,
                 passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
                 compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
                 representative_long_state_counterfactual_audit_enabled=(
@@ -1217,7 +1219,7 @@ def execute_evaluation_backtest(
         passivity_diagnostics_payload = build_eval_passivity_diagnostics_report(
             run_id=normalized_run_id,
             evaluation_session_id=evaluation_session_id,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
             deterministic_summary=deterministic_summary,
             stochastic_summary=stochastic_summary,
@@ -1229,7 +1231,7 @@ def execute_evaluation_backtest(
             run_id=normalized_run_id,
             evaluation_session_id=evaluation_session_id,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             compact_step_rows=compact_step_rows,
         )
     if eval_config.representative_long_state_counterfactual_audit:
@@ -1237,7 +1239,7 @@ def execute_evaluation_backtest(
             run_id=normalized_run_id,
             evaluation_session_id=evaluation_session_id,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             records=representative_long_state_counterfactual_rows,
         )
 
@@ -1255,7 +1257,7 @@ def execute_evaluation_backtest(
         evaluation_success=True,
         selected_algorithm=eval_config.algorithm,
         deterministic=eval_config.deterministic,
-        action_masking_enabled=eval_config.action_masking,
+        action_masking_enabled=runtime_action_masking_enabled,
         passivity_diagnostics_enabled=eval_config.passivity_diagnostics,
         compact_step_diagnostics_enabled=eval_config.compact_step_diagnostics,
         representative_long_state_counterfactual_audit_enabled=eval_config.representative_long_state_counterfactual_audit,
@@ -1312,7 +1314,7 @@ def execute_evaluation_backtest(
             evaluation_success=False,
             selected_algorithm=eval_config.algorithm,
             deterministic=eval_config.deterministic,
-            action_masking_enabled=eval_config.action_masking,
+            action_masking_enabled=runtime_action_masking_enabled,
             evaluation_policy_mode=eval_config.evaluation_policy_mode,
             evaluation_temperature=eval_config.evaluation_temperature,
             effective_seed=eval_config.seed,
